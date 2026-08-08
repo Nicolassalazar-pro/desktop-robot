@@ -1069,7 +1069,7 @@ uint32_t g_lastDriveClient     = 0;
 uint8_t  g_lastDriveSeq        = 0;
 const char* g_lastDriveSource  = "none";
 
-uint16_t g_eyeRegionBackup[kEyeBackupMaxW * kEyeBackupMaxH] = {0};
+uint16_t* g_eyeRegionBackup = nullptr;
 
 // [DEBUG-DELETE] BEGIN — demo mood label overlay (bottom-right red text).
 // Used during mood-review demos so we can identify the mood on-camera.
@@ -2262,6 +2262,36 @@ static void updateBatteryMeter() {
 }
 // [DEBUG-DELETE] END
 
+// Lazily allocated in PSRAM, and only when head-sympathy shift is actually
+// switched on.
+//
+// This was a static .bss array sized to the worst-case eye rectangle:
+// 191 x 120 x 2 B = 45,840 bytes (confirmed from the linker map, not
+// calculated) of INTERNAL SRAM -- about 44% of all RAM the firmware reported
+// in use. Its only consumer is applyHeadSympathyShift(), which does nothing
+// unless g_headShiftXDiv/YDiv are non-zero, and both default to 0. So the
+// board was permanently holding 45 KB of fast internal RAM for a feature that
+// is off until somebody types `headgain`.
+//
+// PSRAM is the right home: this is a bulk memcpy target touched at most once
+// per frame, not cache-hot state, and the canvas framebuffer already lives
+// there. Returns false if allocation fails, in which case the caller simply
+// skips the backup rather than writing out of bounds.
+bool ensureEyeRegionBackup() {
+  if (g_eyeRegionBackup != nullptr) return true;
+  constexpr size_t kBytes =
+      static_cast<size_t>(kEyeBackupMaxW) * kEyeBackupMaxH * sizeof(uint16_t);
+  g_eyeRegionBackup = static_cast<uint16_t*>(ps_malloc(kBytes));
+  if (g_eyeRegionBackup == nullptr) {
+    Serial.println(F("eye: backup buffer alloc FAILED; head shift disabled"));
+    return false;
+  }
+  memset(g_eyeRegionBackup, 0, kBytes);
+  Serial.printf("eye: backup buffer %u B allocated in PSRAM\n",
+                static_cast<unsigned>(kBytes));
+  return true;
+}
+
 void backupEyeRegionFromCanvas() {
   if (g_canvas == nullptr) {
     return;
@@ -2269,6 +2299,9 @@ void backupEyeRegionFromCanvas() {
 
   uint16_t* framebuffer = g_canvas->getFramebuffer();
   if (framebuffer == nullptr) {
+    return;
+  }
+  if (!ensureEyeRegionBackup()) {
     return;
   }
 
@@ -2280,7 +2313,7 @@ void backupEyeRegionFromCanvas() {
 }
 
 void restoreEyeRegionToCanvas() {
-  if (g_canvas == nullptr) {
+  if (g_canvas == nullptr || g_eyeRegionBackup == nullptr) {
     return;
   }
 
