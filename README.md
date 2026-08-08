@@ -7,6 +7,45 @@ onboard buzzer, RTC, IMU, LiPo charger, USB-C).
 Same moods, same eye renderer, same serial CLI as DeskNotif — different
 board.
 
+---
+
+## ⚠ Read this before you drive it
+
+**Never drive the robot while it is plugged into USB.** The cable
+physically restrains the chassis, so any turn measured while tethered is
+invalid, and the robot can drag itself off the desk or wrench the
+connector.
+
+Movement measurements follow a fixed workflow:
+
+```
+arm the run over serial  →  unplug  →  press the on-screen button
+                         →  results persist to NVS  →  replug and read back
+```
+
+`bench arm` / `bench report` and `spin auto` are built around exactly this.
+An agent or script **cannot** validate a turn on its own — the button press
+is the human-in-the-loop step, and it is deliberate.
+
+**Start here for context:** [`docs/PROJECT-HISTORY.md`](docs/PROJECT-HISTORY.md)
+records 14 months of decisions, measured constants, and **43 approaches that
+were already tried and rejected**. It exists because two bugs were re-debugged
+from scratch that had already been solved. Read Section 3 before proposing a
+change; read Appendix B before assuming anything.
+
+---
+
+## Documentation map
+
+| File | What it is |
+|---|---|
+| [`HARDWARE.md`](HARDWARE.md) | Pin map, power architecture, measured hardware constants, the SYS_EN gotcha, LCD SPI timing analysis |
+| [`docs/PROJECT-HISTORY.md`](docs/PROJECT-HISTORY.md) | Full project history: decisions, rejected approaches, open bugs, working agreements |
+| [`docs/GIT-NOTES.md`](docs/GIT-NOTES.md) | Which GitHub account owns this, and the two auth traps that make pushes fail confusingly |
+| [`docs/key-issues/`](docs/key-issues/) | Review findings by domain (RELY, DEP, TEST, READ, PERF, DSGN, SEC, DOCS) |
+| [`IMU-RESEARCH.md`](IMU-RESEARCH.md) | Gyro drift research synthesis |
+| `docs/bench-run-*.md`, `docs/scale-check-*.md` | Individual measurement records |
+
 ## Hardware
 
 See [`HARDWARE.md`](HARDWARE.md) for the full pin map, power-architecture
@@ -14,12 +53,27 @@ notes, and the critical "always drive SYS_EN HIGH in setup()" gotcha.
 
 ## Build & flash
 
+`pio` is **not on PATH** — it lives in the PlatformIO venv. Note also that
+`pyserial` is installed in that venv's python, not the system python, so
+serial helper scripts must be run with it.
+
 ```powershell
 cd C:\Users\v-nisalazar\Desktop\Scripts\desktop-robot
 $env:PATH = "$env:USERPROFILE\.platformio\penv\Scripts;$env:PATH"
 pio run -t upload
 pio device monitor -b 115200
 ```
+
+## Tests
+
+13 native C++ suites run on the host (no board required):
+
+```powershell
+powershell -NoProfile -File test\run_motor_host_tests.ps1
+```
+
+Python suites (melody generation, calibration contracts) run under pytest
+from `tools/` and `test/`.
 
 First flash of a brand-new board: hold **BOOT**, tap **RESET**, release
 **BOOT**, then `pio run -t upload`. After that, esptool auto-resets via
@@ -59,7 +113,9 @@ py -3.12 .\test\test_calibrator_contract.py -v
 help                     show this list
 ping                     -> pong
 status                   JSON snapshot
-mood <name>              default|bored|annoyed|tired|angry|happy|sad|think|error
+mood <name>              default|bored|angry|happy|think|error|tired|annoyed|sad
+                         surprised|wink|sleeping|love|confused|curious|scared
+                         (16 moods; note there is no id 4)
 look <dir>               default|center|n|ne|e|se|s|sw|w|nw
 blink
 wander <on|off>

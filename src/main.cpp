@@ -3249,6 +3249,37 @@ void printHelp() {
   Serial.println(F("spin show                staged vs saved vs default"));
   Serial.println(F("spin save confirm"));
   Serial.println(F("spin erase confirm"));
+  // The list below was missing entirely: `help` documented 25 of the 48
+  // commands dispatchCommand actually handles, so more than a third of the
+  // surface -- including every diagnostic added while chasing the black-screen
+  // and AP faults -- was reachable only by reading the source.
+  Serial.println(F("-- expression --"));
+  Serial.println(F("sound <happy|sad|confused>   compose + play (fresh each time)"));
+  Serial.println(F("sound stop"));
+  // `gesture` is already printed above by printGestureUsage(); not repeated.
+  Serial.println(F("-- network / UI --"));
+  Serial.println(F("wifi                     AP mode, IP, MAC, stations, tx power"));
+  Serial.println(F("state                    override state machine + LCD mode"));
+  Serial.println(F("swipe <down|up>          queue a wake / teardown gesture"));
+  Serial.println(F("-- display diagnostics --"));
+  Serial.println(F("lcdspi [hz]              show/set SPI clock (8M..80M, reboot to apply)"));
+  Serial.println(F("lcdprobe                 read panel RDDPM: is it awake and on?"));
+  Serial.println(F("lcdpush                  full canvas->panel push only"));
+  Serial.println(F("lcdbus                   re-init the SPI peripheral only"));
+  Serial.println(F("crash [clear]            last fault: reason + phase + heap"));
+  Serial.println(F("-- motion / IMU --"));
+  Serial.println(F("straight <cm> [speed]    gyro-corrected straight run"));
+  Serial.println(F("sense                    bump/shake/lifted detector state"));
+  Serial.println(F("lead [alpha]             turn coast-compensation constant"));
+  Serial.println(F("scale [actual <deg>]     gyro scale check / correction"));
+  Serial.println(F("cod [run|status]         on-demand gyro calibration"));
+  Serial.println(F("lpf [0..3]               gyro low-pass filter mode"));
+  Serial.println(F("bench <arm|report|clear> unattended measurement run"));
+  Serial.println(F("-- survey / RF --"));
+  Serial.println(F("survey ...               dead-reckoning position survey"));
+  Serial.println(F("rfscan / rfsurvey        RSSI scan + per-position store"));
+  Serial.println(F("-- touch --"));
+  Serial.println(F("touchinfo / touchlog / touchdebug / touchreset"));
 }
 
 void dispatchCommand(char* line) {
@@ -5445,11 +5476,22 @@ static bool requestHasValidAccessToken(AsyncWebServerRequest* request) {
   const String& supplied = tokenParameter->value();
   uint8_t difference = 0;
   const bool correctLength = supplied.length() == kAccessTokenHexLength;
-  if (correctLength) {
-    for (size_t i = 0; i < kAccessTokenHexLength; ++i) {
-      difference |= static_cast<uint8_t>(supplied[i] ^ expected[i]);
-    }
+  // Always run the full compare, even when the length is wrong.
+  //
+  // Skipping the loop on a length mismatch returns measurably faster, which
+  // lets an observer distinguish "wrong length" from "wrong content" by
+  // response timing and converge on the token length in fewer probes. Reading
+  // past the end of a short string is avoided by indexing a fixed-length local
+  // copy rather than the String itself; the mismatch is then folded into
+  // `difference` so the result is unchanged.
+  char probe[kAccessTokenHexLength];
+  for (size_t i = 0; i < kAccessTokenHexLength; ++i) {
+    probe[i] = (i < supplied.length()) ? supplied[i] : '\0';
   }
+  for (size_t i = 0; i < kAccessTokenHexLength; ++i) {
+    difference |= static_cast<uint8_t>(probe[i] ^ expected[i]);
+  }
+  secureZero(probe, sizeof(probe));
   secureZero(expected, sizeof(expected));
   return correctLength && difference == 0U;
 }
@@ -10558,6 +10600,12 @@ void overrideLoop() {
   g_apLifecycleActive.store(false, std::memory_order_release);
   g_apStopFaultPending.store(false, std::memory_order_release);
   g_overrideUp = false;
+  // Safe here, and ONLY here. WiFi.mode(WIFI_OFF) corrupts the lwIP netif
+  // chain and is banned from the AP teardown path (see the softAPdisconnect
+  // call site). This is the [[noreturn]] display-init halt: the board never
+  // brings an AP up again, so there is no subsequent bring-up to corrupt, and
+  // dropping the radio is the right thing for a permanently halted device.
+  // Kept explicit so a future cleanup does not "unify" it with teardown.
   WiFi.mode(WIFI_OFF);
   setBacklightLevel(0U);
   Serial.println(F(

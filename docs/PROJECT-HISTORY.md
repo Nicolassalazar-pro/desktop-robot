@@ -1362,6 +1362,15 @@ is right. Enumerated:
    The older checkpoints will read as "wrong" — they aren't wrong for
    their era, they're just superseded. See §4.1, D9.
 
+   > **Verified against the source 2026-08-07** —
+   > `src/main.cpp:442-443` reads
+   > `kServoLeftPin = 18; kServoRightPin = 17;`
+   > This is CORRECT and must not be "fixed". Any quotation of
+   > `17/18` elsewhere in this document is a historical record of the
+   > bug, never an instruction. Changing it re-inverts differential
+   > steering, and the failure is not obvious from a bench test that
+   > only drives one wheel at a time.
+
 2. **WiFi credentials.** Present-in-code briefly in `[063]` as
    rotating per activation. `[065]` reverted to fixed
    `Hanger OVERRIDE` / `TheGarageAtl`. Current code = fixed. See D6,
