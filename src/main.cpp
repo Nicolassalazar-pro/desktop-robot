@@ -1636,6 +1636,12 @@ void stopMovementGesture(const char* reason);
 // DriveSession::state(), because a fault reset and an idle robot are the same
 // state (SafeOff) and only one of them should cancel. See resetDriveControl.
 void requestMovementAbort(const char* reason);
+// Queue a websocket close from the AsyncTCP task; performed later on the loop
+// task. Closing from inside an AsyncTCP callback re-enters the client's own
+// teardown and has crashed this board with INT_WDT.
+void requestWsClientClose(AsyncWebSocketClient* client, uint16_t code,
+                          const char* reason);
+void serviceWsPendingCloses();
 static void serviceGestureMenu(uint32_t now);
 bool startMovementGesture(const char* name, uint16_t runMs = 0);
 bool startSpinCalibration(uint16_t fullTurnMs, bool clockwise,
@@ -5729,6 +5735,86 @@ void closeWsEventClient(const WsEvent& event, uint16_t code,
   eventClient->close(code, reason);
 }
 
+// ---------------------------------------------------------------------------
+// Deferred websocket close.
+//
+// Closing a client from inside an AsyncTCP callback re-enters that client's own
+// teardown. It is the pattern that crashed this board with INT_WDT and no
+// backtrace (the panic handler cannot print over USB CDC, so the hardware
+// watchdog resets first). It was fixed for the auth path by refusing
+// unauthorised upgrades at the HTTP handshake, before any client object exists
+// -- but every OTHER rejection reason still built a real client and then closed
+// it from inside its own callback.
+//
+// So requests are queued here and performed by the loop task, which is where
+// every other rejection already runs. The identity check on the loop side is
+// the same pointer-vs-token comparison closeWsEventClient uses, so a client
+// that AsyncTCP has already destroyed and reallocated is not closed by mistake.
+//
+// Fixed capacity, no heap, and duplicates are collapsed: a rejected client
+// keeps sending frames until the close lands, and each one would otherwise
+// queue another request.
+struct PendingWsClose {
+  uint32_t client;
+  uintptr_t token;
+  uint16_t code;
+  const char* reason;  // static string literals only
+};
+
+constexpr uint8_t kMaxPendingWsCloses = 8;
+PendingWsClose g_pendingWsCloses[kMaxPendingWsCloses];
+uint8_t g_pendingWsCloseCount = 0;
+portMUX_TYPE g_pendingWsCloseMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Callable from the AsyncTCP task. Never closes; only records the intent.
+void requestWsClientClose(AsyncWebSocketClient* client, uint16_t code,
+                          const char* reason) {
+  if (client == nullptr) return;
+  const uint32_t id = client->id();
+  const uintptr_t token = reinterpret_cast<uintptr_t>(client);
+  portENTER_CRITICAL(&g_pendingWsCloseMux);
+  bool duplicate = false;
+  for (uint8_t i = 0; i < g_pendingWsCloseCount; ++i) {
+    if (g_pendingWsCloses[i].client == id &&
+        g_pendingWsCloses[i].token == token) {
+      duplicate = true;
+      break;
+    }
+  }
+  if (!duplicate && g_pendingWsCloseCount < kMaxPendingWsCloses) {
+    g_pendingWsCloses[g_pendingWsCloseCount].client = id;
+    g_pendingWsCloses[g_pendingWsCloseCount].token = token;
+    g_pendingWsCloses[g_pendingWsCloseCount].code = code;
+    g_pendingWsCloses[g_pendingWsCloseCount].reason = reason;
+    ++g_pendingWsCloseCount;
+  }
+  portEXIT_CRITICAL(&g_pendingWsCloseMux);
+}
+
+// Loop task only.
+void serviceWsPendingCloses() {
+  PendingWsClose batch[kMaxPendingWsCloses];
+  uint8_t count = 0;
+  // Copy out under the lock, then do the actual closes outside it. close()
+  // reaches into AsyncTCP and must never run with interrupts disabled.
+  portENTER_CRITICAL(&g_pendingWsCloseMux);
+  count = g_pendingWsCloseCount;
+  for (uint8_t i = 0; i < count; ++i) batch[i] = g_pendingWsCloses[i];
+  g_pendingWsCloseCount = 0;
+  portEXIT_CRITICAL(&g_pendingWsCloseMux);
+
+  for (uint8_t i = 0; i < count; ++i) {
+    AsyncWebSocketClient* c = g_orWs.client(batch[i].client);
+    // Pointer identity guards against the id having been recycled onto a
+    // different client since the request was queued.
+    if (c == nullptr ||
+        reinterpret_cast<uintptr_t>(c) != batch[i].token) {
+      continue;
+    }
+    c->close(batch[i].code, batch[i].reason);
+  }
+}
+
 void rejectWsTransportAdmission(const WsEvent& event, const char* reason) {
   lockWsTransportState();
   const bool currentOwner =
@@ -6304,6 +6390,18 @@ bool startMovementGesture(const char* name, uint16_t runMs) {
     return false;
   }
   const uint32_t now = millis();
+  // Consume any stale abort request before starting.
+  //
+  // requestMovementAbort() sets the flag unconditionally, including when no
+  // gesture is running -- e.g. every AP teardown calls resetDriveControl().
+  // Without this clear the flag survives until the NEXT gesture starts and
+  // cancels it on its first tick, so gestures appear broken after any drive
+  // reset. Caught on hardware: `swipe up` then `gesture frustrated` produced
+  // "gesture: stopped (drive control reset)" instead of running.
+  //
+  // Clearing here is safe because it happens before the sequencer starts: an
+  // abort raised from this point on is genuinely about THIS gesture.
+  g_movementAbortPending.store(false, std::memory_order_release);
   if (!g_movementSequencer.start(pattern, now)) {
     Serial.println(F("ERR gesture pattern failed validation"));
     return false;
@@ -8720,7 +8818,7 @@ void terminateWsTransportForProtocolFault(
     }
     enqueueWsEventForCapturedOwnerWhileGuarded(event);
   }
-  client->close(1002, "Protocol fault");
+  requestWsClientClose(client, 1002, "Protocol fault");
 }
 
 // AsyncTCP context: own transport identity/lifetime, send only the published
@@ -8762,7 +8860,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
       Serial.printf("ws: client #%lu rejected; activation token required\n",
                     static_cast<unsigned long>(clientId));
       wsStep(3);
-      client->close(1008, "Forbidden");
+      requestWsClientClose(client, 1008, "Forbidden");
       wsStep(4);
       return;
     }
@@ -8773,7 +8871,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   if (!ingress) {
     wsStep(6);
     if (type != WS_EVT_DISCONNECT) {
-      client->close();
+      requestWsClientClose(client, 1000, "Closing");
     }
     wsStep(7);
     return;
@@ -8817,10 +8915,10 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
                         : (transportFaultClosePending
                                ? "faulted transport closing"
                                : "transport owner busy"));
-      client->close(1008,
-                    (activationFaulted || transportFaultClosePending)
-                        ? "Unavailable"
-                        : "Owner busy");
+      requestWsClientClose(client, 1008,
+                           (activationFaulted || transportFaultClosePending)
+                               ? "Unavailable"
+                               : "Owner busy");
       return;
     }
 
@@ -8839,7 +8937,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         g_wsTransportOpenCount.store(0U, std::memory_order_release);
       }
       unlockWsTransportState();
-      client->close();
+      requestWsClientClose(client, 1000, "Closing");
       return;
     }
 
@@ -8847,7 +8945,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     if (g_wsTransportOwnerToken.load(std::memory_order_acquire) != token ||
         g_wsTransportOwnerGeneration.load(std::memory_order_acquire) !=
             g_wsTransportGeneration.load(std::memory_order_acquire)) {
-      client->close();
+      requestWsClientClose(client, 1000, "Closing");
       return;
     }
     if (copyWsTelemetrySnapshot(frame) &&
@@ -8918,7 +9016,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     // it is the prime suspect for the AP restart: close() on a client that is
     // already tearing down is a classic AsyncWebSocket use-after-free.
     wsStep(21);
-    client->close();
+    requestWsClientClose(client, 1000, "Closing");
     wsStep(22);
     return;
   }
@@ -9021,7 +9119,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     return;
   }
   if (!enqueueWsEventForCapturedOwnerWhileGuarded(event)) {
-    client->close();
+    requestWsClientClose(client, 1000, "Closing");
     return;
   }
   if (!telemetryTraffic) {
@@ -9043,7 +9141,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   if (g_wsTransportOwnerToken.load(std::memory_order_acquire) != token ||
       g_wsTransportOwnerGeneration.load(std::memory_order_acquire) !=
           g_wsTransportGeneration.load(std::memory_order_acquire)) {
-    client->close();
+    requestWsClientClose(client, 1000, "Closing");
     return;
   }
   uint32_t expectedTelemetryMs = lastTelemetryMs;
@@ -10815,6 +10913,9 @@ void loop() {
   // [DEBUG-DELETE] pump override HTTP server + drive-watchdog
   breadcrumb(kCrumbLoopOverride);
   overrideLoop();
+  // Perform any websocket closes the AsyncTCP callbacks asked for. Runs on the
+  // loop task by design; see requestWsClientClose.
+  serviceWsPendingCloses();
   // [DEBUG-DELETE] END
   breadcrumb(kCrumbLoopPower);
   checkPowerButton();
