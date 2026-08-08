@@ -1318,8 +1318,26 @@ bool lcdPanelLooksAlive(uint8_t rddpm) {
 // attached. HWCDC::operator bool() reports host presence. Errors, boot lines
 // and command replies are left ungated -- they are rare, and a command reply
 // only happens when a host is by definition attached.
-inline bool serialHostAttached() {
-  return static_cast<bool>(Serial);
+// True only when a host is attached AND the USB CDC TX FIFO has room for a
+// full diagnostic line.
+//
+// Gating on host-attachment alone was NOT enough, and the measurement that
+// proved it is worth recording. With the port closed the board survived a
+// 150 s idle window with no reset. It then reset while a host WAS attached --
+// because an attached host is not necessarily a host that is *reading*. A
+// script that opens the port, writes a command, sleeps, and only then reads
+// leaves the FIFO to fill exactly as if nothing were attached, and the next
+// write blocks the loop task until TASK_WDT fires ~5 s later.
+//
+// availableForWrite() is the only condition that actually matters: if the
+// bytes will not fit, skip the line. Diagnostics are best-effort by nature --
+// dropping one is strictly better than stalling the control loop, and a
+// dropped line is invisible whereas a watchdog reset blanks the screen.
+//
+// 200 bytes covers the longest periodic line (the 1 Hz `diag:` record).
+inline bool serialCanWrite(size_t bytes = 200) {
+  return static_cast<bool>(Serial) &&
+         static_cast<size_t>(Serial.availableForWrite()) >= bytes;
 }
 
 void setEyeLoopRate(bool animating) {
@@ -2219,7 +2237,7 @@ static void updateBatteryMeter() {
   g_batVoltageRawPrev = g_batVoltageRaw;
 
   drawBatteryMeter();
-  if (serialHostAttached()) {
+  if (serialCanWrite()) {
     Serial.printf("bat raw=%.3fV filt=%.3fV slope=%+.3fV pct=%u%s\n",
                   static_cast<double>(g_batVoltageRaw),
                   static_cast<double>(g_batVoltage),
@@ -5104,7 +5122,7 @@ void processDemo() {
   if (g_demoStep < kDemoMoodCount) {
     const NamedMood& moodStep = kDemoMoods[g_demoStep];
     setEyesMood(moodStep.mood);
-    if (serialHostAttached()) {
+    if (serialCanWrite()) {
       Serial.printf("demo step %u/%u mood %s\n",
                     static_cast<unsigned>(g_demoStep + 1U),
                     static_cast<unsigned>(kDemoTotalSteps),
@@ -5114,7 +5132,7 @@ void processDemo() {
     const uint8_t lookIndex = static_cast<uint8_t>(g_demoStep - kDemoMoodCount);
     const NamedLook& lookStep = kDemoLooks[lookIndex];
     g_eyes.setPosition(lookStep.position);
-    if (serialHostAttached()) {
+    if (serialCanWrite()) {
       Serial.printf("demo step %u/%u look %s\n",
                     static_cast<unsigned>(g_demoStep + 1U),
                     static_cast<unsigned>(kDemoTotalSteps),
@@ -5122,7 +5140,7 @@ void processDemo() {
     }
   } else {
     g_eyes.blink();
-    if (serialHostAttached()) {
+    if (serialCanWrite()) {
       Serial.printf("demo step %u/%u blink\n",
                     static_cast<unsigned>(g_demoStep + 1U),
                     static_cast<unsigned>(kDemoTotalSteps));
@@ -10289,7 +10307,7 @@ void overrideLoop() {
       static uint32_t s_diagNextMs = 0;
       if (now >= s_diagNextMs) {
         s_diagNextMs = now + 1000;
-        if (serialHostAttached())
+        if (serialCanWrite())
         Serial.printf("diag: ctrl_rx=%u/s mood_rx=%u/s raw=(%d,%d) effective=(%d,%d) requestedUs=(%u,%u) readbackUs=(%u,%u) ageMs=%lu rail=%u outputValid=%u session=%s cal=%s wsClients=%u touchEvts=%u\n",
             static_cast<unsigned>(g_diagCtrlRx),
             static_cast<unsigned>(g_diagMoodRx),
@@ -10674,7 +10692,7 @@ void loop() {
     const uint32_t nowMs = millis();
     if (nowMs >= s_nextActMs) {
       s_nextActMs = nowMs + 1000;
-      if (serialHostAttached()) {
+      if (serialCanWrite()) {
         Serial.printf("lcdact: pushes/s=%lu loops/s=%lu lastPushAge=%lums "
                       "mode=%d full=%d eye=%d paused=%d\n",
                       static_cast<unsigned long>(g_lcdPushCount - s_lastPush),
