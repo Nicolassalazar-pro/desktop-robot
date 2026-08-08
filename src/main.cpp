@@ -8292,6 +8292,15 @@ h1{font:600 18px/1.2 system-ui;letter-spacing:-.02em;margin:0}
 button{appearance:none;border:0;border-radius:8px;font:600 14px/1 system-ui;cursor:pointer;min-height:44px;transition:transform .18s cubic-bezier(.2,.8,.2,1);color:var(--text)}
 button:active{transform:scale(.97)}
 .primary{background:var(--accent);color:#0a0a0a}
+/* The one dangerous control on the page must not share the colour of every
+   positive state (live dot, active mood, battery bar, stick thumbs). STOP
+   keeps its unique shape and position and now gets a unique colour too.
+   `.stopped` is the latched state: the whole surface reports it, not just
+   the button, and it is text-labelled as well as coloured. */
+.danger{background:var(--danger);color:#fff}
+.dot.stopped{background:var(--danger)}
+body.stopped .stick-pad,body.stopped .vstick{opacity:.45;filter:grayscale(1)}
+body.stopped .stopBig{outline:2px solid #fff;outline-offset:-4px}
 .ghost{background:transparent;color:var(--text);border:1px solid var(--surf2)}
 .bigV{font:600 24px/1 system-ui;letter-spacing:-.02em}
 .bigV small{font:500 12px/1 system-ui;color:var(--muted);margin-left:2px}
@@ -8316,11 +8325,9 @@ button:active{transform:scale(.97)}
 .vlabel.bot{bottom:8px}
 .vval{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);font:600 14px/1 system-ui;color:var(--muted);font-variant-numeric:tabular-nums;pointer-events:none}
 .subhead{font:600 11px/1 system-ui;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin:0 0 8px}
-#hint{position:fixed;left:12px;right:12px;bottom:max(12px,env(safe-area-inset-bottom));z-index:20;background:var(--surf);border:1px solid var(--accent);border-radius:12px;padding:12px;font-size:13px;display:none;box-shadow:0 8px 32px rgba(0,0,0,.6)}
-#hint.show{display:block;animation:up .24s cubic-bezier(.2,.8,.2,1)}
+/* NOTE: `up` is still used by the .sheet panel animation below. The #hint
+   rules that also used it were removed - no #hint element exists. */
 @keyframes up{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-#hint b{color:var(--accent)}
-#hint button{margin-top:8px;width:100%;background:var(--surf2)}
 .sheet{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:30;display:none;align-items:flex-end;justify-content:center}
 .sheet.show{display:flex}
 .sheet .p{background:var(--surf);border-radius:16px 16px 0 0;width:100%;max-width:520px;padding:16px;padding-bottom:max(16px,env(safe-area-inset-bottom));animation:up .24s cubic-bezier(.2,.8,.2,1)}
@@ -8388,7 +8395,7 @@ button:active{transform:scale(.97)}
       <span class="vlabel bot">R REV</span>
     </div>
   </div>
-  <button class="primary stopBig" onclick="stopAll()">STOP</button>
+  <button class="danger stopBig" onclick="stopAll()">STOP</button>
 </div>
 <div id="moodM" class="sheet" onclick="if(event.target.id==='moodM')closeMoods()"><div class="p"><div class="faces" id="allF"></div><button class="x" onclick="closeMoods()">Close</button></div></div>
 <div id="sndM" class="sheet" onclick="if(event.target.id==='sndM')closeSounds()"><div class="p"><div class="faces" id="allS"></div><p class="hint">Each tap composes a new phrase.</p><button class="x" onclick="closeSounds()">Close</button></div></div>
@@ -8405,9 +8412,16 @@ const $=id=>document.getElementById(id);
 let ws=null,seq=0,curMood=0;
 let curL=0,curR=0;
 let linkLive=false,driveStatus='LOCKED';
+/* STOP latch. While true, every control frame is forced to zero and the
+   sticks refuse to take input. See stopAll(). */
+let stopLatched=false;
 let reconnectTimer=null,reconnectAttempt=0;
 const RECONNECT_BASE_MS=500,RECONNECT_MAX_MS=8000;
-function paintLink(){const d=$('dot'),t=$('linkT');d.classList.toggle('live',linkLive);t.textContent=linkLive?'live · '+driveStatus:'connecting · '+driveStatus}
+function paintLink(){const d=$('dot'),t=$('linkT');d.classList.toggle('live',linkLive);d.classList.toggle('stopped',stopLatched);
+  /* STOPPED outranks link state in the pill: while latched, that is the single
+     most important thing on screen. Shown as text, not colour alone. */
+  t.textContent=stopLatched?'STOPPED · tap a stick to resume':(linkLive?'live · '+driveStatus:'connecting · '+driveStatus);
+  document.body.classList.toggle('stopped',stopLatched)}
 function setLink(live){linkLive=live;paintLink()}
 function setDriveStatus(eligible,state){driveStatus=!eligible?'LOCKED':state===1?'WAIT NEUTRAL':state>=2&&state<=4?'ARMED':'SAFE OFF';paintLink()}
 function bGrid(host,ids){host.innerHTML='';ids.forEach(id=>{const m=MOODS.find(x=>x[0]===id);if(!m)return;const b=document.createElement('button');b.className='face';b.textContent=m[1];b.dataset.id=id;b.onclick=()=>sendMood(id);host.appendChild(b)})}
@@ -8444,6 +8458,10 @@ function openWs(){
 function sendCtrl(l,r){
   if(!ws||ws.readyState!==1)return;
   if(ws.bufferedAmount>1024)return;
+  /* While STOP is latched nothing may transmit a non-zero command, whatever
+     the caller passes. This is the last gate before the wire, so a stray
+     handler cannot get around it. */
+  if(stopLatched){l=0;r=0}
   const b=new ArrayBuffer(4),d=new DataView(b);
   d.setUint8(0,OP_CONTROL);d.setInt8(1,l);d.setInt8(2,r);d.setUint8(3,(seq++)&0xff);
   ws.send(b);
@@ -8471,12 +8489,16 @@ function makeVStick(el,setVal){
     return Math.round(v);
   }
   el.addEventListener('pointerdown',e=>{
+    releaseStop();   /* a deliberate new grab is the only way out of STOP */
     try{el.setPointerCapture(e.pointerId)}catch(x){}
     active=e.pointerId;el.classList.add('live');
     const v=compute(e);setVal(v);position(v);paintVals();e.preventDefault();
   });
   el.addEventListener('pointermove',e=>{
     if(e.pointerId!==active)return;
+    /* Ignore movement of a finger that was already down when STOP was hit.
+       Without this the latch is defeated by a twitch. */
+    if(stopLatched)return;
     const v=compute(e);setVal(v);position(v);paintVals();
   });
   ['pointerup','pointercancel','lostpointercapture'].forEach(ev=>el.addEventListener(ev,e=>{
@@ -8510,12 +8532,15 @@ function makeJoy(el,setLR){
     setLR(l,r);position(c.dx,c.dy);
   }
   el.addEventListener('pointerdown',e=>{
+    releaseStop();   /* a deliberate new grab is the only way out of STOP */
     try{el.setPointerCapture(e.pointerId)}catch(x){}
     active=e.pointerId;el.classList.add('live');
     fire(compute(e));paintVals();e.preventDefault();
   });
   el.addEventListener('pointermove',e=>{
     if(e.pointerId!==active)return;
+    /* Ignore movement of a finger that was already down when STOP was hit. */
+    if(stopLatched)return;
     fire(compute(e));paintVals();
   });
   ['pointerup','pointercancel','lostpointercapture'].forEach(ev=>el.addEventListener(ev,e=>{
@@ -8525,7 +8550,28 @@ function makeJoy(el,setLR){
   position(0,0);
 }
 makeJoy($('JOY'),(l,r)=>{curL=l;curR=r});
-function stopAll(){curL=0;curR=0;sendCtrl(0,0);paintVals()}
+function stopAll(){
+  /* STOP is a MODE, not a keystroke.
+     It used to zero curL/curR and send one frame. That does not survive the
+     posture the user is actually in when they hit it: one thumb still on a
+     stick. The next pointermove reassigns curL/curR from the finger position
+     and the 30 Hz sender re-arms drive within one tick, so the wheels stop for
+     a single frame and then start again for no visible reason.
+     Latching holds zero until the user deliberately grabs a stick again. */
+  stopLatched=true;
+  curL=0;curR=0;
+  neutralUi();          /* re-centres every thumb so the UI matches reality */
+  sendCtrl(0,0);
+  paintVals();
+  paintLink();
+}
+function releaseStop(){
+  /* Cleared only by a fresh pointerdown on a stick - a deliberate new grab,
+     never by a move of a finger that was already down when STOP was pressed. */
+  if(!stopLatched)return;
+  stopLatched=false;
+  paintLink();
+}
 function send3(op,id){if(!ws||ws.readyState!==1)return;const b=new ArrayBuffer(3),d=new DataView(b);d.setUint8(0,op);d.setUint8(1,id);d.setUint8(2,(seq++)&0xff);ws.send(b)}
 /* Picking an expression does NOT close the sheet. These are audition
    controls: the user is comparing faces, sounds and movements against each
