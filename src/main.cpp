@@ -409,6 +409,10 @@ uint8_t g_headShiftYDiv = 0;
 bool g_paused = false;
 bool g_forceFullPush = false;
 uint32_t g_lcdPushCount = 0;    // total canvas->panel pushes
+// Set from any task to cancel a gesture in flight; consumed by the loop task.
+// Atomic because resetDriveControl can be reached from the AsyncTCP callback
+// task (protocol faults) as well as from loop().
+std::atomic<bool> g_movementAbortPending{false};
 uint32_t g_lcdLastPushMs = 0;   // when the last one happened
 uint32_t g_loopIterations = 0;  // main loop iterations, to detect a stall
 bool g_forceEyeRedraw = false;
@@ -1628,6 +1632,10 @@ static void requestWsTransportReset();
 void beginWsIngressQuarantine();
 static void resetDriveControl(const char* reason);
 void stopMovementGesture(const char* reason);
+// Cancels a gesture in flight from any context. Deliberately independent of
+// DriveSession::state(), because a fault reset and an idle robot are the same
+// state (SafeOff) and only one of them should cancel. See resetDriveControl.
+void requestMovementAbort(const char* reason);
 static void serviceGestureMenu(uint32_t now);
 bool startMovementGesture(const char* name, uint16_t runMs = 0);
 bool startSpinCalibration(uint16_t fullTurnMs, bool clockwise,
@@ -5829,7 +5837,31 @@ void endWsIngressQuarantine() {
   g_wsIngressBlocked.store(false, std::memory_order_release);
 }
 
+void requestMovementAbort(const char* reason) {
+  // Unconditional set. The sequencer may start between this call and the
+  // loop's next tick, and a stale-but-set flag costs at most one cancelled
+  // gesture, whereas a missed one leaves the wheels turning with no operator.
+  // The consumer (serviceMovementGesture) logs the actual cancellation, so
+  // nothing is lost by not inspecting sequencer state here — which also keeps
+  // this callable from the AsyncTCP task without touching loop-owned objects.
+  (void)reason;
+  g_movementAbortPending.store(true, std::memory_order_release);
+}
+
 static void resetDriveControl(const char* reason) {
+  // Cancel any gesture in flight. This CANNOT be inferred from
+  // DriveSession::state(): a fault reset lands the session in SafeOff, which is
+  // the same state as "idle, nobody connected" -- the state the gesture path
+  // must be allowed to run in. Without an explicit signal, a transport fault
+  // (MalformedControl / ProtocolFailure / TransportFailure / queue overflow)
+  // powers the rail down and then the very next loop tick re-energises it,
+  // because serviceMovementGesture writes drive output and each write also
+  // refreshes the 300 ms hardware lease. The independent EN cutoff therefore
+  // never fires, and the only remaining bound is the 8 s pattern cap.
+  //
+  // Net effect without this: operator loses the connection mid-`excited` and
+  // the robot keeps spinning at full speed for up to 8 s, unattended.
+  requestMovementAbort(reason);
   beginWsIngressQuarantine();
   resetDriveSessionAndPower(reason);
   endWsIngressQuarantine();
@@ -8083,6 +8115,14 @@ void serviceTurnTestSequence(uint32_t now) {
 
 void serviceMovementGesture(uint32_t now) {
   if (!g_movementSequencer.active()) return;
+  // A fault or an explicit reset cancels the gesture. Checked BEFORE the
+  // state-based guard below, because DriveSession::state() cannot express the
+  // difference between "idle, nobody connected" and "just force-reset by a
+  // transport fault" — both are SafeOff, and only the second must abort.
+  if (g_movementAbortPending.exchange(false, std::memory_order_acq_rel)) {
+    stopMovementGesture("drive control reset");
+    return;
+  }
   // Abort only when the operator is actually DRIVING, not merely connected.
   //
   // This guard used to be `state() != SafeOff`, which was correct when the
