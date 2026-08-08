@@ -9888,7 +9888,29 @@ static bool requestExpectedSoftApStop() {
   // Callers make g_apLifecycleActive false before reaching this point. The
   // AP_STOP callback only consumes the pending marker, so after it clears the
   // marker it cannot mutate or tear down a subsequently-started activation.
-  WiFi.softAPdisconnect(/*wifioff=*/true);
+  //
+  // wifioff=FALSE, deliberately. With `true` the Arduino core shuts the WiFi
+  // driver down inside this call, and the shutdown emits a spurious
+  // AP_START -> AP_STOP pair with:
+  //     E wifi_init_default: netstack cb reg failed with 12289
+  // (checkpoint 062 recorded 12308; same fault, the code varies). That is the
+  // driver re-registering lwIP netif callbacks against a netif chain it is in
+  // the middle of destroying, and it leaves the stack able to bring an AP up
+  // and hand out DHCP leases while routing nothing to AsyncWebServer.
+  //
+  // Reproduced on current firmware 2026-08-07 via `swipe down` / `swipe up`
+  // over serial, so this is measured, not inherited.
+  //
+  // Two earlier attempts FAILED and must not be retried (checkpoint 062):
+  //   - removing WiFi.mode(WIFI_OFF) + esp_wifi_stop() from teardown
+  //   - reordering the teardown steps
+  // Both left `wifioff=true` in place, which is where the fault actually is.
+  //
+  // With `false` the radio is left initialised and only the stations are
+  // disassociated. The AP is still logically down (no SSID beacon after
+  // server.end() and the state machine's own gating), which is all the
+  // IDLE_DEMO state needs; the driver simply is not torn down and rebuilt.
+  WiFi.softAPdisconnect(/*wifioff=*/false);
   return true;
 }
 
@@ -9975,13 +9997,12 @@ static void stopWifiServer() {
   }
   Serial.println(F("override: stopping..."));
   requestWsTransportReset();
-  // NOTE: We deliberately do NOT call WiFi.mode(WIFI_OFF) or esp_wifi_stop()
-  // after softAPdisconnect(true). On ESP32-S3 Arduino-Core 2.x, that extra
-  // tear-down corrupts the netif chain — subsequent softAP() bring-ups print
-  // "wifi_init_default: netstack cb reg failed with 12308" and the AP looks
-  // up but routes no traffic to the AsyncWebServer (phone connects + gets
-  // DHCP, HTTP requests time out). softAPdisconnect(true) already drops the
-  // radio internally; that's enough.
+  // Teardown deliberately does NOT call WiFi.mode(WIFI_OFF) or esp_wifi_stop(),
+  // and calls softAPdisconnect with wifioff=FALSE. All three shut the WiFi
+  // driver down, and that shutdown is what corrupts the netif chain: the AP
+  // then comes up and hands out DHCP leases but routes nothing to the
+  // AsyncWebServer. See the comment at the softAPdisconnect call site for the
+  // measured evidence and the two fix attempts that failed.
   g_orWs.closeAll(1001, "Unavailable");
   g_orServer.end();
   requestExpectedSoftApStop();
