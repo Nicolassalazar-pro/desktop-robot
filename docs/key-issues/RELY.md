@@ -1,6 +1,22 @@
 ## Reliability [RELY]
 
-> Last reviewed: 2026-08-07 | Open: 8
+> Last reviewed: 2026-08-07 | **Revised against hardware evidence: 2026-08-08**
+> Open: 4 (RELY-5, RELY-6, and the teardown half of RELY-4) | Fixed: 3 | Won't fix: 1
+>
+> **2026-08-08 — read this before acting on any finding below.**
+> A hardware debugging session confirmed some findings, refuted one, and showed that two of the
+> *suggested fixes* were actively harmful. Severity was not a reliable guide: the two MEDIUM findings
+> (RELY-4, RELY-5) turned out to describe the single most damaging defect on the AP path — heap
+> corruption from calling into `AsyncWebSocket` off the AsyncTCP task — while the HIGH-severity
+> RELY-2 is not supported by any captured crash.
+>
+> **The rule the evidence supports, which supersedes the individual fix suggestions below:**
+> the `AsyncWebSocket` object belongs to the AsyncTCP task. The loop task publishes state into
+> atomics and never touches a client. `AsyncWebSocketClient::_queueControl` does an unsynchronised
+> `_controlQueue.add()` (`AsyncWebSocket.cpp:561`), so any `close()`, `closeAll()` or
+> `cleanupClients()` from `loop()` races AsyncTCP's `_onData` and corrupts the heap.
+> "Defer the close to the loop task" is therefore the wrong instinct, and shipping it as `973a91a`
+> crashed the board on the first phone connect.
 >
 > Scope: `src/main.cpp` (WS/AsyncTCP callbacks, drive session, servo write, override state machine),
 > `src/drive_session.cpp`, `src/movement_expression.h`, `src/piezo_tone.cpp`. Read-only review.
@@ -16,25 +32,35 @@
 
 ### RELY-1 — Non-owner `WS_EVT_DATA` still calls `client->close()` from inside the AsyncTCP callback ("prime suspect for AP restart" per the code's own comment)
 - Severity: HIGH
-- Status: OPEN
+- Status: **FIXED (2026-08-08, commit 118c5a3) — but NOT by the fix proposed below, which was wrong and crashed the board.**
 - File: `src/main.cpp:8823-8837`
 - Problem: When a WS_EVT_DATA fires for a client that is no longer the transport owner, `orOnWsEvent`
   calls `client->close()` directly on the AsyncTCP task. The code comment right above the call site
   (`main.cpp:8831-8833`) explicitly labels this pattern the "prime suspect for the AP restart" and
   calls it "a classic AsyncWebSocket use-after-free."
-- Why: This is the same class of hazard PROJECT-HISTORY §recent-bugs #1 fixed for `WS_EVT_CONNECT`
-  by moving auth rejection to the HTTP handshake (`WsAuthGuardHandler`, `main.cpp:1595`). But
-  in-flight WS_EVT_DATA frames from a client that has just lost owner status (revoked by
-  `requestWsTransportReset`, `rejectWsTransportAdmission`, or the phone-reaper at `main.cpp:10294`)
-  can still land in `orOnWsEvent` before AsyncTCP has finished tearing the client down. Calling
-  `close()` on such a client re-enters its own teardown. Observed failure mode elsewhere in this
-  codebase is `rst:0x8 (TG1WDT_SYS_RST) reason = INT_WDT`, no backtrace, because the panic
-  handler cannot print over USB CDC and the hardware watchdog resets first.
-- Fix: Do not close from AsyncTCP. Instead, enqueue a "revoke non-owner" `WsEvent` (carrying
-  `event.transportToken` and `event.client`) and let the loop task run `closeWsEventClient(event, 1008, "Forbidden")`,
-  which already does the pointer-identity check via `transportToken` (`main.cpp:5716-5720`).
-  The loop-task path is what every other rejection already funnels through (see `main.cpp:9047,
-  9054, 9063` in `serviceDriveControl`). This one path is the outlier.
+- **Confirmed on hardware.** The comment was right. Reproduced by leaving the AP mid-session, which
+  kills TCP with no FIN; the stale-owner reaper then revokes ownership, and the next late frame or
+  RST for that socket took this branch:
+
+      Guru Meditation Error: Core 1 panic'ed (LoadProhibited)
+      AsyncWebSocketClient::_onData (AsyncWebSocket.cpp:639)
+        <- _recv <- _s_recv <- _async_service_task
+
+  Reported by the operator as "it reset when I switched networks".
+- **Actual fix: drop the frame, do not close at all.** Nothing needed the close. Unauthorized clients
+  never reach here (`WsAuthGuardHandler` refuses them at the HTTP upgrade), and rejected clients are
+  closed in the CONNECT branch before they are live. What reaches this branch is only a ghost, and the
+  right treatment of ghost traffic is to ignore it and let AsyncTCP reap the socket on its own timeout.
+- **The fix proposed below was implemented as commit `973a91a` and had to be reverted.** Deferring the
+  close to the loop task does not remove the hazard, it converts it into a worse one: a cross-task data
+  race on `_controlQueue` (see RELY-4), which corrupted the heap and panicked on the *first* phone
+  connect. Recorded here because the reasoning looks correct and is not.
+- Consequence for the operator: the app can no longer learn it has been revoked from the socket
+  closing, so a telemetry-staleness watchdog was added to the web app (4 s without a telemetry frame
+  forces a reconnect). Without it the app shows "live" forever while nothing responds.
+- ~~Fix: Do not close from AsyncTCP. Instead, enqueue a "revoke non-owner" `WsEvent` (carrying
+  `event.transportToken` and `event.client`) and let the loop task run `closeWsEventClient(event, 1008, "Forbidden")`~~
+  — **REJECTED, see above. `closeWsEventClient` is itself unsafe; see RELY-5.**
 
 ---
 
@@ -58,10 +84,22 @@
   pattern the fix was designed to eliminate. `main.cpp:8734` fires whenever a second client tries
   to connect while the first still owns the transport, which is a normal user scenario (phone
   reconnects before the reaper has run).
-- Fix: Same pattern as RELY-1: do not close from `WS_EVT_CONNECT`. Enqueue an "admission
-  rejected" event, and let the loop task tear the client down. The transport-owner atomics can
-  still be released synchronously in the callback (they already are). Only the `close()` call
-  needs to be deferred.
+- **2026-08-08 — RE-ASSESSED, and this finding is not supported by evidence. Downgraded, and the
+  proposed fix was implemented, tested, and REVERTED.**
+  - The suggested change shipped as commit `973a91a` (defer all closes to the loop task). It did not
+    fix a crash; it CAUSED one, on the very first phone connect, by converting a claimed re-entrancy
+    hazard into a real cross-task data race on `_controlQueue` (see RELY-4).
+  - The INT_WDT crash this finding extrapolates from was on the *unauthenticated* connect path, which
+    `WsAuthGuardHandler` already eliminated at the HTTP handshake. There is no captured crash for the
+    remaining connect-time closes.
+  - `WS_EVT_CONNECT` runs on the AsyncTCP task, which is the task that owns the client. Closing a
+    just-rejected client there is the library's intended usage: the client is not yet live, and no
+    inbound frames are queued against it. That is materially different from RELY-1, where the close
+    landed on a client with in-flight data and a dying TCP connection.
+- Status: **CLOSED — WON'T FIX.** The closes at `8679/8690/8734/8756/8764` are correct where they are.
+- ~~Fix: Same pattern as RELY-1: do not close from `WS_EVT_CONNECT`. Enqueue an "admission
+  rejected" event, and let the loop task tear the client down.~~ — **REJECTED. Tried as `973a91a`,
+  crashed the board, reverted in `118c5a3`. Do not re-propose; see PROJECT-HISTORY §3.**
 
 ---
 
@@ -100,8 +138,32 @@
 ---
 
 ### RELY-4 — `g_orWs.closeAll()` and `g_orWs.cleanupClients()` are invoked from the loop task while AsyncTCP is concurrently servicing the same object
-- Severity: MEDIUM
-- Status: OPEN
+- Severity: **HIGH (raised from MEDIUM — this was the heap corruptor)**
+- Status: **FIXED in the reaper (2026-08-08, commit 118c5a3). Still present in the two teardown
+  paths (`stopWifiServer`, `handleApLifecycleFault`), which are one-shot and quarantined.**
+- **CONFIRMED ON HARDWARE — no longer "would require correlating a crash".** The review called this
+  MEDIUM and hard to attribute. It was in fact the most damaging defect on the AP path, and the
+  correlation the finding asked for was captured directly:
+
+      Guru Meditation Error: Core 1 panic'ed (StoreProhibited)
+      _async_service_task -> _s_recv -> _recv -> _onData
+        -> _queueControl -> LinkedList::add -> operator new
+        -> malloc -> tlsf_malloc -> block_locate_free -> remove_free_block
+
+  The fault is inside the allocator's own free-list unlink, i.e. the heap metadata was already
+  corrupt and `operator new` was merely the first allocation to touch the poisoned block.
+  `close()`/`closeAll()` reach `AsyncWebSocketClient::_queueControl`, which does an unsynchronised
+  `_controlQueue.add()` (`AsyncWebSocket.cpp:561`) — the identical call AsyncTCP makes from `_onData`.
+- Why the per-tick `cleanupClients()` was the worst part: it ran on EVERY loop pass in `ORS_RUNNING`,
+  so the race window was permanently open, not just during a reaper firing.
+- **Fix applied: the reaper no longer calls into AsyncWebSocket at all.** `requestWsTransportReset()`
+  is pure atomics and already does the whole job — it makes `wsTransportOwnerConnected()` false, which
+  is the entire meaning of "release the transport". Both library calls were deleted. A ghost socket
+  left open is harmless: it is no longer the owner, and its frames are ignored.
+- Note on the suggested fix below (wrap the reaper in ingress quarantine): that would NOT have been
+  sufficient. The quarantine drains inbound callbacks, but `_queueControl` is also reachable from
+  AsyncTCP's own TCP-level processing; the only safe rule is that the loop task never touches the
+  object. See RELY-5 for the remaining instance.
 - File: `src/main.cpp:10024, 10124, 10286, 10294`
 - Problem: `AsyncWebSocket` is not documented as thread-safe. `orOnWsEvent` runs on the AsyncTCP
   task and may be mid-callback (holding a `WsIngressGuard`, iterating the client list, or
@@ -131,8 +193,29 @@
 ---
 
 ### RELY-5 — `closeWsEventClient` looks up a client on the loop task via `g_orWs.client(id)` while AsyncTCP may be adding/removing that client
-- Severity: MEDIUM
-- Status: OPEN
+- Severity: **HIGH (raised from MEDIUM)**
+- Status: **OPEN — but no longer speculative. This is the same mechanism as RELY-4, which was
+  confirmed on hardware as a heap corruptor on 2026-08-08. Treat as a live defect, not a "would be
+  hard to attribute" theoretical.**
+- **2026-08-08 update.** RELY-4 was fixed and the crash it caused was captured in full:
+  `close()` reaches `AsyncWebSocketClient::_queueControl`, which does an unsynchronised
+  `_controlQueue.add()` (`AsyncWebSocket.cpp:561`, `StringArray.h:76`) — the same call AsyncTCP makes
+  from `_onData` on its own task. Two tasks allocating into one unlocked LinkedList wrecks the TLSF
+  free list, and the next `malloc` dies in the allocator's own bookkeeping. `closeWsEventClient`
+  performs *exactly* this call from the loop task, from 7 sites.
+- **The codebase already has the correct pattern, and this function is the outlier.**
+  `publishWsTelemetrySnapshot()` deliberately does not send: the loop task publishes into a
+  seqlock-protected atomic snapshot and the AsyncTCP task performs the write
+  (`copyWsTelemetrySnapshot`). Loop publishes state; AsyncTCP does all client I/O.
+  `terminateWsTransportForProtocolFault` likewise closes from the AsyncTCP task, which is correct.
+- Why it has not yet been changed: the safety-critical half already happens without touching the
+  client — ownership is revoked and `g_wsTransportFaultToken` is latched, so a faulted client cannot
+  drive and cannot re-admit. The close is only how the *phone* learns to reconnect. Removing it
+  naively reproduces "connected but won't respond" (see RELY-1), so the web-app telemetry-staleness
+  watchdog had to land first. It now has, which unblocks this.
+- Suggested fix: delete the close from the loop path and let revocation + the client-side 4 s
+  staleness watchdog drive recovery. Do NOT "defer" it to another task — that was tried for RELY-1
+  as commit `973a91a` and made things strictly worse.
 - File: `src/main.cpp:5714-5722`; call sites `main.cpp:5744, 9047, 9054, 9063`
 - Problem: `closeWsEventClient` calls `AsyncWebSocket::client(id)` from the loop task, walks the
   internal client list, and then calls `close()`. The pointer-identity check against

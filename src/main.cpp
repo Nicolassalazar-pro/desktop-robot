@@ -8515,8 +8515,8 @@ let linkLive=false,driveStatus='LOCKED';
 /* STOP latch. While true, every control frame is forced to zero and the
    sticks refuse to take input. See stopAll(). */
 let stopLatched=false;
-let reconnectTimer=null,reconnectAttempt=0;
-const RECONNECT_BASE_MS=500,RECONNECT_MAX_MS=8000;
+let reconnectTimer=null,reconnectAttempt=0,lastRxMs=0,rxWatchdog=null;
+const RECONNECT_BASE_MS=500,RECONNECT_MAX_MS=8000,RX_STALE_MS=4000;
 function paintLink(){const d=$('dot'),t=$('linkT');d.classList.toggle('live',linkLive);d.classList.toggle('stopped',stopLatched);
   /* STOPPED outranks link state in the pill: while latched, that is the single
      most important thing on screen. Shown as text, not colour alone. */
@@ -8535,17 +8535,37 @@ function retryWs(status){
   reconnectAttempt=Math.min(reconnectAttempt+1,5);
   reconnectTimer=setTimeout(()=>{reconnectTimer=null;openWs()},delay);
 }
+/* An open socket is not the same as a working link.
+   The robot streams telemetry at 5 Hz, so silence means the link is dead even
+   though onclose never fired. That happens whenever the firmware revokes this
+   client's transport ownership: from then on our frames are ignored, and --
+   deliberately -- the firmware does NOT close the socket, because closing a
+   client from a stale data path was a use-after-free that reset the board.
+   Without this watchdog the app sits showing "live" forever while nothing
+   responds. Reported as "im connected to the network but it wont respond to
+   the controller". Forcing close() drops us into the normal onclose backoff. */
+function armRxWatchdog(){
+  if(rxWatchdog!==null)return;
+  rxWatchdog=setInterval(()=>{
+    if(!ws||ws.readyState!==WebSocket.OPEN)return;
+    if(lastRxMs&&Date.now()-lastRxMs>RX_STALE_MS){
+      driveStatus='LINK STALE';paintLink();
+      try{ws.close()}catch(e){}
+    }
+  },1000);
+}
 function openWs(){
   if(!ACCESS_TOKEN){driveStatus='AUTH REQUIRED';setLink(false);return}
   if(ws&&(ws.readyState===WebSocket.OPEN||ws.readyState===WebSocket.CONNECTING))return;
   ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws?k='+encodeURIComponent(ACCESS_TOKEN));
   ws.binaryType='arraybuffer';
-  ws.onopen=()=>{reconnectAttempt=0;if(reconnectTimer!==null){clearTimeout(reconnectTimer);reconnectTimer=null}seq=0;neutralUi();setLink(true);sendCtrl(0,0)};
+  ws.onopen=()=>{reconnectAttempt=0;if(reconnectTimer!==null){clearTimeout(reconnectTimer);reconnectTimer=null}seq=0;lastRxMs=Date.now();armRxWatchdog();neutralUi();setLink(true);sendCtrl(0,0)};
   ws.onclose=e=>{neutralUi();sendCtrl(0,0);setLink(false);if(e.code===1008&&e.reason==='Forbidden'){driveStatus='AUTH FAILED';paintLink();return}retryWs(e.reason==='Owner busy'?'OWNER BUSY':e.reason==='Stale'?'STALE':e.reason==='Unavailable'?'UNAVAILABLE':'RETRYING')};
   ws.onerror=()=>{try{ws.close()}catch(e){}};
   ws.onmessage=e=>{
     const v=new DataView(e.data);
     if(v.byteLength!==30||v.getUint8(0)!==OP_TELEMETRY)return;
+    lastRxMs=Date.now();
     const dsp=v.getUint16(3)/1000,pct=v.getUint8(5),mood=v.getUint8(6),chg=v.getUint8(7);
     $('dsp').textContent=dsp.toFixed(2);
     $('pct').textContent=pct;

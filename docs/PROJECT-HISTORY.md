@@ -838,6 +838,98 @@ correct fix and remains on the deferred list.
 
 ---
 
+### R44 — Deferring `AsyncWebSocketClient::close()` to the loop task
+**Tried:** commit `973a91a`, "never close a websocket client from the AsyncTCP
+callback". A pending-close queue was filled from `orOnWsEvent` and drained by
+`serviceWsPendingCloses()` in `loop()`.
+**Why:** RELY-1/RELY-2 both argued that closing a client from inside its own
+AsyncTCP callback re-enters its teardown, and blamed it for an INT_WDT reset.
+The reasoning is plausible and reads correctly.
+**Why rejected:** it is exactly backwards, and it crashed the board on the
+FIRST phone connect. `AsyncWebSocketClient::_queueControl` does an
+unsynchronised `_controlQueue.add()` (`AsyncWebSocket.cpp:561`,
+`StringArray.h:76`); `close()` goes through it, and AsyncTCP calls the same
+path from `_onData` on its own task. Moving closes to `loop()` therefore
+converts a claimed re-entrancy hazard into a real cross-task data race on an
+unlocked LinkedList, which corrupts the TLSF free list:
+
+    Guru Meditation Error: Core 1 panic'ed (StoreProhibited)
+    _async_service_task -> _s_recv -> _recv -> _onData
+      -> _queueControl -> LinkedList::add -> operator new
+      -> tlsf_malloc -> block_locate_free -> remove_free_block
+
+Reverted in `118c5a3`. **The library is single-task by design: the
+`AsyncWebSocket` object belongs to the AsyncTCP task.** The loop task
+publishes state into atomics and never touches a client — which is the pattern
+`publishWsTelemetrySnapshot()` already followed.
+**Basis:** MEASURED (decoded backtrace, hardware, 2026-08-08).
+
+---
+
+### R45 — Closing a non-owner client from the WS data path
+**Tried:** long-standing. `orOnWsEvent` called `client->close()` whenever a
+frame arrived from a client that was no longer the transport owner.
+**Why:** tidiness — evict a client that has lost its claim.
+**Why rejected:** use-after-free. Leaving the AP kills TCP with no FIN, so the
+socket lingers; the stale-owner reaper then revokes ownership, making that
+once-legitimate client a non-owner. Its next late frame or RST hit `close()`
+on a client AsyncTCP was already tearing down, and the following `_recv` read
+freed memory:
+
+    Guru Meditation Error: Core 1 panic'ed (LoadProhibited)
+    AsyncWebSocketClient::_onData (AsyncWebSocket.cpp:639)
+
+Reported as "it reset when I switched networks". The code's own comment had
+predicted this exact failure for months. Nothing needed the close:
+`WsAuthGuardHandler` refuses unauthorized clients at the HTTP upgrade, and
+rejected clients are closed in the CONNECT branch before they are live.
+Ghost traffic is now dropped. **Consequence:** the app can no longer learn it
+was revoked from the socket closing, so the web app gained a 4 s
+telemetry-staleness watchdog that forces a reconnect.
+**Basis:** MEASURED (decoded backtrace, hardware, 2026-08-08).
+
+---
+
+### R46 — Unsigned `(now - timestamp)` for any value written by another task
+**Tried:** long-standing, in the stale-owner reaper:
+`static_cast<uint32_t>(now - g_lastControlEventMs) > kWsOwnerSilenceTimeoutMs`.
+**Why:** the standard Arduino rollover-safe idiom — which it is, but only when
+both operands come from the same task.
+**Why rejected:** `g_lastControlEventMs` is stamped by the AsyncTCP task when a
+frame lands; `now` is captured by the loop task at the top of its pass. They run
+concurrently, so a frame arriving in between is legitimately IN THE FUTURE.
+Unsigned, the subtraction wraps to ~4.29e9, which beats any threshold:
+
+    override: ws owner silent 4294967295ms -> releasing transport
+    drive session: SAFE_OFF reason=ws owner silent
+
+That cut drive power mid-run on a completely healthy session (seq 42→179 with
+clean servo readbacks) and dropped the robot into GRACE. With control frames
+streaming at 30–60 Hz it was near-inevitable. **Use a signed `int32_t` delta**,
+so a negative value reads as "just heard from them" — which is also correct
+across the 49.7-day `millis()` rollover. The other five `now - timestamp`
+comparisons in `main.cpp` are safe because their timestamps are written by the
+loop task itself.
+**Basis:** MEASURED (serial capture, hardware, 2026-08-08).
+
+---
+
+### R47 — Suppressing the boot logo to hide a "network reset flash"
+**Tried (proposed by the user, correctly withdrawn after evidence):** hide the
+garage logo animation when the AP resets while already running.
+**Why:** the logo appeared to flash on every network drop, which read as
+cosmetic noise during normal reconnect cleanup.
+**Why rejected:** `runStartupLogoAnimation()` is only reachable from `setup()`,
+from `wake`, and from the power-off path. There is no route from a transport or
+AP reset to it. **A logo flash therefore means the board rebooted**, and
+suppressing it would have hidden a crash rather than fixed one — the same trap
+as the black-screen investigation, where every "fix" appeared to work because
+opening the serial port drained the CDC FIFO. The flash was real and was the
+use-after-free in R45; once that was fixed the flash stopped.
+**Basis:** MEASURED (call-graph + serial capture, 2026-08-08).
+
+---
+
 ## 4. Hardware facts and measured constants
 
 ### 4.1 Pin map (final)
