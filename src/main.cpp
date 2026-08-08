@@ -1636,12 +1636,6 @@ void stopMovementGesture(const char* reason);
 // DriveSession::state(), because a fault reset and an idle robot are the same
 // state (SafeOff) and only one of them should cancel. See resetDriveControl.
 void requestMovementAbort(const char* reason);
-// Queue a websocket close from the AsyncTCP task; performed later on the loop
-// task. Closing from inside an AsyncTCP callback re-enters the client's own
-// teardown and has crashed this board with INT_WDT.
-void requestWsClientClose(AsyncWebSocketClient* client, uint16_t code,
-                          const char* reason);
-void serviceWsPendingCloses();
 static void serviceGestureMenu(uint32_t now);
 bool startMovementGesture(const char* name, uint16_t runMs = 0);
 bool startSpinCalibration(uint16_t fullTurnMs, bool clockwise,
@@ -5811,85 +5805,27 @@ void closeWsEventClient(const WsEvent& event, uint16_t code,
 }
 
 // ---------------------------------------------------------------------------
-// Deferred websocket close.
+// THE ASYNCWEBSOCKET OBJECT BELONGS TO THE ASYNCTCP TASK. DO NOT TOUCH IT
+// FROM loop().
 //
-// Closing a client from inside an AsyncTCP callback re-enters that client's own
-// teardown. It is the pattern that crashed this board with INT_WDT and no
-// backtrace (the panic handler cannot print over USB CDC, so the hardware
-// watchdog resets first). It was fixed for the auth path by refusing
-// unauthorised upgrades at the HTTP handshake, before any client object exists
-// -- but every OTHER rejection reason still built a real client and then closed
-// it from inside its own callback.
+// AsyncWebSocketClient::_queueControl does an unsynchronised
+// `_controlQueue.add()` (AsyncWebSocket.cpp:561, StringArray.h:76). close()
+// goes through that same path. So calling close() -- or closeAll(), or
+// cleanupClients() -- from the loop task races AsyncTCP's own _onData on the
+// identical LinkedList, and two concurrent operator new calls corrupt the heap.
 //
-// So requests are queued here and performed by the loop task, which is where
-// every other rejection already runs. The identity check on the loop side is
-// the same pointer-vs-token comparison closeWsEventClient uses, so a client
-// that AsyncTCP has already destroyed and reallocated is not closed by mistake.
+// This is not theoretical. A deferred-close queue was added here to move
+// closes OFF the AsyncTCP callback, on the theory that closing from inside a
+// callback was the cause of an earlier crash. It made things strictly worse
+// and produced, on the first phone connect:
 //
-// Fixed capacity, no heap, and duplicates are collapsed: a rejected client
-// keeps sending frames until the close lands, and each one would otherwise
-// queue another request.
-struct PendingWsClose {
-  uint32_t client;
-  uintptr_t token;
-  uint16_t code;
-  const char* reason;  // static string literals only
-};
-
-constexpr uint8_t kMaxPendingWsCloses = 8;
-PendingWsClose g_pendingWsCloses[kMaxPendingWsCloses];
-uint8_t g_pendingWsCloseCount = 0;
-portMUX_TYPE g_pendingWsCloseMux = portMUX_INITIALIZER_UNLOCKED;
-
-// Callable from the AsyncTCP task. Never closes; only records the intent.
-void requestWsClientClose(AsyncWebSocketClient* client, uint16_t code,
-                          const char* reason) {
-  if (client == nullptr) return;
-  const uint32_t id = client->id();
-  const uintptr_t token = reinterpret_cast<uintptr_t>(client);
-  portENTER_CRITICAL(&g_pendingWsCloseMux);
-  bool duplicate = false;
-  for (uint8_t i = 0; i < g_pendingWsCloseCount; ++i) {
-    if (g_pendingWsCloses[i].client == id &&
-        g_pendingWsCloses[i].token == token) {
-      duplicate = true;
-      break;
-    }
-  }
-  if (!duplicate && g_pendingWsCloseCount < kMaxPendingWsCloses) {
-    g_pendingWsCloses[g_pendingWsCloseCount].client = id;
-    g_pendingWsCloses[g_pendingWsCloseCount].token = token;
-    g_pendingWsCloses[g_pendingWsCloseCount].code = code;
-    g_pendingWsCloses[g_pendingWsCloseCount].reason = reason;
-    ++g_pendingWsCloseCount;
-  }
-  portEXIT_CRITICAL(&g_pendingWsCloseMux);
-}
-
-// Loop task only.
-void serviceWsPendingCloses() {
-  PendingWsClose batch[kMaxPendingWsCloses];
-  uint8_t count = 0;
-  // Copy out under the lock, then do the actual closes outside it. close()
-  // reaches into AsyncTCP and must never run with interrupts disabled.
-  portENTER_CRITICAL(&g_pendingWsCloseMux);
-  count = g_pendingWsCloseCount;
-  for (uint8_t i = 0; i < count; ++i) batch[i] = g_pendingWsCloses[i];
-  g_pendingWsCloseCount = 0;
-  portEXIT_CRITICAL(&g_pendingWsCloseMux);
-
-  for (uint8_t i = 0; i < count; ++i) {
-    AsyncWebSocketClient* c = g_orWs.client(batch[i].client);
-    // Pointer identity guards against the id having been recycled onto a
-    // different client since the request was queued.
-    if (c == nullptr ||
-        reinterpret_cast<uintptr_t>(c) != batch[i].token) {
-      continue;
-    }
-    c->close(batch[i].code, batch[i].reason);
-  }
-}
-
+//   Guru Meditation Error: Core 1 panic'ed (StoreProhibited)
+//   ... _async_service_task -> _s_recv -> _recv -> _onData
+//       -> _queueControl -> LinkedList::add -> operator new
+//
+// The library is single-task by design. Closes therefore happen on the
+// AsyncTCP task, which is where its callbacks already run. The loop task
+// touches only OUR atomics.
 void rejectWsTransportAdmission(const WsEvent& event, const char* reason) {
   lockWsTransportState();
   const bool currentOwner =
@@ -6482,22 +6418,13 @@ bool startMovementGesture(const char* name, uint16_t runMs) {
     return false;
   }
   g_movementLastTickMs = now;
-  // An expression is movement AND sound. Sound and movement have different
-  // vocabularies (three movements, three generated moods), so each gesture
-  // picks the mood whose emotional tone matches the motion:
-  // frustrated->confused (sour/searching), excited->happy (rising major
-  // line), scared->confused (unsettled, not tonally resolved). Nothing maps
-  // to `sad` yet — that is a real gap in the vocabulary rather than an
-  // oversight.
-  MelodyGen::Mood accompanyingMood = MelodyGen::Mood::Happy;
-  if (strcmp(pattern->name, "frustrated") == 0) {
-    accompanyingMood = MelodyGen::Mood::Confused;
-  } else if (strcmp(pattern->name, "excited") == 0) {
-    accompanyingMood = MelodyGen::Mood::Happy;
-  } else if (strcmp(pattern->name, "scared") == 0) {
-    accompanyingMood = MelodyGen::Mood::Confused;
-  }
-  playMood(accompanyingMood);
+  // Movement only. A movement button moves; it does not play a melody.
+  //
+  // This used to also fire playMood() with an "accompanying mood" mapped from
+  // the pattern name, on the reasoning that "an expression is movement AND
+  // sound". That was never asked for. The web app has three separate button
+  // groups -- Faces, Sounds, Moves -- and each one does exactly its own thing.
+  // Sound is triggered by OP_SOUND from the Sounds sheet.
   Serial.printf("gesture: %s %lums\n", pattern->name,
                 static_cast<unsigned long>(
                     MovementExpression::totalDurationMs(*pattern)));
@@ -8893,7 +8820,7 @@ void terminateWsTransportForProtocolFault(
     }
     enqueueWsEventForCapturedOwnerWhileGuarded(event);
   }
-  requestWsClientClose(client, 1002, "Protocol fault");
+  client->close(1002, "Protocol fault");
 }
 
 // AsyncTCP context: own transport identity/lifetime, send only the published
@@ -8935,7 +8862,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
       Serial.printf("ws: client #%lu rejected; activation token required\n",
                     static_cast<unsigned long>(clientId));
       wsStep(3);
-      requestWsClientClose(client, 1008, "Forbidden");
+      client->close(1008, "Forbidden");
       wsStep(4);
       return;
     }
@@ -8946,7 +8873,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   if (!ingress) {
     wsStep(6);
     if (type != WS_EVT_DISCONNECT) {
-      requestWsClientClose(client, 1000, "Closing");
+      client->close();
     }
     wsStep(7);
     return;
@@ -8978,6 +8905,21 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
       g_wsTransportLastTelemetryMs.store(0, std::memory_order_relaxed);
       g_wsTransportOwnerToken.store(token, std::memory_order_release);
       g_wsTransportOpenCount.store(1U, std::memory_order_release);
+      // Arm the liveness clock AT ADMISSION.
+      //
+      // This line is the whole reason a phone could not connect. The stale-
+      // owner reaper fires when (now - g_lastControlEventMs) exceeds 8 s, but
+      // g_lastControlEventMs was only ever written when a control FRAME
+      // arrived -- never when a client was admitted. It starts at 0, so a
+      // client admitted at millis()=90000 was instantly judged to have been
+      // silent for 90 s, and the reaper killed it on the very next loop pass,
+      // before the phone had sent its first frame. Captured on hardware:
+      //
+      //     ws: client #1 connected
+      //     Guru Meditation Error: Core 1 panic'ed (StoreProhibited)
+      //
+      // The owner has by definition just been heard from. Say so.
+      g_lastControlEventMs = now;
       accepted = true;
     }
     unlockWsTransportState();
@@ -8990,10 +8932,10 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
                         : (transportFaultClosePending
                                ? "faulted transport closing"
                                : "transport owner busy"));
-      requestWsClientClose(client, 1008,
-                           (activationFaulted || transportFaultClosePending)
-                               ? "Unavailable"
-                               : "Owner busy");
+      client->close(1008,
+                    (activationFaulted || transportFaultClosePending)
+                        ? "Unavailable"
+                        : "Owner busy");
       return;
     }
 
@@ -9012,7 +8954,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
         g_wsTransportOpenCount.store(0U, std::memory_order_release);
       }
       unlockWsTransportState();
-      requestWsClientClose(client, 1000, "Closing");
+      client->close();
       return;
     }
 
@@ -9020,7 +8962,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     if (g_wsTransportOwnerToken.load(std::memory_order_acquire) != token ||
         g_wsTransportOwnerGeneration.load(std::memory_order_acquire) !=
             g_wsTransportGeneration.load(std::memory_order_acquire)) {
-      requestWsClientClose(client, 1000, "Closing");
+      client->close();
       return;
     }
     if (copyWsTelemetrySnapshot(frame) &&
@@ -9087,12 +9029,26 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   unlockWsTransportState();
   wsStep(20);
   if (!currentOwner) {
-    // A non-owner frame. This is the path a rejected second client takes, and
-    // it is the prime suspect for the AP restart: close() on a client that is
-    // already tearing down is a classic AsyncWebSocket use-after-free.
+    // Ignore the frame. Do NOT close.
+    //
+    // Closing here is a use-after-free, and it is what crashed the board the
+    // moment a phone switched WiFi networks. Leaving the AP kills the TCP with
+    // no FIN, so the socket lingers; the stale-owner reaper then releases
+    // ownership, which makes this once-legitimate client a non-owner. Its next
+    // late frame or RST lands here, close() runs on a client AsyncTCP is
+    // already tearing down, and the following _recv reads freed memory:
+    //
+    //     Guru Meditation Error: Core 1 panic'ed (LoadProhibited)
+    //     AsyncWebSocketClient::_onData (AsyncWebSocket.cpp:639)
+    //       <- _recv <- _s_recv <- _async_service_task
+    //
+    // Nothing needs the close. Unauthorized clients never reach here -- they
+    // are refused at the HTTP upgrade by WsAuthGuardHandler ("ws: upgrade
+    // refused at handshake"). A rejected client is closed in the CONNECT
+    // branch, which runs before the client is live. What is left here is only
+    // a ghost, and the correct treatment of a ghost's traffic is to drop it
+    // and let AsyncTCP reap the socket on its own timeout.
     wsStep(21);
-    requestWsClientClose(client, 1000, "Closing");
-    wsStep(22);
     return;
   }
   event.transportFlags = kWsEventTransportOwner;
@@ -9194,7 +9150,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     return;
   }
   if (!enqueueWsEventForCapturedOwnerWhileGuarded(event)) {
-    requestWsClientClose(client, 1000, "Closing");
+    client->close();
     return;
   }
   if (!telemetryTraffic) {
@@ -9216,7 +9172,7 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
   if (g_wsTransportOwnerToken.load(std::memory_order_acquire) != token ||
       g_wsTransportOwnerGeneration.load(std::memory_order_acquire) !=
           g_wsTransportGeneration.load(std::memory_order_acquire)) {
-    requestWsClientClose(client, 1000, "Closing");
+    client->close();
     return;
   }
   uint32_t expectedTelemetryMs = lastTelemetryMs;
@@ -10419,6 +10375,26 @@ void overrideLoop() {
     Serial.println(F("override: gesture=SwipeDown"));
     if (g_orState == ORS_IDLE) {
       enterWifiBoot();
+    } else if (g_orState == ORS_GRACE) {
+      // Swipe down during GRACE means "give me the QR back so I can
+      // reconnect". Honour it.
+      //
+      // GRACE hides both QRs on purpose -- they carry the access token, so
+      // they must not sit on screen after the owner walks away. But a swipe is
+      // a deliberate act by somebody standing at the robot, which is exactly
+      // the condition that makes showing the code safe again.
+      //
+      // Without this the robot is unreachable for the full 30 s GRACE window:
+      // the face is up, no QR is visible, and the swipe was refused as
+      // "already past IDLE" -- reported as "it won't let me slide down to show
+      // the QR code when I want to reconnect".
+      //
+      // Returning to RUNNING rather than tearing down is what makes it
+      // instant: the AP is still up throughout GRACE, so there is no restart,
+      // no boot logo and no waiting. Credentials outlive GRACE
+      // (resetDriveControl does not invalidate them), so the QR is still valid.
+      Serial.println(F("override: SwipeDown during GRACE -> QR restored"));
+      enterRunning();
     } else {
       Serial.println(F("override: SwipeDown ignored (already past IDLE)"));
     }
@@ -10539,18 +10515,55 @@ void overrideLoop() {
       // still there forever.
       //
       // The web app streams control frames continuously, so silence from the
-      // owner is a reliable liveness signal. cleanupClients() alone is not
-      // enough: it only reaps clients that already changed status, which a
-      // silently-dead socket never does.
-      g_orWs.cleanupClients();
-      breadcrumb(kCrumbWsCleanup);
+      // owner is a reliable liveness signal.
+      //
+      // Releasing ownership is done ENTIRELY through our own atomics.
+      // requestWsTransportReset() bumps the transport generation, which makes
+      // wsTransportOwnerConnected() false and lets a new phone in -- that is
+      // the whole point of the reaper, and it needs no library call at all.
+      //
+      // What used to be here was `g_orWs.cleanupClients()` every pass plus
+      // `g_orWs.closeAll(1001, "Stale")`, both from the LOOP task. That is a
+      // heap-corrupting cross-task mutation: AsyncWebSocketClient::close()
+      // goes through _queueControl, which does an unsynchronised
+      // _controlQueue.add() (AsyncWebSocket.cpp:561), and AsyncTCP calls the
+      // exact same path from _onData on its own task. Two tasks allocating
+      // into one unlocked LinkedList wrecks the TLSF free list, and the next
+      // malloc dies inside remove_free_block:
+      //
+      //     _onData -> _queueControl -> operator new -> tlsf_malloc
+      //             -> block_locate_free -> remove_free_block   StoreProhibited
+      //
+      // The AsyncWebSocket object belongs to the AsyncTCP task. The loop task
+      // reads our atomics and nothing else. A ghost socket left open is
+      // harmless: it is no longer the owner, and if it ever does send a frame
+      // it gets closed from the AsyncTCP callback, which is the safe place.
+      // SIGNED delta. This must never be an unsigned subtraction.
+      //
+      // g_lastControlEventMs is written from the AsyncTCP task (it is
+      // event.receivedAtMs, stamped when the frame landed) and compared here
+      // against `now`, which the loop task captured at the top of its pass.
+      // AsyncTCP runs concurrently, so a frame that arrives in between is
+      // legitimately a millisecond or two IN THE FUTURE relative to `now`.
+      //
+      // Unsigned, that underflows to ~4.29e9, which is always greater than the
+      // 8 s threshold, so the reaper fired instantly and killed a live
+      // session. Captured on hardware mid-drive, right after a healthy run of
+      // control frames:
+      //
+      //     override: ws owner silent 4294967295ms -> releasing transport
+      //     drive session: SAFE_OFF reason=ws owner silent
+      //     override: -> GRACE (30 s window)
+      //
+      // A negative delta means "heard from them a moment ago", i.e. the
+      // opposite of silent. The signed form is also what makes this correct
+      // across the millis() rollover at 49.7 days.
+      const int32_t ownerSilentMs =
+          static_cast<int32_t>(now - g_lastControlEventMs);
       if (wsTransportOwnerConnected() &&
-          static_cast<uint32_t>(now - g_lastControlEventMs) >
-              kWsOwnerSilenceTimeoutMs) {
-        Serial.printf("override: ws owner silent %lums -> releasing transport\n",
-                      static_cast<unsigned long>(now - g_lastControlEventMs));
-        breadcrumb(kCrumbWsCloseAll);
-        g_orWs.closeAll(1001, "Stale");
+          ownerSilentMs > static_cast<int32_t>(kWsOwnerSilenceTimeoutMs)) {
+        Serial.printf("override: ws owner silent %ldms -> releasing transport\n",
+                      static_cast<long>(ownerSilentMs));
         requestWsTransportReset();
         resetDriveControl("ws owner silent");
         g_lastControlEventMs = now;
@@ -10566,6 +10579,8 @@ void overrideLoop() {
       static uint32_t s_diagNextMs = 0;
       if (now >= s_diagNextMs) {
         s_diagNextMs = now + 1000;
+        const int32_t ageMs =
+            static_cast<int32_t>(now - g_lastControlEventMs);
         if (serialCanWrite())
         Serial.printf("diag: ctrl_rx=%u/s mood_rx=%u/s raw=(%d,%d) effective=(%d,%d) requestedUs=(%u,%u) readbackUs=(%u,%u) ageMs=%lu rail=%u outputValid=%u session=%s cal=%s wsClients=%u touchEvts=%u\n",
             static_cast<unsigned>(g_diagCtrlRx),
@@ -10578,7 +10593,12 @@ void overrideLoop() {
             static_cast<unsigned>(g_servoRightRequestedPulseUs),
             static_cast<unsigned>(g_servoLeftReadbackPulseUs),
             static_cast<unsigned>(g_servoRightReadbackPulseUs),
-            static_cast<unsigned long>(now - g_lastControlEventMs),
+            // Signed, and clamped at zero: this timestamp comes from the
+            // AsyncTCP task, so it can be a hair ahead of the loop's `now`.
+            // Unsigned it prints 4294967295, which reads as a stuck link when
+            // the truth is the opposite -- a frame just arrived.
+            static_cast<unsigned long>(
+                ageMs < 0 ? 0 : ageMs),
             g_driveRailOn ? 1U : 0U,
             g_driveOutputValid ? 1U : 0U,
             driveSessionStateName(g_driveSession.state()),
@@ -10994,9 +11014,6 @@ void loop() {
   // [DEBUG-DELETE] pump override HTTP server + drive-watchdog
   breadcrumb(kCrumbLoopOverride);
   overrideLoop();
-  // Perform any websocket closes the AsyncTCP callbacks asked for. Runs on the
-  // loop task by design; see requestWsClientClose.
-  serviceWsPendingCloses();
   // [DEBUG-DELETE] END
   breadcrumb(kCrumbLoopPower);
   checkPowerButton();
