@@ -88,14 +88,20 @@ class PowerAnimationContractTests(unittest.TestCase):
         )
 
     def test_serial_sleep_and_wake_share_animation_language(self) -> None:
-        dispatch = function_body(MAIN, "void dispatchCommand(char* line)")
-        self.assertIn("runSleepLogoAnimation()", dispatch)
-        self.assertIn("runWakeLogoAnimation()", dispatch)
-        self.assertIn('resetDriveControl("serial sleep")', dispatch)
+        # The `sleep`/`wake` serial commands were extracted into
+        # cmdSleep/cmdWake handler functions when dispatchCommand was
+        # split into a table (see src/serial_console.h).  The lifecycle
+        # contract is unchanged; only the enclosing function-body address
+        # moved.
+        sleep_body = function_body(MAIN, "void cmdSleep(char* argument)")
+        self.assertIn("runSleepLogoAnimation()", sleep_body)
+        self.assertIn('resetDriveControl("serial sleep")', sleep_body)
         self.assertLess(
-            dispatch.index("g_paused = true"),
-            dispatch.index('resetDriveControl("serial sleep")'),
+            sleep_body.index("g_paused = true"),
+            sleep_body.index('resetDriveControl("serial sleep")'),
         )
+        wake_body = function_body(MAIN, "void cmdWake(char* argument)")
+        self.assertIn("runWakeLogoAnimation()", wake_body)
         output = function_body(MAIN, "bool writeDriveOutputLocked(")
         self.assertIn("g_systemShuttingDown || g_paused", output)
         service = function_body(

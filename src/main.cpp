@@ -46,6 +46,7 @@
 #include <esp_random.h>
 
 #include "override_html.h"
+#include "serial_console.h"
 
 namespace {
 
@@ -2659,29 +2660,6 @@ char* normalizeLine(char* line) {
   return line;
 }
 
-char* splitArgument(char* line) {
-  char* cursor = line;
-  while ((*cursor != '\0') && !isspace(static_cast<unsigned char>(*cursor))) {
-    ++cursor;
-  }
-  if (*cursor == '\0') {
-    return nullptr;
-  }
-
-  *cursor = '\0';
-  ++cursor;
-  while ((*cursor != '\0') && isspace(static_cast<unsigned char>(*cursor))) {
-    ++cursor;
-  }
-
-  char* end = cursor + strlen(cursor);
-  while ((end > cursor) && isspace(static_cast<unsigned char>(*(end - 1)))) {
-    --end;
-  }
-  *end = '\0';
-  return cursor;
-}
-
 bool parseMood(const char* name, EyeMood& outMood) {
   for (size_t index = 0; index < (sizeof(kMoodCommands) / sizeof(kMoodCommands[0])); ++index) {
     if (strcmp(name, kMoodCommands[index].name) == 0) {
@@ -3237,1908 +3215,1894 @@ void printGestureUsage() {
   Serial.println(F("|stop>  (frustrated accepts an optional runMs)"));
 }
 
-void printHelp() {
-  Serial.println(F("help"));
-  Serial.println(F("ping"));
-  Serial.println(F("status"));
-  Serial.println(F("mood <default|bored|annoyed|tired|angry|happy|sad|think|error|"));
-  Serial.println(F("      surprised|scared|wink|sleeping|love|confused|curious>"));
-  Serial.println(F("look <default|center|n|ne|e|se|s|sw|w|nw>"));
-  Serial.println(F("blink"));
-  Serial.println(F("wander <on|off>"));
-  Serial.println(F("dims <w> <h> <r>"));
-  Serial.println(F("motion <x> <y>"));
-  Serial.println(F("blinkrate <sec> <jitter>"));
-  Serial.println(F("color <RRGGBB|green|cyan|red|blue|yellow|white|magenta|orange>"));
-  Serial.println(F("headgain <xDiv> <yDiv>"));
-  Serial.println(F("tone <hz>"));
-  Serial.println(F("sleep"));
-  Serial.println(F("wake"));
-  Serial.println(F("demo"));
-  Serial.println(F("motorstate"));
-  Serial.println(F("cal show"));
-  Serial.println(F("cal set <left|right> <stop|fwdstart|revstart|fwdmax|revmax> <1000..2000>"));
-  Serial.println(F("cal validate"));
-  Serial.println(F("cal save confirm"));
-  Serial.println(F("cal reset confirm  (draft only; NVS reloads after reboot)"));
-  Serial.println(F("cal erase confirm  (erase persisted calibration; drive remains locked)"));
-  Serial.println(F("servooff         (safe drive powerdown only)"));
-  printGestureUsage();
-  Serial.println(F("test                     360 fast cw, rezero, 360 slow ccw"));
-  Serial.println(F("heading [zero]          relative heading + drift state"));
-  Serial.println(F("turn <deg> [cw|ccw] [speed]  closed-loop, gyro-stopped"));
-  Serial.println(F("power                    battery latch + backlight state"));
-  Serial.println(F("spin calib               probe+model+verify, saves itself"));
-  Serial.println(F("spin auto [ms] [cw|ccw]  measure the turn with the gyro"));
-  Serial.println(F("spin test [ms] [cw|ccw]  run one measurement turn"));
-  Serial.println(F("spin set <200..2000>     stage the measured full turn"));
-  Serial.println(F("spin show                staged vs saved vs default"));
-  Serial.println(F("spin save confirm"));
-  Serial.println(F("spin erase confirm"));
-  // The list below was missing entirely: `help` documented 25 of the 48
-  // commands dispatchCommand actually handles, so more than a third of the
-  // surface -- including every diagnostic added while chasing the black-screen
-  // and AP faults -- was reachable only by reading the source.
-  Serial.println(F("-- expression --"));
-  Serial.println(F("sound <happy|sad|confused>   compose + play (fresh each time)"));
-  Serial.println(F("sound stop"));
-  // `gesture` is already printed above by printGestureUsage(); not repeated.
-  Serial.println(F("-- network / UI --"));
-  Serial.println(F("wifi                     AP mode, IP, MAC, stations, tx power"));
-  Serial.println(F("state                    override state machine + LCD mode"));
-  Serial.println(F("swipe <down|up>          queue a wake / teardown gesture"));
-  Serial.println(F("-- display diagnostics --"));
-  Serial.println(F("lcdspi [hz]              show/set SPI clock (8M..80M, reboot to apply)"));
-  Serial.println(F("lcdprobe                 read panel RDDPM: is it awake and on?"));
-  Serial.println(F("lcdpush                  full canvas->panel push only"));
-  Serial.println(F("lcdbus                   re-init the SPI peripheral only"));
-  Serial.println(F("crash [clear]            last fault: reason + phase + heap"));
-  Serial.println(F("-- motion / IMU --"));
-  Serial.println(F("straight <cm> [speed]    gyro-corrected straight run"));
-  Serial.println(F("sense                    bump/shake/lifted detector state"));
-  Serial.println(F("lead [alpha]             turn coast-compensation constant"));
-  Serial.println(F("scale [actual <deg>]     gyro scale check / correction"));
-  Serial.println(F("cod [run|status]         on-demand gyro calibration"));
-  Serial.println(F("lpf [0..3]               gyro low-pass filter mode"));
-  Serial.println(F("bench <arm|report|clear> unattended measurement run"));
-  Serial.println(F("-- survey / RF --"));
-  Serial.println(F("survey ...               dead-reckoning position survey"));
-  Serial.println(F("rfscan / rfsurvey        RSSI scan + per-position store"));
-  Serial.println(F("-- touch --"));
-  Serial.println(F("touchinfo / touchlog / touchdebug / touchreset"));
+void printHelp();  // forward decl: definition after the SerialCommand table below
+
+// Serial command handlers.  Each function is the verbatim body of one
+// arm of the pre-refactor dispatchCommand() if/return chain.  They live
+// here (not in serial_console.cpp) because they reach the ~100 globals
+// that this translation unit's anonymous namespace already owns.
+
+void cmdHelp(char* argument) {
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR help takes no arguments"));
+    return;
+  }
+  printHelp();
+  Serial.println(F("OK"));
+  return;
 }
 
-void dispatchCommand(char* line) {
-  char* argument = splitArgument(line);
+void cmdPing(char* argument) {
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR ping takes no arguments"));
+    return;
+  }
+  Serial.println(F("pong"));
+  Serial.println(F("OK"));
+  return;
+}
 
-  if (strcmp(line, "help") == 0) {
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR help takes no arguments"));
-      return;
-    }
-    printHelp();
-    Serial.println(F("OK"));
+void cmdMotorstate(char* argument) {
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR motorstate takes no arguments"));
+    return;
+  }
+  printMotorState();
+  return;
+}
+
+void cmdCal(char* argument) {
+  dispatchCalibrationCommand(argument);
+  return;
+}
+
+void cmdStatus(char* argument) {
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR status takes no arguments"));
     return;
   }
 
-  if (strcmp(line, "ping") == 0) {
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR ping takes no arguments"));
-      return;
-    }
-    Serial.println(F("pong"));
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "motorstate") == 0) {
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR motorstate takes no arguments"));
-      return;
-    }
-    printMotorState();
-    return;
-  }
-
-  if (strcmp(line, "cal") == 0) {
-    dispatchCalibrationCommand(argument);
-    return;
-  }
-
-  if (strcmp(line, "status") == 0) {
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR status takes no arguments"));
-      return;
-    }
-
-    uint8_t width = 0;
-    uint8_t height = 0;
-    uint8_t radius = 0;
-    int8_t motionX = 0;
-    int8_t motionY = 0;
-    uint16_t blinkBase = 0;
-    uint16_t blinkJitter = 0;
-    g_eyes.getDims(width, height, radius);
-    g_eyes.getMotionRange(motionX, motionY);
-    g_eyes.getAutoblinkInterval(blinkBase, blinkJitter);
-    Serial.printf("{\"mood\":\"%s\",\"look\":\"%s\",\"dims\":{\"w\":%u,\"h\":%u,\"r\":%u},\"motion\":{\"x\":%d,\"y\":%d},\"color\":\"%04X\",\"wander\":%s,\"autoblink\":{\"on\":%s,\"base\":%u,\"jitter\":%u},\"headgain\":{\"x\":%u,\"y\":%u},\"paused\":%s,\"fps\":%u}\n",
-                  moodName(g_eyes.getMood()),
-                  lookName(g_eyes.getPosition()),
-                  static_cast<unsigned>(width),
-                  static_cast<unsigned>(height),
-                  static_cast<unsigned>(radius),
-                  static_cast<int>(motionX),
-                  static_cast<int>(motionY),
-                  static_cast<unsigned>(g_eyes.getMainColor()),
-                  g_eyes.isIdleWander() ? "true" : "false",
-                  g_eyes.isAutoblinker() ? "true" : "false",
-                  static_cast<unsigned>(blinkBase),
-                  static_cast<unsigned>(blinkJitter),
-                  static_cast<unsigned>(g_headShiftXDiv),
-                  static_cast<unsigned>(g_headShiftYDiv),
-                  g_paused ? "true" : "false",
-                  static_cast<unsigned>(g_eyes.getFramerate()));
-    Serial.println(F("OK"));
-    return;
-  }
+  uint8_t width = 0;
+  uint8_t height = 0;
+  uint8_t radius = 0;
+  int8_t motionX = 0;
+  int8_t motionY = 0;
+  uint16_t blinkBase = 0;
+  uint16_t blinkJitter = 0;
+  g_eyes.getDims(width, height, radius);
+  g_eyes.getMotionRange(motionX, motionY);
+  g_eyes.getAutoblinkInterval(blinkBase, blinkJitter);
+  Serial.printf("{\"mood\":\"%s\",\"look\":\"%s\",\"dims\":{\"w\":%u,\"h\":%u,\"r\":%u},\"motion\":{\"x\":%d,\"y\":%d},\"color\":\"%04X\",\"wander\":%s,\"autoblink\":{\"on\":%s,\"base\":%u,\"jitter\":%u},\"headgain\":{\"x\":%u,\"y\":%u},\"paused\":%s,\"fps\":%u}\n",
+                moodName(g_eyes.getMood()),
+                lookName(g_eyes.getPosition()),
+                static_cast<unsigned>(width),
+                static_cast<unsigned>(height),
+                static_cast<unsigned>(radius),
+                static_cast<int>(motionX),
+                static_cast<int>(motionY),
+                static_cast<unsigned>(g_eyes.getMainColor()),
+                g_eyes.isIdleWander() ? "true" : "false",
+                g_eyes.isAutoblinker() ? "true" : "false",
+                static_cast<unsigned>(blinkBase),
+                static_cast<unsigned>(blinkJitter),
+                static_cast<unsigned>(g_headShiftXDiv),
+                static_cast<unsigned>(g_headShiftYDiv),
+                g_paused ? "true" : "false",
+                static_cast<unsigned>(g_eyes.getFramerate()));
+  Serial.println(F("OK"));
+  return;
+}
 
   // WiFi/AP diagnostic + start/stop control
-  if (strcmp(line, "wifi") == 0) {
-    if (argument != nullptr && *argument != '\0') {
-      if (strcmp(argument, "on") == 0) {
-        if (g_orState != ORS_IDLE) {
-          Serial.printf("ERR wifi: state=%d, not IDLE\n", (int)g_orState);
-          return;
-        }
-        enterWifiBoot();
-        Serial.println(F("OK"));
-        return;
-      }
-      if (strcmp(argument, "off") == 0) {
-        if (g_orState == ORS_IDLE) {
-          Serial.println(F("wifi: already off"));
-          Serial.println(F("OK"));
-          return;
-        }
-        teardownToIdle();
-        Serial.println(F("OK"));
-        return;
-      }
-      Serial.println(F("ERR wifi takes no arg, 'on', or 'off'"));
-      return;
-    }
-    wifi_mode_t m = WiFi.getMode();
-    uint8_t staMac[6] = {0}, apMac[6] = {0};
-    esp_read_mac(staMac, ESP_MAC_WIFI_STA);
-    esp_read_mac(apMac,  ESP_MAC_WIFI_SOFTAP);
-    int8_t tx = 0;
-    esp_wifi_get_max_tx_power(&tx);
-    Serial.printf("wifi mode=%d  AP_IP=%s  AP_MAC=%s  stations=%d  efuseSTA=%02X:%02X:%02X:%02X:%02X:%02X  efuseAP=%02X:%02X:%02X:%02X:%02X:%02X  tx=%d  psram=%u  override_state=%d up=%d\n",
-        (int)m,
-        WiFi.softAPIP().toString().c_str(),
-        WiFi.softAPmacAddress().c_str(),
-        WiFi.softAPgetStationNum(),
-        staMac[0], staMac[1], staMac[2], staMac[3], staMac[4], staMac[5],
-        apMac[0],  apMac[1],  apMac[2],  apMac[3],  apMac[4],  apMac[5],
-        (int)tx,
-        (unsigned)ESP.getPsramSize(),
-        (int)g_orState,
-        g_overrideUp ? 1 : 0);
-    Serial.println(F("OK"));
-    return;
-  }
-
-  // §16: simulate a swipe gesture for testing without touching the screen.
-  if (strcmp(line, "swipe") == 0) {
-    if (argument == nullptr || *argument == '\0') {
-      Serial.println(F("ERR swipe needs 'down' or 'up'"));
-      return;
-    }
-    if (strcmp(argument, "down") == 0) {
-      g_orPendingSwipeDown = true;
-      Serial.println(F("OK (queued swipe-down)"));
-      return;
-    }
-    if (strcmp(argument, "up") == 0) {
-      g_orPendingSwipeUp = true;
-      Serial.println(F("OK (queued swipe-up)"));
-      return;
-    }
-    Serial.println(F("ERR swipe takes 'down' or 'up'"));
-    return;
-  }
-
-  // §16: override state inspection.
-  if (strcmp(line, "state") == 0) {
-    const char* sname = "?";
-    switch (g_orState) {
-      case ORS_IDLE:      sname = "IDLE_DEMO";     break;
-      case ORS_WIFI_BOOT: sname = "WIFI_BOOT";     break;
-      case ORS_RUNNING:   sname = "RUNNING";       break;
-      case ORS_GRACE:     sname = "GRACE";         break;
-    }
-    const char* lcdname = "?";
-    switch (g_lcdMode) {
-      case LCD_MODE_FACE:         lcdname = "FACE";         break;
-      case LCD_MODE_QR_WIFI:      lcdname = "QR_WIFI";      break;
-      case LCD_MODE_QR_URL:       lcdname = "QR_URL";       break;
-      case LCD_MODE_ESTABLISHING: lcdname = "ESTABLISHING"; break;
-      case LCD_MODE_GESTURE_MENU: lcdname = "GESTURE_MENU"; break;
-    }
-    Serial.printf("state=%s lcd=%s wifiUp=%d wsClients=%u apStations=%u uptimeInState=%lu ms touchEvents=%u\n",
-                  sname, lcdname,
-                  g_overrideUp ? 1 : 0,
-                  static_cast<unsigned>(
-                      g_wsTransportOpenCount.load(std::memory_order_acquire)),
-                  static_cast<unsigned>(WiFi.softAPgetStationNum()),
-                  static_cast<unsigned long>(millis() - g_orStateEnterMs),
-                  static_cast<unsigned>(g_orTouchEventCount));
-    Serial.println(F("OK"));
-    return;
-  }
-
-
-  if (strcmp(line, "mood") == 0) {
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.println(F("ERR mood needs a name"));
-      return;
-    }
-    EyeMood mood = MOOD_DEFAULT;
-    if (!parseMood(argument, mood)) {
-      Serial.println(F("ERR unknown mood"));
-      return;
-    }
-    stopDemo(false);
-    setEyesMood(mood);
-    setEyeLoopRate(true);
-    requestImmediateFrame();
-    Serial.println(F("OK"));
-    return;
-  }
-
-
-  if (strcmp(line, "look") == 0) {
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.println(F("ERR look needs a direction"));
-      return;
-    }
-    EyePosition position = POS_DEFAULT;
-    if (!parseLook(argument, position)) {
-      Serial.println(F("ERR unknown direction"));
-      return;
-    }
-    stopDemo(false);
-    g_eyes.setPosition(position);
-    setEyeLoopRate(true);
-    requestImmediateFrame();
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "blink") == 0) {
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR blink takes no arguments"));
-      return;
-    }
-    stopDemo(false);
-    g_eyes.blink();
-    setEyeLoopRate(true);
-    requestImmediateFrame();
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "wander") == 0) {
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.println(F("ERR wander needs on or off"));
-      return;
-    }
-    if ((strcmp(argument, "on") != 0) && (strcmp(argument, "off") != 0)) {
-      Serial.println(F("ERR wander must be on or off"));
-      return;
-    }
-
-    uint16_t idleBase = 0;
-    uint16_t idleJitter = 0;
-    g_eyes.getIdleWanderInterval(idleBase, idleJitter);
-    stopDemo(false);
-    g_eyes.setIdleWander(strcmp(argument, "on") == 0, idleBase, idleJitter);
-    setEyeLoopRate(true);
-    requestImmediateFrame();
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "dims") == 0) {
-    long values[3] = {0, 0, 0};
-    if (!parseLongArguments(argument, values, 3U)) {
-      Serial.println(F("ERR dims needs w h r"));
-      return;
-    }
-    if ((values[0] < kEyeBaseWMin) || (values[0] > kEyeBaseWMax)) {
-      Serial.println(F("ERR dims w must be 4..32"));
-      return;
-    }
-    if ((values[1] < kEyeBaseHMin) || (values[1] > kEyeBaseHMax)) {
-      Serial.println(F("ERR dims h must be 8..56"));
-      return;
-    }
-
-    const long maxRadius = (((values[0] < values[1]) ? values[0] : values[1]) / 2L);
-    if ((values[2] < 0L) || (values[2] > maxRadius)) {
-      Serial.println(F("ERR dims r must fit eye size"));
-      return;
-    }
-
-    stopDemo(false);
-    g_eyeBaseW = static_cast<uint8_t>(values[0]);
-    g_eyeBaseH = static_cast<uint8_t>(values[1]);
-    g_eyeRadius = static_cast<uint8_t>(values[2]);
-    g_eyeGeom.baseW = g_eyeBaseW;
-    g_eyeGeom.baseH = g_eyeBaseH;
-    g_eyeGeom.borderRadius = g_eyeRadius;
-    g_eyes.setDims(g_eyeBaseW, g_eyeBaseH, g_eyeRadius);
-    recomputeEyeRegionBounds();
-    setEyeLoopRate(true);
-    requestImmediateFrame();
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "motion") == 0) {
-    long values[2] = {0, 0};
-    if (!parseLongArguments(argument, values, 2U)) {
-      Serial.println(F("ERR motion needs x y"));
-      return;
-    }
-    if ((values[0] < 0L) || (values[0] > kEyeMotionXMax)) {
-      Serial.println(F("ERR motion x must be 0..30"));
-      return;
-    }
-    if ((values[1] < 0L) || (values[1] > kEyeMotionYMax)) {
-      Serial.println(F("ERR motion y must be 0..20"));
-      return;
-    }
-
-    stopDemo(false);
-    g_eyeMotionX = static_cast<int8_t>(values[0]);
-    g_eyeMotionY = static_cast<int8_t>(values[1]);
-    g_eyeGeom.motionRangeX = g_eyeMotionX;
-    g_eyeGeom.motionRangeY = g_eyeMotionY;
-    g_eyes.setMotionRange(g_eyeMotionX, g_eyeMotionY);
-    recomputeEyeRegionBounds();
-    setEyeLoopRate(true);
-    requestImmediateFrame();
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "blinkrate") == 0) {
-    long values[2] = {0, 0};
-    if (!parseLongArguments(argument, values, 2U)) {
-      Serial.println(F("ERR blinkrate needs sec jitter"));
-      return;
-    }
-    if ((values[0] < 1L) || (values[0] > 60L)) {
-      Serial.println(F("ERR blinkrate sec must be 1..60"));
-      return;
-    }
-    if ((values[1] < 0L) || (values[1] > values[0])) {
-      Serial.println(F("ERR blinkrate jitter must be 0..sec"));
-      return;
-    }
-
-    stopDemo(false);
-    g_eyes.setAutoblinker(true,
-                          static_cast<uint16_t>(values[0] * 1000L),
-                          static_cast<uint16_t>(values[1] * 1000L));
-    setEyeLoopRate(true);
-    requestImmediateFrame();
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "color") == 0) {
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.println(F("ERR color needs a value"));
-      return;
-    }
-
-    uint16_t color = 0;
-    if (!parseColorArgument(argument, color)) {
-      Serial.println(F("ERR invalid color"));
-      return;
-    }
-
-    stopDemo(false);
-    g_eyes.setMainColor(color);
-    setEyeLoopRate(true);
-    requestImmediateFrame();
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "headgain") == 0) {
-    long values[2] = {0, 0};
-    if (!parseLongArguments(argument, values, 2U)) {
-      Serial.println(F("ERR headgain needs xDiv yDiv"));
-      return;
-    }
-    if ((values[0] < 0L) || (values[0] > kHeadShiftDivMax)) {
-      Serial.println(F("ERR headgain xDiv must be 0..32"));
-      return;
-    }
-    if ((values[1] < 0L) || (values[1] > kHeadShiftDivMax)) {
-      Serial.println(F("ERR headgain yDiv must be 0..32"));
-      return;
-    }
-
-    stopDemo(false);
-    g_headShiftXDiv = static_cast<uint8_t>(values[0]);
-    g_headShiftYDiv = static_cast<uint8_t>(values[1]);
-    if ((g_headShiftXDiv == 0U) || (g_headShiftYDiv == 0U)) {
-      g_forceEyeRedraw = true;
-      g_forceFullPush = true;
-    }
-    setEyeLoopRate(true);
-    requestImmediateFrame();
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "tone") == 0) {
-    long frequencyHz = 0;
-    if (!parseLongArguments(argument, &frequencyHz, 1U)) {
-      Serial.println(F("ERR tone needs exactly one integer argument"));
-      return;
-    }
-    if ((frequencyHz != 0L) &&
-        ((frequencyHz < 200L) || (frequencyHz > 6000L))) {
-      Serial.println(F("ERR tone frequency must be 0 or 200..6000"));
-      return;
-    }
-    if (!g_piezoAvailable) {
-      Serial.println(F("ERR tone unavailable"));
-      return;
-    }
-    if (!PiezoTone::command(static_cast<uint16_t>(frequencyHz), millis())) {
-      Serial.println(F("ERR tone command failed"));
-      return;
-    }
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "crash") == 0) {
-    if ((argument != nullptr) && strcmp(argument, "clear") == 0) {
-      nvs_handle_t handle = 0;
-      if (nvs_open("crashlog", NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_erase_all(handle);
-        nvs_commit(handle);
-        nvs_close(handle);
-      }
-      Serial.println(F("crash: cleared"));
-      return;
-    }
-    nvs_handle_t handle = 0;
-    if (nvs_open("crashlog", NVS_READONLY, &handle) != ESP_OK) {
-      Serial.println(F("crash: none recorded"));
-      return;
-    }
-    CrashRecord record{};
-    size_t size = sizeof(record);
-    const esp_err_t err = nvs_get_blob(handle, "rec", &record, &size);
-    nvs_close(handle);
-    if (err != ESP_OK || size != sizeof(record) ||
-        record.magic != kCrashRecordMagic) {
-      Serial.println(F("crash: none recorded"));
-      return;
-    }
-    const char* reasonName = "?";
-    switch (static_cast<esp_reset_reason_t>(record.reason)) {
-      case ESP_RST_PANIC:    reasonName = "PANIC"; break;
-      case ESP_RST_INT_WDT:  reasonName = "INT_WDT (interrupts off too long)"; break;
-      case ESP_RST_TASK_WDT: reasonName = "TASK_WDT"; break;
-      case ESP_RST_WDT:      reasonName = "WDT"; break;
-      case ESP_RST_BROWNOUT: reasonName = "BROWNOUT"; break;
-      case ESP_RST_SW:       reasonName = "SW (deliberate restart)"; break;
-      case ESP_RST_EXT:      reasonName = "EXT (reset pin)"; break;
-      default:               reasonName = "UNKNOWN/other"; break;
-    }
-    Serial.printf("crash: #%lu  reason=%s(%lu)\n",
-                  static_cast<unsigned long>(record.count), reasonName,
-                  static_cast<unsigned long>(record.reason));
-    Serial.printf("crash: where=%s  phase=%lu detail=0x%lX (client=%lu step=%lu)\n",
-                  crumbName(record.phase),
-                  static_cast<unsigned long>(record.phase),
-                  static_cast<unsigned long>(record.detail),
-                  static_cast<unsigned long>(record.detail & 0xFF),
-                  static_cast<unsigned long>((record.detail >> 8) & 0xFF));
-    Serial.printf("crash: seq=%lu heapAfter=%lu minHeap=%lu\n",
-                  static_cast<unsigned long>(record.seq),
-                  static_cast<unsigned long>(record.freeHeap),
-                  static_cast<unsigned long>(record.minHeap));
-    return;
-  }
-
-  if (strcmp(line, "lcdpush") == 0) {
-    // Deliberately does ONLY a full canvas->panel push: no SPI re-init, no
-    // panel re-init, no canvas redraw. `lcdprobe` happens to fix the black
-    // screen, but it does two things at once (re-inits the SPI peripheral via
-    // g_bus->begin() AND forces a full push), so it cannot tell us which one
-    // matters. This isolates the push half.
-    //
-    // If THIS fixes a black screen, the canvas was correct and the panel had
-    // simply stopped receiving the incremental eye-region pushes.
-    // If this does NOT fix it but `lcdprobe` does, the SPI peripheral itself
-    // was wedged and re-initialising the bus is the real repair.
-    const uint32_t startedUs = micros();
-    pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
-    const uint32_t tookUs = micros() - startedUs;
-    if (g_batSeeded) drawBatteryMeter();
-    Serial.printf("lcdpush: full push %lux%lu took %lu us (SPI %lu MHz)\n",
-                  static_cast<unsigned long>(kScreenW),
-                  static_cast<unsigned long>(kScreenH),
-                  static_cast<unsigned long>(tookUs),
-                  static_cast<unsigned long>(g_lcdSpiHz / 1000000UL));
-    return;
-  }
-
-  if (strcmp(line, "lcdbus") == 0) {
-    // The other half: re-init the SPI peripheral only, no push.
-    if (g_bus == nullptr) {
-      Serial.println(F("ERR no bus"));
-      return;
-    }
-    g_bus->begin(static_cast<int32_t>(g_lcdSpiHz));
-    Serial.println(F("lcdbus: SPI peripheral re-initialised (no push)"));
-    return;
-  }
-
-  if (strcmp(line, "lcdprobe") == 0) {
-    // Reads 24 bits rather than 8 and prints them raw. The datasheet shows a
-    // "dummy read" before the status byte, but does not pin down whether that
-    // is one dummy CLOCK or a whole dummy BYTE on the serial interface. Rather
-    // than guess the framing, dump the window and locate 0x9C in it.
-    const uint32_t rddpm = lcdProbeRead(0x0A, 24);
-    const uint32_t rddid = lcdProbeRead(0x04, 32);
-    Serial.printf("lcdprobe: RDDPM(0x0A) raw=0x%06lX  RDDID(0x04) raw=0x%08lX\n",
-                  static_cast<unsigned long>(rddpm & 0xFFFFFF),
-                  static_cast<unsigned long>(rddid));
-    Serial.print(F("lcdprobe: RDDPM bits "));
-    for (int8_t bit = 23; bit >= 0; --bit) {
-      Serial.print((rddpm >> bit) & 1U);
-      if (bit % 8 == 0) Serial.print(' ');
-    }
-    Serial.println();
-    // Try each byte alignment; a live panel shows BSTON|SLPOUT|NORON|DISON.
-    for (uint8_t shift = 0; shift <= 16; shift += 8) {
-      const uint8_t candidate = static_cast<uint8_t>((rddpm >> shift) & 0xFF);
-      Serial.printf("lcdprobe:   byte<<%u = 0x%02X  BSTON=%u SLPOUT=%u "
-                    "NORON=%u DISON=%u%s\n",
-                    static_cast<unsigned>(shift),
-                    static_cast<unsigned>(candidate),
-                    static_cast<unsigned>((candidate >> 7) & 1),
-                    static_cast<unsigned>((candidate >> 4) & 1),
-                    static_cast<unsigned>((candidate >> 3) & 1),
-                    static_cast<unsigned>((candidate >> 2) & 1),
-                    lcdPanelLooksAlive(candidate) ? "  <-- ALIVE" : "");
-    }
-    if ((rddpm & 0xFFFFFF) == 0 || (rddpm & 0xFFFFFF) == 0xFFFFFF) {
-      // All-zero or all-one means the line never changed: either the panel is
-      // not driving SDA back, or read-back is not wired on this module.
-      Serial.println(F("lcdprobe: line static -- no read-back on this board"));
-    }
-    // The probe borrowed the SPI pins; repaint so nothing is left half-drawn.
-    g_forceFullPush = true;
-    g_forceEyeRedraw = true;
-    g_eyes.forceRedraw();
-    return;
-  }
-
-  if (strcmp(line, "lcdspi") == 0) {
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.printf("lcdspi: %lu Hz (%lu MHz) active; default %lu MHz\n",
-                    static_cast<unsigned long>(g_lcdSpiHz),
-                    static_cast<unsigned long>(g_lcdSpiHz / 1000000UL),
-                    static_cast<unsigned long>(kLcdSpiHzDefault / 1000000UL));
-      Serial.println(F("usage: lcdspi <hz>  (8000000..80000000; reboot to apply)"));
-      return;
-    }
-    const long requested = strtol(argument, nullptr, 10);
-    if (requested < static_cast<long>(kLcdSpiHzMin) ||
-        requested > static_cast<long>(kLcdSpiHzMax)) {
-      Serial.printf("ERR lcdspi must be %lu..%lu Hz\n",
-                    static_cast<unsigned long>(kLcdSpiHzMin),
-                    static_cast<unsigned long>(kLcdSpiHzMax));
-      return;
-    }
-    nvs_handle_t handle = 0;
-    if (nvs_open("lcdcfg", NVS_READWRITE, &handle) != ESP_OK) {
-      Serial.println(F("ERR lcdcfg open failed"));
-      return;
-    }
-    esp_err_t err = nvs_set_u32(handle, "spihz",
-                                static_cast<uint32_t>(requested));
-    if (err == ESP_OK) err = nvs_commit(handle);
-    nvs_close(handle);
-    if (err != ESP_OK) {
-      Serial.println(F("ERR lcdcfg write failed"));
-      return;
-    }
-    // The clock is fixed when the bus is constructed, so this cannot take
-    // effect until the next boot. Say so rather than implying a live change.
-    Serial.printf("lcdspi: stored %ld Hz; reboot to apply\n", requested);
-    return;
-  }
-
-  if (strcmp(line, "sleep") == 0) {
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR sleep takes no arguments"));
-      return;
-    }
-    stopDemo(false);
-    PiezoTone::stop();
-    g_paused = true;
-    resetDriveControl("serial sleep");
-    runSleepLogoAnimation();
-    g_forceFullPush = false;
-    g_forceEyeRedraw = false;
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "wake") == 0) {
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR wake takes no arguments"));
-      return;
-    }
-    stopDemo(false);
-    if (g_paused) {
-      runWakeLogoAnimation();
-    }
-    g_paused = false;
-    g_lcdMode = LCD_MODE_FACE;
-    g_forceFullPush = false;
-    g_forceEyeRedraw = false;
-    setEyeLoopRate(true);
-    requestImmediateFrame();
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "demo") == 0) {
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR demo takes no arguments"));
-      return;
-    }
-    startDemo();
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "servooff") == 0) {
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR servooff takes no arguments"));
-      return;
-    }
-    stopMovementGesture("serial servooff");
-    resetDriveControl("serial servooff");
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "touchinfo") == 0) {
-    MDO::TouchScreenController::device_type_t deviceType;
-    unsigned char firmware = 0;
-    const bool haveType = g_orTouch.getDeviceType(deviceType);
-    const bool haveFw = g_orTouch.getFirmwareVersion(firmware);
-    Serial.printf("touch: type=%d(%d) fw=%d(%d) gestures=%u points=%u debug=%d\n",
-                  haveType ? static_cast<int>(deviceType) : -1, haveType ? 1 : 0,
-                  haveFw ? static_cast<int>(firmware) : -1, haveFw ? 1 : 0,
-                  static_cast<unsigned>(g_orTouchEventCount),
-                  static_cast<unsigned>(g_orTouchPointCount),
-                  g_touchDebug ? 1 : 0);
-    return;
-  }
-
-  if (strcmp(line, "touchlog") == 0) {
-    if ((argument != nullptr) && (strcmp(argument, "clear") == 0)) {
-      g_touchLogNext = 0;
-      g_touchLogTotal = 0;
-      Serial.println(F("OK"));
-      return;
-    }
-    const uint32_t total = g_touchLogTotal;
-    const uint8_t count =
-        total < kTouchLogSize ? static_cast<uint8_t>(total) : kTouchLogSize;
-    Serial.printf("touchlog total=%lu shown=%u now=%lu\n",
-                  static_cast<unsigned long>(total),
-                  static_cast<unsigned>(count),
-                  static_cast<unsigned long>(millis()));
-    // Oldest first, so a tap sequence reads in the order it was performed.
-    for (uint8_t i = 0; i < count; ++i) {
-      const uint8_t slot = static_cast<uint8_t>(
-          (g_touchLogNext + kTouchLogSize - count + i) % kTouchLogSize);
-      const TouchLogEntry& e = g_touchLog[slot];
-      Serial.printf("  #%u ms=%lu gid=%d xy=(%d,%d) pressed=%d\n",
-                    static_cast<unsigned>(i), static_cast<unsigned long>(e.ms),
-                    static_cast<int>(e.gestureId), static_cast<int>(e.x),
-                    static_cast<int>(e.y), e.pressed ? 1 : 0);
-    }
-    return;
-  }
-
-  if (strcmp(line, "touchreset") == 0) {
-    // Recovery path: re-applies our configuration if the chip ever stops
-    // reporting. Deliberately does NOT touch auto-sleep — see the note in
-    // setup(); disabling it kills event reporting entirely.
-    const bool reset = g_orTouch.resetChip(true);
-    Serial.printf("touch: reset=%d\n", reset ? 1 : 0);
-    return;
-  }
-
-  if (strcmp(line, "touchdebug") == 0) {
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.printf("touchdebug=%s\n", g_touchDebug ? "on" : "off");
-      return;
-    }
+void cmdWifi(char* argument) {
+  if (argument != nullptr && *argument != '\0') {
     if (strcmp(argument, "on") == 0) {
-      g_touchDebug = true;
-    } else if (strcmp(argument, "off") == 0) {
-      g_touchDebug = false;
-    } else {
-      Serial.println(F("ERR touchdebug <on|off>"));
-      return;
-    }
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "gesture") == 0) {
-    if ((argument == nullptr) || (*argument == '\0')) {
-      printGestureUsage();
-      return;
-    }
-    if (strcmp(argument, "stop") == 0) {
-      stopMovementGesture("serial request");
+      if (g_orState != ORS_IDLE) {
+        Serial.printf("ERR wifi: state=%d, not IDLE\n", (int)g_orState);
+        return;
+      }
+      enterWifiBoot();
       Serial.println(F("OK"));
-      return;
-    }
-
-    // Optional second token: the frustrated swing length, so it can be tuned
-    // on the bench without a reflash.
-    char nameBuffer[24];
-    uint16_t runMs = 0;
-    const char* space = strchr(argument, ' ');
-    if (space != nullptr) {
-      const size_t nameLength = static_cast<size_t>(space - argument);
-      if (nameLength == 0 || nameLength >= sizeof(nameBuffer)) {
-        printGestureUsage();
-        return;
-      }
-      memcpy(nameBuffer, argument, nameLength);
-      nameBuffer[nameLength] = '\0';
-
-      const char* value = space;
-      while (*value == ' ') ++value;
-      if (*value == '\0') {
-        printGestureUsage();
-        return;
-      }
-      char* end = nullptr;
-      const long parsed = strtol(value, &end, 10);
-      if (end == value || (end != nullptr && *end != '\0') || parsed <= 0 ||
-          parsed > 65535) {
-        Serial.println(F("ERR run length must be a positive integer"));
-        return;
-      }
-      runMs = static_cast<uint16_t>(parsed);
-      argument = nameBuffer;
-    }
-
-    if (!startMovementGesture(argument, runMs)) {
-      printGestureUsage();
-      return;
-    }
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "test") == 0) {
-    // Same sequence the on-screen button runs, exposed on serial so it can be
-    // watched: 360 one way, rezero, 360 back.
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR test takes no arguments"));
-      return;
-    }
-    if (!startTurnTestSequence()) {
-      Serial.println(F("ERR could not start test"));
-      return;
-    }
-    return;
-  }
-
-  if (strcmp(line, "heading") == 0) {
-    if ((argument != nullptr) && (*argument != '\0')) {
-      if (strcmp(argument, "zero") == 0) {
-        g_headingIntegrator.reset();
-        Serial.println(F("heading: zeroed"));
-        Serial.println(F("OK"));
-        return;
-      }
-      Serial.println(F("ERR heading [zero]"));
-      return;
-    }
-    // Relative to the last zero — there is no compass, so this is not a
-    // bearing. Bias and ZUPT count are reported because they are what bound
-    // the drift, and drift is the only thing that makes this untrustworthy.
-    Serial.printf(
-        "heading: %.2f deg (axis %s, proj gain %.4f, bias %.3f dps, zupt %lu "
-        "applied / %lu rejected, last %.3f spread %.3f, samples %lu)\n",
-        static_cast<double>(g_headingIntegrator.totalDegrees()),
-        TurnMeasure::axisName(g_turnYawAxis),
-        static_cast<double>(g_turnAxisFraction > 0.0f
-                                ? 1.0f / g_turnAxisFraction
-                                : 0.0f),
-        static_cast<double>(g_turnBias[static_cast<int>(g_turnYawAxis)]),
-        static_cast<unsigned long>(g_headingZuptCount),
-        static_cast<unsigned long>(g_headingZuptRejected),
-        static_cast<double>(g_headingLastZuptDps),
-        static_cast<double>(g_headingLastZuptSpread),
-        static_cast<unsigned long>(g_headingIntegrator.sampleCount()));
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strcmp(line, "turn") == 0) {
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.println(F("ERR turn <degrees> [cw|ccw]"));
-      return;
-    }
-    char* end = nullptr;
-    const double parsed = strtod(argument, &end);
-    if (end == argument) {
-      Serial.println(F("ERR turn <degrees> [cw|ccw]"));
-      return;
-    }
-    bool clockwise = true;
-    int8_t speed = MovementExpression::kSpinSpeed;
-    while (*end == ' ') ++end;
-    if (*end != '\0') {
-      // Optional direction, then optional speed, in either order after the
-      // angle: "turn 90 ccw 60" and "turn 90 60" both work.
-      char* cursor = end;
-      while (*cursor != '\0') {
-        while (*cursor == ' ') ++cursor;
-        if (*cursor == '\0') break;
-        if (strncmp(cursor, "ccw", 3) == 0) {
-          clockwise = false;
-          cursor += 3;
-          continue;
-        }
-        if (strncmp(cursor, "cw", 2) == 0) {
-          clockwise = true;
-          cursor += 2;
-          continue;
-        }
-        char* numEnd = nullptr;
-        const long parsedSpeed = strtol(cursor, &numEnd, 10);
-        if (numEnd == cursor) {
-          Serial.println(F("ERR turn <degrees> [cw|ccw] [speed]"));
-          return;
-        }
-        if (parsedSpeed < MovementExpression::kSpinMinSpeed ||
-            parsedSpeed > MovementExpression::kCommandMax) {
-          Serial.printf("ERR speed %d..%d\n",
-                        static_cast<int>(MovementExpression::kSpinMinSpeed),
-                        static_cast<int>(MovementExpression::kCommandMax));
-          return;
-        }
-        speed = static_cast<int8_t>(parsedSpeed);
-        cursor = numEnd;
-      }
-    }
-    if (!startClosedLoopTurn(static_cast<float>(parsed), clockwise, speed)) {
-      return;
-    }
-    return;
-  }
-
-  if (strncmp(line, "lead", 4) == 0 &&
-      (line[4] == '\0' || line[4] == ' ')) {
-    // The coast lead is learned automatically from every turn, but being able
-    // to read it, pin it, or disable it without a reflash makes it possible to
-    // A/B the compensation on the bench in seconds.
-    if ((argument == nullptr) || (*argument == '\0')) {
-      // Report BOTH terms. The linear one is zero by default now that the
-      // model is quadratic, and printing only that made the compensation look
-      // disabled when it was in fact doing all the work.
-      const float rate = 285.0f;
-      const float linear = g_coastLeadSeconds * rate;
-      const float quadratic =
-          g_coastAlpha > 0.0f ? (rate * rate) / (2.0f * g_coastAlpha) : 0.0f;
-      Serial.printf(
-          "lead: alpha %.0f deg/s2 + linear %.4f s -> %.1f deg predicted "
-          "coast at %.0f dps (%.1f quadratic + %.1f linear)\n",
-          static_cast<double>(g_coastAlpha),
-          static_cast<double>(g_coastLeadSeconds),
-          static_cast<double>(quadratic + linear), static_cast<double>(rate),
-          static_cast<double>(quadratic), static_cast<double>(linear));
-      Serial.printf("lead: %lu learned updates\n",
-                    static_cast<unsigned long>(g_coastLeadUpdates));
-      return;
-    }
-    if (strcmp(argument, "reset") == 0) {
-      g_coastLeadSeconds = kCoastLeadDefaultS;
-      g_coastLeadUpdates = 0;
-      Serial.printf("lead: reset to %.4f s\n",
-                    static_cast<double>(g_coastLeadSeconds));
       return;
     }
     if (strcmp(argument, "off") == 0) {
-      g_coastLeadSeconds = 0.0f;
-      g_coastLeadUpdates = 0;
-      Serial.println(F("lead: off (turns stop on the measured angle, as before)"));
-      return;
-    }
-    char* end = nullptr;
-    const double seconds = strtod(argument, &end);
-    if (end == argument || seconds < kCoastLeadMinS || seconds > kCoastLeadMaxS) {
-      Serial.printf("ERR lead [<%g..%g seconds>|off|reset]\n",
-                    static_cast<double>(kCoastLeadMinS),
-                    static_cast<double>(kCoastLeadMaxS));
-      return;
-    }
-    g_coastLeadSeconds = static_cast<float>(seconds);
-    g_coastLeadUpdates = 0;   // a manual value is not a learned one
-    Serial.printf("lead: %.4f s set manually\n",
-                  static_cast<double>(g_coastLeadSeconds));
-    return;
-  }
-
-  if (strncmp(line, "bench", 5) == 0 &&
-      (line[5] == '\0' || line[5] == ' ')) {
-    // The bench run is the answer to a hard constraint: movement cannot be
-    // tested from here. A tethered turn is invalid (the cable restrains
-    // rotation) and the robot must not be driven while plugged in, so every
-    // real measurement costs supervised, untethered human time. This makes that
-    // time count by extracting the coast constant, the speed/rate model and the
-    // lead-compensation A/B from a single ~2 minute run.
-    if ((argument == nullptr) || (*argument == '\0') ||
-        strcmp(argument, "status") == 0) {
-      Serial.printf("bench: armed=%d stored=%u entries%s running=%d\n",
-                    BenchLog::isArmed() ? 1 : 0,
-                    static_cast<unsigned>(g_benchLog.count()),
-                    g_benchLog.overflowed() ? " (TRUNCATED)" : "",
-                    g_benchPhase != BenchPhase::Idle ? 1 : 0);
-      return;
-    }
-    if (strcmp(argument, "arm") == 0) {
-      if (!BenchLog::setArmed(true)) {
-        Serial.println(F("ERR could not arm"));
+      if (g_orState == ORS_IDLE) {
+        Serial.println(F("wifi: already off"));
+        Serial.println(F("OK"));
         return;
       }
-      Serial.println(F("bench: ARMED. Now:"));
-      Serial.println(F("  1. unplug USB (the robot stays on battery)"));
-      Serial.println(F("  2. put it on the desk, on its wheels, clear space"));
-      Serial.println(F("  3. press the TEST button, do not touch it for ~2 min"));
-      Serial.println(F("  4. plug back in and run 'bench report'"));
-      return;
-    }
-    if (strcmp(argument, "disarm") == 0) {
-      BenchLog::setArmed(false);
-      Serial.println(F("bench: disarmed"));
-      return;
-    }
-    if (strcmp(argument, "clear") == 0) {
-      g_benchLog.erase();
-      Serial.println(F("bench: results erased"));
-      return;
-    }
-    if (strcmp(argument, "report") == 0) {
-      if (g_benchLog.count() == 0 && !g_benchLog.load()) {
-        Serial.println(F("bench: no stored run"));
-        return;
-      }
-      Serial.printf("bench report: %u entries%s\n",
-                    static_cast<unsigned>(g_benchLog.count()),
-                    g_benchLog.overflowed() ? " (TRUNCATED)" : "");
-      // Serial TX is normally non-blocking (setTxTimeoutMs(0)) so a missing
-      // host can never stall the control loop. That means it DROPS bytes when
-      // the USB CDC buffer fills — which silently corrupted two lines and
-      // swallowed the entire summary on run 002. flush() does not help,
-      // because with a zero timeout it does not wait either.
-      //
-      // For this one command, apply real backpressure. The timeout is kept
-      // short so an absent host costs at most ~20 ms per write rather than
-      // hanging, and it is restored immediately afterwards. This is the only
-      // copy of data that costs a supervised session to retake.
-      Serial.setTxTimeoutMs(20);
-      for (uint16_t i = 0; i < g_benchLog.count(); ++i) {
-        const BenchLog::Entry& entry = g_benchLog.at(i);
-        Serial.printf(
-            "bench %s param=%d cond=%s value=%.4f\n",
-            BenchLog::metricName(static_cast<BenchLog::Metric>(entry.metric)),
-            static_cast<int>(entry.param),
-            BenchLog::conditionName(entry.condition),
-            static_cast<double>(entry.value));
-        // Yield periodically so the buffer drains even at 20 ms of backpressure.
-        if ((i % 4) == 3) {
-          Serial.flush();
-          delay(4);
-        }
-      }
-      Serial.flush();
-      delay(10);
-      // The comparisons the run exists to make, computed on-device so they
-      // cannot be got wrong by hand. Split BY SPEED: pooling speeds averages a
-      // 16 deg coast together with a 4 deg one and understates the effect.
-      static const int16_t kReportSpeeds[] = {100, 75, 55};
-      Serial.println(F("bench summary (per speed):"));
-      for (int16_t speed : kReportSpeeds) {
-        float coastMean = 0.0f, rateMean = 0.0f;
-        uint16_t nCoast = 0, nRate = 0;
-        const bool haveCoast = g_benchLog.summariseParam(
-            BenchLog::Metric::CoastDegrees, BenchLog::kCondLeadOff, speed,
-            &coastMean, nullptr, &nCoast);
-        const bool haveRate = g_benchLog.summariseParam(
-            BenchLog::Metric::SteadyRateDps, BenchLog::kCondLeadOff, speed,
-            &rateMean, nullptr, &nRate);
-        if (!haveCoast || !haveRate || rateMean <= 1.0f || coastMean <= 0.01f) {
-          continue;
-        }
-        // alpha from the Coulomb model, which is what the controller uses. A
-        // linear model would need coast/rate instead, and the fact that that
-        // number is NOT constant across speeds is the whole reason the model
-        // is quadratic. Both are printed so the choice stays checkable.
-        const float alpha = (rateMean * rateMean) / (2.0f * coastMean);
-        Serial.printf(
-            "  speed %3d: rate %6.1f dps, coast %5.2f deg (n=%u) -> "
-            "alpha %5.0f, linear-k %.4f s\n",
-            static_cast<int>(speed), static_cast<double>(rateMean),
-            static_cast<double>(coastMean), static_cast<unsigned>(nCoast),
-            static_cast<double>(alpha),
-            static_cast<double>(coastMean / rateMean));
-        Serial.flush();
-        delay(4);
-      }
-      for (int16_t speed : kReportSpeeds) {
-        float off = 0.0f, on = 0.0f;
-        uint16_t nOff = 0, nOn = 0;
-        const bool haveOff = g_benchLog.summariseParam(
-            BenchLog::Metric::TurnErrorDegrees, BenchLog::kCondLeadOff, speed,
-            &off, nullptr, &nOff);
-        const bool haveOn = g_benchLog.summariseParam(
-            BenchLog::Metric::TurnErrorDegrees, BenchLog::kCondLeadOn, speed,
-            &on, nullptr, &nOn);
-        if (!haveOff || !haveOn) continue;
-        // Compared on MAGNITUDE. Once compensation over-corrects the error goes
-        // negative, and a naive ratio would report an over-correction as a
-        // greater-than-100% improvement. The sign is printed too, because
-        // which way it misses is the thing that decides the next alpha.
-        const float offMag = off < 0 ? -off : off;
-        const float onMag = on < 0 ? -on : on;
-        Serial.printf(
-            "  A/B speed %3d: %+.2f deg lead-off (n=%u) -> %+.2f deg lead-on "
-            "(n=%u), |err| %.1f%% smaller%s\n",
-            static_cast<int>(speed), static_cast<double>(off),
-            static_cast<unsigned>(nOff), static_cast<double>(on),
-            static_cast<unsigned>(nOn),
-            static_cast<double>(offMag > 0.01f
-                                    ? (1.0f - onMag / offMag) * 100.0f
-                                    : 0.0f),
-            on < -0.5f ? " (OVER-corrected: raise alpha)"
-                       : (on > 0.5f ? " (under-corrected: lower alpha)" : ""));
-        Serial.flush();
-        delay(4);
-      }
-      Serial.printf("bench: compiled alpha %.0f deg/s2, live alpha %.0f\n",
-                    static_cast<double>(kCoastAlphaDefault),
-                    static_cast<double>(g_coastAlpha));
-      Serial.flush();
-      // Back to non-blocking, so a disconnected host can never stall the loop.
-      Serial.setTxTimeoutMs(0);
+      teardownToIdle();
       Serial.println(F("OK"));
       return;
     }
-    Serial.println(F("ERR bench [status|arm|disarm|report|clear]"));
+    Serial.println(F("ERR wifi takes no arg, 'on', or 'off'"));
+    return;
+  }
+  wifi_mode_t m = WiFi.getMode();
+  uint8_t staMac[6] = {0}, apMac[6] = {0};
+  esp_read_mac(staMac, ESP_MAC_WIFI_STA);
+  esp_read_mac(apMac,  ESP_MAC_WIFI_SOFTAP);
+  int8_t tx = 0;
+  esp_wifi_get_max_tx_power(&tx);
+  Serial.printf("wifi mode=%d  AP_IP=%s  AP_MAC=%s  stations=%d  efuseSTA=%02X:%02X:%02X:%02X:%02X:%02X  efuseAP=%02X:%02X:%02X:%02X:%02X:%02X  tx=%d  psram=%u  override_state=%d up=%d\n",
+      (int)m,
+      WiFi.softAPIP().toString().c_str(),
+      WiFi.softAPmacAddress().c_str(),
+      WiFi.softAPgetStationNum(),
+      staMac[0], staMac[1], staMac[2], staMac[3], staMac[4], staMac[5],
+      apMac[0],  apMac[1],  apMac[2],  apMac[3],  apMac[4],  apMac[5],
+      (int)tx,
+      (unsigned)ESP.getPsramSize(),
+      (int)g_orState,
+      g_overrideUp ? 1 : 0);
+  Serial.println(F("OK"));
+  return;
+}
+
+  // §16: simulate a swipe gesture for testing without touching the screen.
+void cmdSwipe(char* argument) {
+  if (argument == nullptr || *argument == '\0') {
+    Serial.println(F("ERR swipe needs 'down' or 'up'"));
+    return;
+  }
+  if (strcmp(argument, "down") == 0) {
+    g_orPendingSwipeDown = true;
+    Serial.println(F("OK (queued swipe-down)"));
+    return;
+  }
+  if (strcmp(argument, "up") == 0) {
+    g_orPendingSwipeUp = true;
+    Serial.println(F("OK (queued swipe-up)"));
+    return;
+  }
+  Serial.println(F("ERR swipe takes 'down' or 'up'"));
+  return;
+}
+
+  // §16: override state inspection.
+void cmdState(char* argument) {
+  const char* sname = "?";
+  switch (g_orState) {
+    case ORS_IDLE:      sname = "IDLE_DEMO";     break;
+    case ORS_WIFI_BOOT: sname = "WIFI_BOOT";     break;
+    case ORS_RUNNING:   sname = "RUNNING";       break;
+    case ORS_GRACE:     sname = "GRACE";         break;
+  }
+  const char* lcdname = "?";
+  switch (g_lcdMode) {
+    case LCD_MODE_FACE:         lcdname = "FACE";         break;
+    case LCD_MODE_QR_WIFI:      lcdname = "QR_WIFI";      break;
+    case LCD_MODE_QR_URL:       lcdname = "QR_URL";       break;
+    case LCD_MODE_ESTABLISHING: lcdname = "ESTABLISHING"; break;
+    case LCD_MODE_GESTURE_MENU: lcdname = "GESTURE_MENU"; break;
+  }
+  Serial.printf("state=%s lcd=%s wifiUp=%d wsClients=%u apStations=%u uptimeInState=%lu ms touchEvents=%u\n",
+                sname, lcdname,
+                g_overrideUp ? 1 : 0,
+                static_cast<unsigned>(
+                    g_wsTransportOpenCount.load(std::memory_order_acquire)),
+                static_cast<unsigned>(WiFi.softAPgetStationNum()),
+                static_cast<unsigned long>(millis() - g_orStateEnterMs),
+                static_cast<unsigned>(g_orTouchEventCount));
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdMood(char* argument) {
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.println(F("ERR mood needs a name"));
+    return;
+  }
+  EyeMood mood = MOOD_DEFAULT;
+  if (!parseMood(argument, mood)) {
+    Serial.println(F("ERR unknown mood"));
+    return;
+  }
+  stopDemo(false);
+  setEyesMood(mood);
+  setEyeLoopRate(true);
+  requestImmediateFrame();
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdLook(char* argument) {
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.println(F("ERR look needs a direction"));
+    return;
+  }
+  EyePosition position = POS_DEFAULT;
+  if (!parseLook(argument, position)) {
+    Serial.println(F("ERR unknown direction"));
+    return;
+  }
+  stopDemo(false);
+  g_eyes.setPosition(position);
+  setEyeLoopRate(true);
+  requestImmediateFrame();
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdBlink(char* argument) {
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR blink takes no arguments"));
+    return;
+  }
+  stopDemo(false);
+  g_eyes.blink();
+  setEyeLoopRate(true);
+  requestImmediateFrame();
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdWander(char* argument) {
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.println(F("ERR wander needs on or off"));
+    return;
+  }
+  if ((strcmp(argument, "on") != 0) && (strcmp(argument, "off") != 0)) {
+    Serial.println(F("ERR wander must be on or off"));
     return;
   }
 
-  if (strncmp(line, "sound", 5) == 0 && (line[5] == '\0' || line[5] == ' ')) {
-    if ((argument == nullptr) || (*argument == '\0')) {
-      // The generator now owns the sound vocabulary — three moods, each
-      // composed fresh on every trigger.
-      Serial.println(F("sound: happy, sad, confused"));
-      Serial.printf("sound: playing=%d %s\n", g_melody.active() ? 1 : 0,
-                    g_melody.active() ? g_melody.name() : "");
-      Serial.println(F("usage: sound <happy|sad|confused> | sound stop"));
-      return;
-    }
-    if (strcmp(argument, "stop") == 0) {
-      g_melody.stop();
-      PiezoTone::stop();
-      Serial.println(F("sound: stopped"));
-      return;
-    }
-    if (!g_piezoAvailable) {
-      Serial.println(F("ERR piezo unavailable"));
-      return;
-    }
-    if (!playMoodByName(argument)) {
-      Serial.printf("ERR unknown mood \"%s\" (expected happy|sad|confused)\n",
-                    argument);
-      return;
-    }
-    Serial.printf("sound: %s\n", argument);
+  uint16_t idleBase = 0;
+  uint16_t idleJitter = 0;
+  g_eyes.getIdleWanderInterval(idleBase, idleJitter);
+  stopDemo(false);
+  g_eyes.setIdleWander(strcmp(argument, "on") == 0, idleBase, idleJitter);
+  setEyeLoopRate(true);
+  requestImmediateFrame();
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdDims(char* argument) {
+  long values[3] = {0, 0, 0};
+  if (!parseLongArguments(argument, values, 3U)) {
+    Serial.println(F("ERR dims needs w h r"));
     return;
   }
+  if ((values[0] < kEyeBaseWMin) || (values[0] > kEyeBaseWMax)) {
+    Serial.println(F("ERR dims w must be 4..32"));
+    return;
+  }
+  if ((values[1] < kEyeBaseHMin) || (values[1] > kEyeBaseHMax)) {
+    Serial.println(F("ERR dims h must be 8..56"));
+    return;
+  }
+
+  const long maxRadius = (((values[0] < values[1]) ? values[0] : values[1]) / 2L);
+  if ((values[2] < 0L) || (values[2] > maxRadius)) {
+    Serial.println(F("ERR dims r must fit eye size"));
+    return;
+  }
+
+  stopDemo(false);
+  g_eyeBaseW = static_cast<uint8_t>(values[0]);
+  g_eyeBaseH = static_cast<uint8_t>(values[1]);
+  g_eyeRadius = static_cast<uint8_t>(values[2]);
+  g_eyeGeom.baseW = g_eyeBaseW;
+  g_eyeGeom.baseH = g_eyeBaseH;
+  g_eyeGeom.borderRadius = g_eyeRadius;
+  g_eyes.setDims(g_eyeBaseW, g_eyeBaseH, g_eyeRadius);
+  recomputeEyeRegionBounds();
+  setEyeLoopRate(true);
+  requestImmediateFrame();
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdMotion(char* argument) {
+  long values[2] = {0, 0};
+  if (!parseLongArguments(argument, values, 2U)) {
+    Serial.println(F("ERR motion needs x y"));
+    return;
+  }
+  if ((values[0] < 0L) || (values[0] > kEyeMotionXMax)) {
+    Serial.println(F("ERR motion x must be 0..30"));
+    return;
+  }
+  if ((values[1] < 0L) || (values[1] > kEyeMotionYMax)) {
+    Serial.println(F("ERR motion y must be 0..20"));
+    return;
+  }
+
+  stopDemo(false);
+  g_eyeMotionX = static_cast<int8_t>(values[0]);
+  g_eyeMotionY = static_cast<int8_t>(values[1]);
+  g_eyeGeom.motionRangeX = g_eyeMotionX;
+  g_eyeGeom.motionRangeY = g_eyeMotionY;
+  g_eyes.setMotionRange(g_eyeMotionX, g_eyeMotionY);
+  recomputeEyeRegionBounds();
+  setEyeLoopRate(true);
+  requestImmediateFrame();
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdBlinkrate(char* argument) {
+  long values[2] = {0, 0};
+  if (!parseLongArguments(argument, values, 2U)) {
+    Serial.println(F("ERR blinkrate needs sec jitter"));
+    return;
+  }
+  if ((values[0] < 1L) || (values[0] > 60L)) {
+    Serial.println(F("ERR blinkrate sec must be 1..60"));
+    return;
+  }
+  if ((values[1] < 0L) || (values[1] > values[0])) {
+    Serial.println(F("ERR blinkrate jitter must be 0..sec"));
+    return;
+  }
+
+  stopDemo(false);
+  g_eyes.setAutoblinker(true,
+                        static_cast<uint16_t>(values[0] * 1000L),
+                        static_cast<uint16_t>(values[1] * 1000L));
+  setEyeLoopRate(true);
+  requestImmediateFrame();
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdColor(char* argument) {
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.println(F("ERR color needs a value"));
+    return;
+  }
+
+  uint16_t color = 0;
+  if (!parseColorArgument(argument, color)) {
+    Serial.println(F("ERR invalid color"));
+    return;
+  }
+
+  stopDemo(false);
+  g_eyes.setMainColor(color);
+  setEyeLoopRate(true);
+  requestImmediateFrame();
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdHeadgain(char* argument) {
+  long values[2] = {0, 0};
+  if (!parseLongArguments(argument, values, 2U)) {
+    Serial.println(F("ERR headgain needs xDiv yDiv"));
+    return;
+  }
+  if ((values[0] < 0L) || (values[0] > kHeadShiftDivMax)) {
+    Serial.println(F("ERR headgain xDiv must be 0..32"));
+    return;
+  }
+  if ((values[1] < 0L) || (values[1] > kHeadShiftDivMax)) {
+    Serial.println(F("ERR headgain yDiv must be 0..32"));
+    return;
+  }
+
+  stopDemo(false);
+  g_headShiftXDiv = static_cast<uint8_t>(values[0]);
+  g_headShiftYDiv = static_cast<uint8_t>(values[1]);
+  if ((g_headShiftXDiv == 0U) || (g_headShiftYDiv == 0U)) {
+    g_forceEyeRedraw = true;
+    g_forceFullPush = true;
+  }
+  setEyeLoopRate(true);
+  requestImmediateFrame();
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdTone(char* argument) {
+  long frequencyHz = 0;
+  if (!parseLongArguments(argument, &frequencyHz, 1U)) {
+    Serial.println(F("ERR tone needs exactly one integer argument"));
+    return;
+  }
+  if ((frequencyHz != 0L) &&
+      ((frequencyHz < 200L) || (frequencyHz > 6000L))) {
+    Serial.println(F("ERR tone frequency must be 0 or 200..6000"));
+    return;
+  }
+  if (!g_piezoAvailable) {
+    Serial.println(F("ERR tone unavailable"));
+    return;
+  }
+  if (!PiezoTone::command(static_cast<uint16_t>(frequencyHz), millis())) {
+    Serial.println(F("ERR tone command failed"));
+    return;
+  }
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdCrash(char* argument) {
+  if ((argument != nullptr) && strcmp(argument, "clear") == 0) {
+    nvs_handle_t handle = 0;
+    if (nvs_open("crashlog", NVS_READWRITE, &handle) == ESP_OK) {
+      nvs_erase_all(handle);
+      nvs_commit(handle);
+      nvs_close(handle);
+    }
+    Serial.println(F("crash: cleared"));
+    return;
+  }
+  nvs_handle_t handle = 0;
+  if (nvs_open("crashlog", NVS_READONLY, &handle) != ESP_OK) {
+    Serial.println(F("crash: none recorded"));
+    return;
+  }
+  CrashRecord record{};
+  size_t size = sizeof(record);
+  const esp_err_t err = nvs_get_blob(handle, "rec", &record, &size);
+  nvs_close(handle);
+  if (err != ESP_OK || size != sizeof(record) ||
+      record.magic != kCrashRecordMagic) {
+    Serial.println(F("crash: none recorded"));
+    return;
+  }
+  const char* reasonName = "?";
+  switch (static_cast<esp_reset_reason_t>(record.reason)) {
+    case ESP_RST_PANIC:    reasonName = "PANIC"; break;
+    case ESP_RST_INT_WDT:  reasonName = "INT_WDT (interrupts off too long)"; break;
+    case ESP_RST_TASK_WDT: reasonName = "TASK_WDT"; break;
+    case ESP_RST_WDT:      reasonName = "WDT"; break;
+    case ESP_RST_BROWNOUT: reasonName = "BROWNOUT"; break;
+    case ESP_RST_SW:       reasonName = "SW (deliberate restart)"; break;
+    case ESP_RST_EXT:      reasonName = "EXT (reset pin)"; break;
+    default:               reasonName = "UNKNOWN/other"; break;
+  }
+  Serial.printf("crash: #%lu  reason=%s(%lu)\n",
+                static_cast<unsigned long>(record.count), reasonName,
+                static_cast<unsigned long>(record.reason));
+  Serial.printf("crash: where=%s  phase=%lu detail=0x%lX (client=%lu step=%lu)\n",
+                crumbName(record.phase),
+                static_cast<unsigned long>(record.phase),
+                static_cast<unsigned long>(record.detail),
+                static_cast<unsigned long>(record.detail & 0xFF),
+                static_cast<unsigned long>((record.detail >> 8) & 0xFF));
+  Serial.printf("crash: seq=%lu heapAfter=%lu minHeap=%lu\n",
+                static_cast<unsigned long>(record.seq),
+                static_cast<unsigned long>(record.freeHeap),
+                static_cast<unsigned long>(record.minHeap));
+  return;
+}
+
+void cmdLcdpush(char* argument) {
+  // Deliberately does ONLY a full canvas->panel push: no SPI re-init, no
+  // panel re-init, no canvas redraw. `lcdprobe` happens to fix the black
+  // screen, but it does two things at once (re-inits the SPI peripheral via
+  // g_bus->begin() AND forces a full push), so it cannot tell us which one
+  // matters. This isolates the push half.
+  //
+  // If THIS fixes a black screen, the canvas was correct and the panel had
+  // simply stopped receiving the incremental eye-region pushes.
+  // If this does NOT fix it but `lcdprobe` does, the SPI peripheral itself
+  // was wedged and re-initialising the bus is the real repair.
+  const uint32_t startedUs = micros();
+  pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
+  const uint32_t tookUs = micros() - startedUs;
+  if (g_batSeeded) drawBatteryMeter();
+  Serial.printf("lcdpush: full push %lux%lu took %lu us (SPI %lu MHz)\n",
+                static_cast<unsigned long>(kScreenW),
+                static_cast<unsigned long>(kScreenH),
+                static_cast<unsigned long>(tookUs),
+                static_cast<unsigned long>(g_lcdSpiHz / 1000000UL));
+  return;
+}
+
+void cmdLcdbus(char* argument) {
+  // The other half: re-init the SPI peripheral only, no push.
+  if (g_bus == nullptr) {
+    Serial.println(F("ERR no bus"));
+    return;
+  }
+  g_bus->begin(static_cast<int32_t>(g_lcdSpiHz));
+  Serial.println(F("lcdbus: SPI peripheral re-initialised (no push)"));
+  return;
+}
+
+void cmdLcdprobe(char* argument) {
+  // Reads 24 bits rather than 8 and prints them raw. The datasheet shows a
+  // "dummy read" before the status byte, but does not pin down whether that
+  // is one dummy CLOCK or a whole dummy BYTE on the serial interface. Rather
+  // than guess the framing, dump the window and locate 0x9C in it.
+  const uint32_t rddpm = lcdProbeRead(0x0A, 24);
+  const uint32_t rddid = lcdProbeRead(0x04, 32);
+  Serial.printf("lcdprobe: RDDPM(0x0A) raw=0x%06lX  RDDID(0x04) raw=0x%08lX\n",
+                static_cast<unsigned long>(rddpm & 0xFFFFFF),
+                static_cast<unsigned long>(rddid));
+  Serial.print(F("lcdprobe: RDDPM bits "));
+  for (int8_t bit = 23; bit >= 0; --bit) {
+    Serial.print((rddpm >> bit) & 1U);
+    if (bit % 8 == 0) Serial.print(' ');
+  }
+  Serial.println();
+  // Try each byte alignment; a live panel shows BSTON|SLPOUT|NORON|DISON.
+  for (uint8_t shift = 0; shift <= 16; shift += 8) {
+    const uint8_t candidate = static_cast<uint8_t>((rddpm >> shift) & 0xFF);
+    Serial.printf("lcdprobe:   byte<<%u = 0x%02X  BSTON=%u SLPOUT=%u "
+                  "NORON=%u DISON=%u%s\n",
+                  static_cast<unsigned>(shift),
+                  static_cast<unsigned>(candidate),
+                  static_cast<unsigned>((candidate >> 7) & 1),
+                  static_cast<unsigned>((candidate >> 4) & 1),
+                  static_cast<unsigned>((candidate >> 3) & 1),
+                  static_cast<unsigned>((candidate >> 2) & 1),
+                  lcdPanelLooksAlive(candidate) ? "  <-- ALIVE" : "");
+  }
+  if ((rddpm & 0xFFFFFF) == 0 || (rddpm & 0xFFFFFF) == 0xFFFFFF) {
+    // All-zero or all-one means the line never changed: either the panel is
+    // not driving SDA back, or read-back is not wired on this module.
+    Serial.println(F("lcdprobe: line static -- no read-back on this board"));
+  }
+  // The probe borrowed the SPI pins; repaint so nothing is left half-drawn.
+  g_forceFullPush = true;
+  g_forceEyeRedraw = true;
+  g_eyes.forceRedraw();
+  return;
+}
+
+void cmdLcdspi(char* argument) {
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.printf("lcdspi: %lu Hz (%lu MHz) active; default %lu MHz\n",
+                  static_cast<unsigned long>(g_lcdSpiHz),
+                  static_cast<unsigned long>(g_lcdSpiHz / 1000000UL),
+                  static_cast<unsigned long>(kLcdSpiHzDefault / 1000000UL));
+    Serial.println(F("usage: lcdspi <hz>  (8000000..80000000; reboot to apply)"));
+    return;
+  }
+  const long requested = strtol(argument, nullptr, 10);
+  if (requested < static_cast<long>(kLcdSpiHzMin) ||
+      requested > static_cast<long>(kLcdSpiHzMax)) {
+    Serial.printf("ERR lcdspi must be %lu..%lu Hz\n",
+                  static_cast<unsigned long>(kLcdSpiHzMin),
+                  static_cast<unsigned long>(kLcdSpiHzMax));
+    return;
+  }
+  nvs_handle_t handle = 0;
+  if (nvs_open("lcdcfg", NVS_READWRITE, &handle) != ESP_OK) {
+    Serial.println(F("ERR lcdcfg open failed"));
+    return;
+  }
+  esp_err_t err = nvs_set_u32(handle, "spihz",
+                              static_cast<uint32_t>(requested));
+  if (err == ESP_OK) err = nvs_commit(handle);
+  nvs_close(handle);
+  if (err != ESP_OK) {
+    Serial.println(F("ERR lcdcfg write failed"));
+    return;
+  }
+  // The clock is fixed when the bus is constructed, so this cannot take
+  // effect until the next boot. Say so rather than implying a live change.
+  Serial.printf("lcdspi: stored %ld Hz; reboot to apply\n", requested);
+  return;
+}
+
+void cmdSleep(char* argument) {
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR sleep takes no arguments"));
+    return;
+  }
+  stopDemo(false);
+  PiezoTone::stop();
+  g_paused = true;
+  resetDriveControl("serial sleep");
+  runSleepLogoAnimation();
+  g_forceFullPush = false;
+  g_forceEyeRedraw = false;
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdWake(char* argument) {
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR wake takes no arguments"));
+    return;
+  }
+  stopDemo(false);
+  if (g_paused) {
+    runWakeLogoAnimation();
+  }
+  g_paused = false;
+  g_lcdMode = LCD_MODE_FACE;
+  g_forceFullPush = false;
+  g_forceEyeRedraw = false;
+  setEyeLoopRate(true);
+  requestImmediateFrame();
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdDemo(char* argument) {
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR demo takes no arguments"));
+    return;
+  }
+  startDemo();
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdServooff(char* argument) {
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR servooff takes no arguments"));
+    return;
+  }
+  stopMovementGesture("serial servooff");
+  resetDriveControl("serial servooff");
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdTouchinfo(char* argument) {
+  MDO::TouchScreenController::device_type_t deviceType;
+  unsigned char firmware = 0;
+  const bool haveType = g_orTouch.getDeviceType(deviceType);
+  const bool haveFw = g_orTouch.getFirmwareVersion(firmware);
+  Serial.printf("touch: type=%d(%d) fw=%d(%d) gestures=%u points=%u debug=%d\n",
+                haveType ? static_cast<int>(deviceType) : -1, haveType ? 1 : 0,
+                haveFw ? static_cast<int>(firmware) : -1, haveFw ? 1 : 0,
+                static_cast<unsigned>(g_orTouchEventCount),
+                static_cast<unsigned>(g_orTouchPointCount),
+                g_touchDebug ? 1 : 0);
+  return;
+}
+
+void cmdTouchlog(char* argument) {
+  if ((argument != nullptr) && (strcmp(argument, "clear") == 0)) {
+    g_touchLogNext = 0;
+    g_touchLogTotal = 0;
+    Serial.println(F("OK"));
+    return;
+  }
+  const uint32_t total = g_touchLogTotal;
+  const uint8_t count =
+      total < kTouchLogSize ? static_cast<uint8_t>(total) : kTouchLogSize;
+  Serial.printf("touchlog total=%lu shown=%u now=%lu\n",
+                static_cast<unsigned long>(total),
+                static_cast<unsigned>(count),
+                static_cast<unsigned long>(millis()));
+  // Oldest first, so a tap sequence reads in the order it was performed.
+  for (uint8_t i = 0; i < count; ++i) {
+    const uint8_t slot = static_cast<uint8_t>(
+        (g_touchLogNext + kTouchLogSize - count + i) % kTouchLogSize);
+    const TouchLogEntry& e = g_touchLog[slot];
+    Serial.printf("  #%u ms=%lu gid=%d xy=(%d,%d) pressed=%d\n",
+                  static_cast<unsigned>(i), static_cast<unsigned long>(e.ms),
+                  static_cast<int>(e.gestureId), static_cast<int>(e.x),
+                  static_cast<int>(e.y), e.pressed ? 1 : 0);
+  }
+  return;
+}
+
+void cmdTouchreset(char* argument) {
+  // Recovery path: re-applies our configuration if the chip ever stops
+  // reporting. Deliberately does NOT touch auto-sleep — see the note in
+  // setup(); disabling it kills event reporting entirely.
+  const bool reset = g_orTouch.resetChip(true);
+  Serial.printf("touch: reset=%d\n", reset ? 1 : 0);
+  return;
+}
+
+void cmdTouchdebug(char* argument) {
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.printf("touchdebug=%s\n", g_touchDebug ? "on" : "off");
+    return;
+  }
+  if (strcmp(argument, "on") == 0) {
+    g_touchDebug = true;
+  } else if (strcmp(argument, "off") == 0) {
+    g_touchDebug = false;
+  } else {
+    Serial.println(F("ERR touchdebug <on|off>"));
+    return;
+  }
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdGesture(char* argument) {
+  if ((argument == nullptr) || (*argument == '\0')) {
+    printGestureUsage();
+    return;
+  }
+  if (strcmp(argument, "stop") == 0) {
+    stopMovementGesture("serial request");
+    Serial.println(F("OK"));
+    return;
+  }
+
+  // Optional second token: the frustrated swing length, so it can be tuned
+  // on the bench without a reflash.
+  char nameBuffer[24];
+  uint16_t runMs = 0;
+  const char* space = strchr(argument, ' ');
+  if (space != nullptr) {
+    const size_t nameLength = static_cast<size_t>(space - argument);
+    if (nameLength == 0 || nameLength >= sizeof(nameBuffer)) {
+      printGestureUsage();
+      return;
+    }
+    memcpy(nameBuffer, argument, nameLength);
+    nameBuffer[nameLength] = '\0';
+
+    const char* value = space;
+    while (*value == ' ') ++value;
+    if (*value == '\0') {
+      printGestureUsage();
+      return;
+    }
+    char* end = nullptr;
+    const long parsed = strtol(value, &end, 10);
+    if (end == value || (end != nullptr && *end != '\0') || parsed <= 0 ||
+        parsed > 65535) {
+      Serial.println(F("ERR run length must be a positive integer"));
+      return;
+    }
+    runMs = static_cast<uint16_t>(parsed);
+    argument = nameBuffer;
+  }
+
+  if (!startMovementGesture(argument, runMs)) {
+    printGestureUsage();
+    return;
+  }
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdTest(char* argument) {
+  // Same sequence the on-screen button runs, exposed on serial so it can be
+  // watched: 360 one way, rezero, 360 back.
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR test takes no arguments"));
+    return;
+  }
+  if (!startTurnTestSequence()) {
+    Serial.println(F("ERR could not start test"));
+    return;
+  }
+  return;
+}
+
+void cmdHeading(char* argument) {
+  if ((argument != nullptr) && (*argument != '\0')) {
+    if (strcmp(argument, "zero") == 0) {
+      g_headingIntegrator.reset();
+      Serial.println(F("heading: zeroed"));
+      Serial.println(F("OK"));
+      return;
+    }
+    Serial.println(F("ERR heading [zero]"));
+    return;
+  }
+  // Relative to the last zero — there is no compass, so this is not a
+  // bearing. Bias and ZUPT count are reported because they are what bound
+  // the drift, and drift is the only thing that makes this untrustworthy.
+  Serial.printf(
+      "heading: %.2f deg (axis %s, proj gain %.4f, bias %.3f dps, zupt %lu "
+      "applied / %lu rejected, last %.3f spread %.3f, samples %lu)\n",
+      static_cast<double>(g_headingIntegrator.totalDegrees()),
+      TurnMeasure::axisName(g_turnYawAxis),
+      static_cast<double>(g_turnAxisFraction > 0.0f
+                              ? 1.0f / g_turnAxisFraction
+                              : 0.0f),
+      static_cast<double>(g_turnBias[static_cast<int>(g_turnYawAxis)]),
+      static_cast<unsigned long>(g_headingZuptCount),
+      static_cast<unsigned long>(g_headingZuptRejected),
+      static_cast<double>(g_headingLastZuptDps),
+      static_cast<double>(g_headingLastZuptSpread),
+      static_cast<unsigned long>(g_headingIntegrator.sampleCount()));
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdTurn(char* argument) {
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.println(F("ERR turn <degrees> [cw|ccw]"));
+    return;
+  }
+  char* end = nullptr;
+  const double parsed = strtod(argument, &end);
+  if (end == argument) {
+    Serial.println(F("ERR turn <degrees> [cw|ccw]"));
+    return;
+  }
+  bool clockwise = true;
+  int8_t speed = MovementExpression::kSpinSpeed;
+  while (*end == ' ') ++end;
+  if (*end != '\0') {
+    // Optional direction, then optional speed, in either order after the
+    // angle: "turn 90 ccw 60" and "turn 90 60" both work.
+    char* cursor = end;
+    while (*cursor != '\0') {
+      while (*cursor == ' ') ++cursor;
+      if (*cursor == '\0') break;
+      if (strncmp(cursor, "ccw", 3) == 0) {
+        clockwise = false;
+        cursor += 3;
+        continue;
+      }
+      if (strncmp(cursor, "cw", 2) == 0) {
+        clockwise = true;
+        cursor += 2;
+        continue;
+      }
+      char* numEnd = nullptr;
+      const long parsedSpeed = strtol(cursor, &numEnd, 10);
+      if (numEnd == cursor) {
+        Serial.println(F("ERR turn <degrees> [cw|ccw] [speed]"));
+        return;
+      }
+      if (parsedSpeed < MovementExpression::kSpinMinSpeed ||
+          parsedSpeed > MovementExpression::kCommandMax) {
+        Serial.printf("ERR speed %d..%d\n",
+                      static_cast<int>(MovementExpression::kSpinMinSpeed),
+                      static_cast<int>(MovementExpression::kCommandMax));
+        return;
+      }
+      speed = static_cast<int8_t>(parsedSpeed);
+      cursor = numEnd;
+    }
+  }
+  if (!startClosedLoopTurn(static_cast<float>(parsed), clockwise, speed)) {
+    return;
+  }
+  return;
+}
+
+void cmdLead(char* argument) {
+  // The coast lead is learned automatically from every turn, but being able
+  // to read it, pin it, or disable it without a reflash makes it possible to
+  // A/B the compensation on the bench in seconds.
+  if ((argument == nullptr) || (*argument == '\0')) {
+    // Report BOTH terms. The linear one is zero by default now that the
+    // model is quadratic, and printing only that made the compensation look
+    // disabled when it was in fact doing all the work.
+    const float rate = 285.0f;
+    const float linear = g_coastLeadSeconds * rate;
+    const float quadratic =
+        g_coastAlpha > 0.0f ? (rate * rate) / (2.0f * g_coastAlpha) : 0.0f;
+    Serial.printf(
+        "lead: alpha %.0f deg/s2 + linear %.4f s -> %.1f deg predicted "
+        "coast at %.0f dps (%.1f quadratic + %.1f linear)\n",
+        static_cast<double>(g_coastAlpha),
+        static_cast<double>(g_coastLeadSeconds),
+        static_cast<double>(quadratic + linear), static_cast<double>(rate),
+        static_cast<double>(quadratic), static_cast<double>(linear));
+    Serial.printf("lead: %lu learned updates\n",
+                  static_cast<unsigned long>(g_coastLeadUpdates));
+    return;
+  }
+  if (strcmp(argument, "reset") == 0) {
+    g_coastLeadSeconds = kCoastLeadDefaultS;
+    g_coastLeadUpdates = 0;
+    Serial.printf("lead: reset to %.4f s\n",
+                  static_cast<double>(g_coastLeadSeconds));
+    return;
+  }
+  if (strcmp(argument, "off") == 0) {
+    g_coastLeadSeconds = 0.0f;
+    g_coastLeadUpdates = 0;
+    Serial.println(F("lead: off (turns stop on the measured angle, as before)"));
+    return;
+  }
+  char* end = nullptr;
+  const double seconds = strtod(argument, &end);
+  if (end == argument || seconds < kCoastLeadMinS || seconds > kCoastLeadMaxS) {
+    Serial.printf("ERR lead [<%g..%g seconds>|off|reset]\n",
+                  static_cast<double>(kCoastLeadMinS),
+                  static_cast<double>(kCoastLeadMaxS));
+    return;
+  }
+  g_coastLeadSeconds = static_cast<float>(seconds);
+  g_coastLeadUpdates = 0;   // a manual value is not a learned one
+  Serial.printf("lead: %.4f s set manually\n",
+                static_cast<double>(g_coastLeadSeconds));
+  return;
+}
+
+void cmdBench(char* argument) {
+  // The bench run is the answer to a hard constraint: movement cannot be
+  // tested from here. A tethered turn is invalid (the cable restrains
+  // rotation) and the robot must not be driven while plugged in, so every
+  // real measurement costs supervised, untethered human time. This makes that
+  // time count by extracting the coast constant, the speed/rate model and the
+  // lead-compensation A/B from a single ~2 minute run.
+  if ((argument == nullptr) || (*argument == '\0') ||
+      strcmp(argument, "status") == 0) {
+    Serial.printf("bench: armed=%d stored=%u entries%s running=%d\n",
+                  BenchLog::isArmed() ? 1 : 0,
+                  static_cast<unsigned>(g_benchLog.count()),
+                  g_benchLog.overflowed() ? " (TRUNCATED)" : "",
+                  g_benchPhase != BenchPhase::Idle ? 1 : 0);
+    return;
+  }
+  if (strcmp(argument, "arm") == 0) {
+    if (!BenchLog::setArmed(true)) {
+      Serial.println(F("ERR could not arm"));
+      return;
+    }
+    Serial.println(F("bench: ARMED. Now:"));
+    Serial.println(F("  1. unplug USB (the robot stays on battery)"));
+    Serial.println(F("  2. put it on the desk, on its wheels, clear space"));
+    Serial.println(F("  3. press the TEST button, do not touch it for ~2 min"));
+    Serial.println(F("  4. plug back in and run 'bench report'"));
+    return;
+  }
+  if (strcmp(argument, "disarm") == 0) {
+    BenchLog::setArmed(false);
+    Serial.println(F("bench: disarmed"));
+    return;
+  }
+  if (strcmp(argument, "clear") == 0) {
+    g_benchLog.erase();
+    Serial.println(F("bench: results erased"));
+    return;
+  }
+  if (strcmp(argument, "report") == 0) {
+    if (g_benchLog.count() == 0 && !g_benchLog.load()) {
+      Serial.println(F("bench: no stored run"));
+      return;
+    }
+    Serial.printf("bench report: %u entries%s\n",
+                  static_cast<unsigned>(g_benchLog.count()),
+                  g_benchLog.overflowed() ? " (TRUNCATED)" : "");
+    // Serial TX is normally non-blocking (setTxTimeoutMs(0)) so a missing
+    // host can never stall the control loop. That means it DROPS bytes when
+    // the USB CDC buffer fills — which silently corrupted two lines and
+    // swallowed the entire summary on run 002. flush() does not help,
+    // because with a zero timeout it does not wait either.
+    //
+    // For this one command, apply real backpressure. The timeout is kept
+    // short so an absent host costs at most ~20 ms per write rather than
+    // hanging, and it is restored immediately afterwards. This is the only
+    // copy of data that costs a supervised session to retake.
+    Serial.setTxTimeoutMs(20);
+    for (uint16_t i = 0; i < g_benchLog.count(); ++i) {
+      const BenchLog::Entry& entry = g_benchLog.at(i);
+      Serial.printf(
+          "bench %s param=%d cond=%s value=%.4f\n",
+          BenchLog::metricName(static_cast<BenchLog::Metric>(entry.metric)),
+          static_cast<int>(entry.param),
+          BenchLog::conditionName(entry.condition),
+          static_cast<double>(entry.value));
+      // Yield periodically so the buffer drains even at 20 ms of backpressure.
+      if ((i % 4) == 3) {
+        Serial.flush();
+        delay(4);
+      }
+    }
+    Serial.flush();
+    delay(10);
+    // The comparisons the run exists to make, computed on-device so they
+    // cannot be got wrong by hand. Split BY SPEED: pooling speeds averages a
+    // 16 deg coast together with a 4 deg one and understates the effect.
+    static const int16_t kReportSpeeds[] = {100, 75, 55};
+    Serial.println(F("bench summary (per speed):"));
+    for (int16_t speed : kReportSpeeds) {
+      float coastMean = 0.0f, rateMean = 0.0f;
+      uint16_t nCoast = 0, nRate = 0;
+      const bool haveCoast = g_benchLog.summariseParam(
+          BenchLog::Metric::CoastDegrees, BenchLog::kCondLeadOff, speed,
+          &coastMean, nullptr, &nCoast);
+      const bool haveRate = g_benchLog.summariseParam(
+          BenchLog::Metric::SteadyRateDps, BenchLog::kCondLeadOff, speed,
+          &rateMean, nullptr, &nRate);
+      if (!haveCoast || !haveRate || rateMean <= 1.0f || coastMean <= 0.01f) {
+        continue;
+      }
+      // alpha from the Coulomb model, which is what the controller uses. A
+      // linear model would need coast/rate instead, and the fact that that
+      // number is NOT constant across speeds is the whole reason the model
+      // is quadratic. Both are printed so the choice stays checkable.
+      const float alpha = (rateMean * rateMean) / (2.0f * coastMean);
+      Serial.printf(
+          "  speed %3d: rate %6.1f dps, coast %5.2f deg (n=%u) -> "
+          "alpha %5.0f, linear-k %.4f s\n",
+          static_cast<int>(speed), static_cast<double>(rateMean),
+          static_cast<double>(coastMean), static_cast<unsigned>(nCoast),
+          static_cast<double>(alpha),
+          static_cast<double>(coastMean / rateMean));
+      Serial.flush();
+      delay(4);
+    }
+    for (int16_t speed : kReportSpeeds) {
+      float off = 0.0f, on = 0.0f;
+      uint16_t nOff = 0, nOn = 0;
+      const bool haveOff = g_benchLog.summariseParam(
+          BenchLog::Metric::TurnErrorDegrees, BenchLog::kCondLeadOff, speed,
+          &off, nullptr, &nOff);
+      const bool haveOn = g_benchLog.summariseParam(
+          BenchLog::Metric::TurnErrorDegrees, BenchLog::kCondLeadOn, speed,
+          &on, nullptr, &nOn);
+      if (!haveOff || !haveOn) continue;
+      // Compared on MAGNITUDE. Once compensation over-corrects the error goes
+      // negative, and a naive ratio would report an over-correction as a
+      // greater-than-100% improvement. The sign is printed too, because
+      // which way it misses is the thing that decides the next alpha.
+      const float offMag = off < 0 ? -off : off;
+      const float onMag = on < 0 ? -on : on;
+      Serial.printf(
+          "  A/B speed %3d: %+.2f deg lead-off (n=%u) -> %+.2f deg lead-on "
+          "(n=%u), |err| %.1f%% smaller%s\n",
+          static_cast<int>(speed), static_cast<double>(off),
+          static_cast<unsigned>(nOff), static_cast<double>(on),
+          static_cast<unsigned>(nOn),
+          static_cast<double>(offMag > 0.01f
+                                  ? (1.0f - onMag / offMag) * 100.0f
+                                  : 0.0f),
+          on < -0.5f ? " (OVER-corrected: raise alpha)"
+                     : (on > 0.5f ? " (under-corrected: lower alpha)" : ""));
+      Serial.flush();
+      delay(4);
+    }
+    Serial.printf("bench: compiled alpha %.0f deg/s2, live alpha %.0f\n",
+                  static_cast<double>(kCoastAlphaDefault),
+                  static_cast<double>(g_coastAlpha));
+    Serial.flush();
+    // Back to non-blocking, so a disconnected host can never stall the loop.
+    Serial.setTxTimeoutMs(0);
+    Serial.println(F("OK"));
+    return;
+  }
+  Serial.println(F("ERR bench [status|arm|disarm|report|clear]"));
+  return;
+}
+
+void cmdSound(char* argument) {
+  if ((argument == nullptr) || (*argument == '\0')) {
+    // The generator now owns the sound vocabulary — three moods, each
+    // composed fresh on every trigger.
+    Serial.println(F("sound: happy, sad, confused"));
+    Serial.printf("sound: playing=%d %s\n", g_melody.active() ? 1 : 0,
+                  g_melody.active() ? g_melody.name() : "");
+    Serial.println(F("usage: sound <happy|sad|confused> | sound stop"));
+    return;
+  }
+  if (strcmp(argument, "stop") == 0) {
+    g_melody.stop();
+    PiezoTone::stop();
+    Serial.println(F("sound: stopped"));
+    return;
+  }
+  if (!g_piezoAvailable) {
+    Serial.println(F("ERR piezo unavailable"));
+    return;
+  }
+  if (!playMoodByName(argument)) {
+    Serial.printf("ERR unknown mood \"%s\" (expected happy|sad|confused)\n",
+                  argument);
+    return;
+  }
+  Serial.printf("sound: %s\n", argument);
+  return;
+}
 
   // Named 'sense', not 'motion': 'motion' is already the eye-engine's gaze-range
   // command and silently shadowed this accelerometer diagnostic for months. The
   // output labels below deliberately still print "motion:" because external
   // scripts grep for them. See PROJECT-HISTORY Appendix B.
-  if (strncmp(line, "sense", 5) == 0 &&
-      (line[5] == '\0' || line[5] == ' ')) {
-    // Live view of the detector, so a threshold that misfires can be SEEN
-    // rather than guessed at. Pick the robot up while watching this and the
-    // tilt number should move immediately.
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.printf(
-          "motion: tilt %.1f deg, |a|-1 %+.3f g, linear %.3f g, lifted=%d\n",
-          static_cast<double>(g_motionEvents.lastTiltDegrees()),
-          static_cast<double>(g_motionEvents.lastMagnitudeDeviationG()),
-          static_cast<double>(g_motionEvents.lastLinearG()),
-          g_motionEvents.lifted() ? 1 : 0);
-      Serial.printf("motion: bumps=%u shakes=%u lifts=%u\n",
-                    static_cast<unsigned>(g_motionEvents.bumpCount()),
-                    static_cast<unsigned>(g_motionEvents.shakeCount()),
-                    static_cast<unsigned>(g_motionEvents.liftCount()));
-      Serial.printf(
-          "motion: thresholds bump %.2f g, shake %u alternations/s, "
-          "lift %.0f deg or %.2f g held %lums\n",
-          static_cast<double>(MotionEvents::kBumpG),
-          static_cast<unsigned>(MotionEvents::kShakeAlternations),
-          static_cast<double>(MotionEvents::kLiftTiltDegrees),
-          static_cast<double>(MotionEvents::kLiftMagnitudeG),
-          static_cast<unsigned long>(MotionEvents::kLiftHoldUs / 1000));
-      return;
-    }
-    if (strcmp(argument, "zero") == 0) {
-      if (!establishYawAxis()) {
-        Serial.println(F("ERR could not read gravity"));
-        return;
-      }
-      g_motionEvents.begin(g_turnGravity[0], g_turnGravity[1],
-                           g_turnGravity[2]);
-      Serial.println(F("sense: reference re-taken at the current pose"));
-      return;
-    }
-    Serial.println(F("ERR sense [zero]"));
+void cmdSense(char* argument) {
+  // Live view of the detector, so a threshold that misfires can be SEEN
+  // rather than guessed at. Pick the robot up while watching this and the
+  // tilt number should move immediately.
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.printf(
+        "motion: tilt %.1f deg, |a|-1 %+.3f g, linear %.3f g, lifted=%d\n",
+        static_cast<double>(g_motionEvents.lastTiltDegrees()),
+        static_cast<double>(g_motionEvents.lastMagnitudeDeviationG()),
+        static_cast<double>(g_motionEvents.lastLinearG()),
+        g_motionEvents.lifted() ? 1 : 0);
+    Serial.printf("motion: bumps=%u shakes=%u lifts=%u\n",
+                  static_cast<unsigned>(g_motionEvents.bumpCount()),
+                  static_cast<unsigned>(g_motionEvents.shakeCount()),
+                  static_cast<unsigned>(g_motionEvents.liftCount()));
+    Serial.printf(
+        "motion: thresholds bump %.2f g, shake %u alternations/s, "
+        "lift %.0f deg or %.2f g held %lums\n",
+        static_cast<double>(MotionEvents::kBumpG),
+        static_cast<unsigned>(MotionEvents::kShakeAlternations),
+        static_cast<double>(MotionEvents::kLiftTiltDegrees),
+        static_cast<double>(MotionEvents::kLiftMagnitudeG),
+        static_cast<unsigned long>(MotionEvents::kLiftHoldUs / 1000));
     return;
   }
-
-  if (strncmp(line, "scale", 5) == 0 && (line[5] == '\0' || line[5] == ' ')) {
-    // The last unmeasured error, and the only one that needs an external
-    // reference: a scale error produces zero output at zero rate, so no
-    // amount of sitting still can reveal it.
-    if ((argument == nullptr) || (*argument == '\0') ||
-        strcmp(argument, "status") == 0) {
-      const float correction = ImuQmi8658::gyroScaleCorrection();
-      Serial.printf("scale: correction %.4f\n",
-                    static_cast<double>(correction));
-      if (g_scaleBoundPercent > 0.0f) {
-        Serial.printf(
-            "scale: VERIFIED against a floor mark - error <%.3f%% "
-            "(<%.2f deg per 360)%s\n",
-            static_cast<double>(g_scaleBoundPercent),
-            static_cast<double>(g_scaleBoundPercent / 100.0f * 360.0f),
-            correction == 1.0f ? ", factory scale kept" : "");
-      } else {
-        Serial.println(F("scale: NEVER CHECKED - factory scale, unverified"));
-      }
-      if (g_scaleCheckRevs > 0) {
-        Serial.printf(
-            "scale: a %u-revolution check is PENDING - measure the offset "
-            "from the mark, then run 'scale actual <deg>'\n",
-            static_cast<unsigned>(g_scaleCheckRevs));
-      }
-      Serial.println(F("usage: scale check [revs] | scale actual <deg> | scale reset"));
+  if (strcmp(argument, "zero") == 0) {
+    if (!establishYawAxis()) {
+      Serial.println(F("ERR could not read gravity"));
       return;
     }
-    if (strcmp(argument, "reset") == 0) {
-      ImuQmi8658::setGyroScaleCorrection(1.0f);
-      saveGyroScale(1.0f);
-      saveScaleCheckRevs(0);
-      saveScaleBound(0.0f);
-      Serial.println(F("scale: reset to factory (1.0000), verification cleared"));
-      return;
-    }
-    if (strncmp(argument, "check", 5) == 0) {
-      long revs = 3;
-      if (argument[5] != '\0') revs = strtol(argument + 5, nullptr, 10);
-      if (revs < 1 || revs > 5) {
-        Serial.println(F("ERR revs 1..5"));
-        return;
-      }
-      if (g_turnCmdActive || g_straightActive || motionInProgress()) {
-        Serial.println(F("ERR a movement is already running"));
-        return;
-      }
-      // Validate NOW, while tethered. Discovering that the turn does not fit
-      // at the moment the button is pressed would waste the whole trip.
-      const uint32_t timeout = turnTimeoutMsFor(
-          static_cast<float>(revs) * 360.0f, MovementExpression::kCommandMax);
-      if (timeout == 0) {
-        Serial.printf(
-            "ERR %ld revolutions will not fit in the %u ms pattern limit at "
-            "the current %u ms/turn calibration; try fewer\n",
-            revs, MovementExpression::kSpinPatternMaxMs,
-            g_spinCalibration.fullTurnMs());
-        return;
-      }
-      // Remember it across the unplug: the turn MUST be untethered, because
-      // the cable measurably restrains rotation.
-      saveScaleCheckRevs(static_cast<uint8_t>(revs));
-      Serial.printf("scale check: %ld revolutions armed (%lums).\n", revs,
-                    static_cast<unsigned long>(timeout));
-      Serial.println(F("  1. mark the floor at the robot's front"));
-      Serial.println(F("  2. unplug USB"));
-      Serial.println(F("  3. press TEST - it will spin, then stop"));
-      Serial.println(F("  4. measure how far PAST the mark it stopped"));
-      Serial.println(F("  5. plug in, run 'scale actual <deg>' (negative = short)"));
-      return;
-    }
-    if (strncmp(argument, "actual", 6) == 0) {
-      if (g_scaleCheckRevs == 0) {
-        Serial.println(F("ERR run 'scale check' first"));
-        return;
-      }
-      char* end = nullptr;
-      const double offset = strtod(argument + 6, &end);
-      if (end == argument + 6) {
-        Serial.println(F("ERR scale actual <degrees past the mark>"));
-        return;
-      }
-      const float commanded =
-          static_cast<float>(g_scaleCheckRevs) * 360.0f;
-      const float trueRotation = commanded + static_cast<float>(offset);
-      if (!(trueRotation > 0.0f)) {
-        Serial.println(F("ERR that offset implies it barely moved"));
-        return;
-      }
-      // The gyro said `commanded`; the floor says `trueRotation`. The ratio is
-      // exactly how much the gyro under-reports.
-      const float correction = trueRotation / commanded;
-      if (!(correction > 0.5f) || !(correction < 2.0f)) {
-        Serial.printf(
-            "ERR implied correction %.3f is outside 0.5..2.0 - re-check the "
-            "measurement rather than applying it\n",
-            static_cast<double>(correction));
-        return;
-      }
+    g_motionEvents.begin(g_turnGravity[0], g_turnGravity[1],
+                         g_turnGravity[2]);
+    Serial.println(F("sense: reference re-taken at the current pose"));
+    return;
+  }
+  Serial.println(F("ERR sense [zero]"));
+  return;
+}
 
-      // How well the offset could be read at all. Applying a correction
-      // smaller than this would be false precision: it would encode the
-      // reading error as if it were a sensor property.
-      const float resolution = kMarkReadingUncertaintyDeg / commanded;
-      const float implied = correction > 1.0f ? correction - 1.0f
-                                              : 1.0f - correction;
-      const float boundPercent =
-          (implied > resolution ? implied : resolution) * 100.0f;
-
+void cmdScale(char* argument) {
+  // The last unmeasured error, and the only one that needs an external
+  // reference: a scale error produces zero output at zero rate, so no
+  // amount of sitting still can reveal it.
+  if ((argument == nullptr) || (*argument == '\0') ||
+      strcmp(argument, "status") == 0) {
+    const float correction = ImuQmi8658::gyroScaleCorrection();
+    Serial.printf("scale: correction %.4f\n",
+                  static_cast<double>(correction));
+    if (g_scaleBoundPercent > 0.0f) {
       Serial.printf(
-          "scale: gyro said %.0f deg, floor says %.0f (offset %+.1f)\n",
-          static_cast<double>(commanded), static_cast<double>(trueRotation),
-          static_cast<double>(offset));
+          "scale: VERIFIED against a floor mark - error <%.3f%% "
+          "(<%.2f deg per 360)%s\n",
+          static_cast<double>(g_scaleBoundPercent),
+          static_cast<double>(g_scaleBoundPercent / 100.0f * 360.0f),
+          correction == 1.0f ? ", factory scale kept" : "");
+    } else {
+      Serial.println(F("scale: NEVER CHECKED - factory scale, unverified"));
+    }
+    if (g_scaleCheckRevs > 0) {
       Serial.printf(
-          "scale: implied error %.3f%%, reading resolution %.3f%% over %u revs\n",
-          static_cast<double>(implied * 100.0f),
-          static_cast<double>(resolution * 100.0f),
+          "scale: a %u-revolution check is PENDING - measure the offset "
+          "from the mark, then run 'scale actual <deg>'\n",
           static_cast<unsigned>(g_scaleCheckRevs));
-
-      if (implied <= resolution) {
-        // Indistinguishable from no error. Record that it was CHECKED and
-        // bounded, which is a stronger and more useful statement than an
-        // invented correction — and leave the factory scale alone.
-        saveScaleBound(boundPercent);
-        saveScaleCheckRevs(0);
-        Serial.printf(
-            "scale: VERIFIED - error is below what the check can resolve.\n"
-            "scale: factory scale kept; error bounded to <%.3f%% "
-            "(<%.2f deg per 360)\n",
-            static_cast<double>(boundPercent),
-            static_cast<double>(boundPercent / 100.0f * 360.0f));
-        Serial.println(F("OK"));
-        return;
-      }
-
-      const float previous = ImuQmi8658::gyroScaleCorrection();
-      ImuQmi8658::setGyroScaleCorrection(correction);
-      saveGyroScale(correction);
-      saveScaleBound(boundPercent);
-      saveScaleCheckRevs(0);
-      Serial.printf("scale: correction %.4f applied (was %.4f)\n",
-                    static_cast<double>(correction),
-                    static_cast<double>(previous));
-
-      // alpha is measured THROUGH the gyro: alpha = w^2/(2*coast), and both w
-      // and coast scale together, so alpha scales linearly. Adjusting it here
-      // keeps the coast compensation valid instead of silently invalidating
-      // three bench runs of tuning.
-      const float ratio = correction / previous;
-      g_coastAlpha *= ratio;
-      Serial.printf("scale: coast alpha auto-adjusted x%.4f -> %.0f deg/s2\n",
-                    static_cast<double>(ratio),
-                    static_cast<double>(g_coastAlpha));
-      Serial.println(F("scale: re-run 'spin auto' and a bench run to confirm"));
-      if (establishYawAxis()) {
-        Serial.println(F("scale: yaw axis re-established"));
-      }
-      Serial.println(F("OK"));
-      return;
     }
-    Serial.println(F("ERR scale [check [revs]|actual <deg>|reset|status]"));
+    Serial.println(F("usage: scale check [revs] | scale actual <deg> | scale reset"));
     return;
   }
-
-  if (strncmp(line, "cod", 3) == 0 && (line[3] == '\0' || line[3] == ' ')) {
-    // Calibration On Demand: the chip measures and corrects its own gyro SCALE
-    // factor. Worth doing because scale is the one error the zero-velocity
-    // update cannot see — 3% of zero is still zero — so it would otherwise
-    // need an external angle reference (a protractor and a human).
-    if ((argument == nullptr) || (*argument == '\0') ||
-        strcmp(argument, "status") == 0) {
-      Serial.printf("cod: stored=%d gains=(%u,%u,%u)\n",
-                    g_codGains.valid ? 1 : 0,
-                    static_cast<unsigned>(g_codGains.x),
-                    static_cast<unsigned>(g_codGains.y),
-                    static_cast<unsigned>(g_codGains.z));
-      Serial.printf("cod: gyro LPF %s mode %u\n",
-                    ImuQmi8658::gyroLowPassEnabled() ? "ON" : "off",
-                    static_cast<unsigned>(ImuQmi8658::gyroLowPassMode()));
-      Serial.println(F("usage: cod run | cod clear"));
-      return;
-    }
-    if (strcmp(argument, "clear") == 0) {
-      nvs_handle_t handle = 0;
-      if (nvs_open(kCodNamespace, NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_erase_key(handle, kCodKey);
-        nvs_commit(handle);
-        nvs_close(handle);
-      }
-      g_codGains.valid = false;
-      Serial.println(F("cod: cleared (power-cycle to drop the applied gains)"));
-      return;
-    }
-    if (strcmp(argument, "run") != 0) {
-      Serial.println(F("ERR cod [run|clear|status]"));
+  if (strcmp(argument, "reset") == 0) {
+    ImuQmi8658::setGyroScaleCorrection(1.0f);
+    saveGyroScale(1.0f);
+    saveScaleCheckRevs(0);
+    saveScaleBound(0.0f);
+    Serial.println(F("scale: reset to factory (1.0000), verification cleared"));
+    return;
+  }
+  if (strncmp(argument, "check", 5) == 0) {
+    long revs = 3;
+    if (argument[5] != '\0') revs = strtol(argument + 5, nullptr, 10);
+    if (revs < 1 || revs > 5) {
+      Serial.println(F("ERR revs 1..5"));
       return;
     }
     if (g_turnCmdActive || g_straightActive || motionInProgress()) {
-      Serial.println(F("ERR cod needs the robot stopped"));
+      Serial.println(F("ERR a movement is already running"));
       return;
     }
-    Serial.println(F("cod: running, ~2s. DO NOT TOUCH THE ROBOT."));
-    Serial.flush();
-    ImuQmi8658::CodResult result{};
-    const bool ok = ImuQmi8658::runCod(result);
-    Serial.printf("cod: status=0x%02X gains=(%u,%u,%u)\n",
-                  static_cast<unsigned>(result.status),
-                  static_cast<unsigned>(result.gainX),
-                  static_cast<unsigned>(result.gainY),
-                  static_cast<unsigned>(result.gainZ));
-    if (!ok) {
-      const char* reason = ImuQmi8658::codFailureReason(result.status);
-      Serial.printf("cod: FAILED - %s\n",
-                    reason != nullptr ? reason : "no response from the device");
-      return;
-    }
-    if (result.gainX == 0 || result.gainY == 0 || result.gainZ == 0) {
-      Serial.println(F("cod: refusing a zero gain (would scale the gyro away)"));
-      return;
-    }
-    if (!saveCodGains(result.gainX, result.gainY, result.gainZ)) {
-      Serial.println(F("cod: measured, but FAILED TO SAVE"));
-      return;
-    }
-    Serial.println(F("cod: saved, re-applied automatically at every boot"));
-    // Re-establish the yaw axis and bias: the scale just changed underneath
-    // every previously measured constant.
-    if (establishYawAxis()) {
-      Serial.println(F("cod: yaw axis re-established"));
-    }
-    Serial.println(F("OK"));
-    return;
-  }
-
-  if (strncmp(line, "lpf", 3) == 0 && (line[3] == '\0' || line[3] == ' ')) {
-    // Gyro low-pass. Runtime-switchable ON PURPOSE: it does NOT reduce
-    // integrated-angle error from white noise (integration is already an
-    // average), but it does prevent servo vibration above Nyquist from
-    // aliasing down into the signal band. It also costs ~38 ms of group delay.
-    // Both effects are measurable with a bench run, so make it easy to A/B.
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.printf("lpf: %s mode %u (%s)\n",
-                    ImuQmi8658::gyroLowPassEnabled() ? "ON" : "off",
-                    static_cast<unsigned>(ImuQmi8658::gyroLowPassMode()),
-                    ImuQmi8658::gyroLowPassEnabled()
-                        ? "~26 Hz bandwidth, ~38 ms group delay"
-                        : "full Nyquist band");
-      Serial.println(F("usage: lpf on [mode 0..3] | lpf off"));
-      return;
-    }
-    if (strcmp(argument, "off") == 0) {
-      if (!ImuQmi8658::setGyroLowPass(false, 0)) {
-        Serial.println(F("ERR could not write CTRL5"));
-        return;
-      }
-      Serial.println(F("lpf: off"));
-      return;
-    }
-    if (strncmp(argument, "on", 2) == 0) {
-      long mode = 0;
-      if (argument[2] != '\0') mode = strtol(argument + 2, nullptr, 10);
-      if (mode < 0 || mode > 3) {
-        Serial.println(F("ERR mode 0..3"));
-        return;
-      }
-      if (!ImuQmi8658::setGyroLowPass(true, static_cast<uint8_t>(mode))) {
-        Serial.println(F("ERR could not write CTRL5"));
-        return;
-      }
-      Serial.printf("lpf: on, mode %ld\n", mode);
-      return;
-    }
-    Serial.println(F("ERR lpf [on [mode]|off]"));
-    return;
-  }
-
-  if (strncmp(line, "straight", 8) == 0 &&
-      (line[8] == '\0' || line[8] == ' ')) {
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.printf("straight: %.1f cm/s at full speed (%s)\n",
-                    static_cast<double>(g_forwardCmPerSec),
-                    g_forwardCalUpdates == 0
-                        ? "DERIVED from spin rate, never measured"
-                        : "self-calibrated from inertial distance");
-      Serial.printf("straight: %lu self-calibration updates so far\n",
-                    static_cast<unsigned long>(g_forwardCalUpdates));
-      Serial.println(F("usage: straight <cm> [speed] | straight cal <actual cm>"));
-      return;
-    }
-    if (strncmp(argument, "cal ", 4) == 0) {
-      // Optional override. The robot self-calibrates from inertial distance
-      // after every leg, so this exists only for the case where a tape measure
-      // disagrees with the IMU and you trust the tape.
-      const long actual = strtol(argument + 4, nullptr, 10);
-      if (actual < 5 || actual > 400 || g_straightTargetCm <= 0) {
-        Serial.println(F("ERR straight cal <actual cm>, after a straight run"));
-        return;
-      }
-      const float ratio = static_cast<float>(actual) /
-                          static_cast<float>(g_straightTargetCm);
-      float updated = g_forwardCmPerSec * ratio;
-      if (updated < kForwardCmPerSecMin) updated = kForwardCmPerSecMin;
-      if (updated > kForwardCmPerSecMax) updated = kForwardCmPerSecMax;
+    // Validate NOW, while tethered. Discovering that the turn does not fit
+    // at the moment the button is pressed would waste the whole trip.
+    const uint32_t timeout = turnTimeoutMsFor(
+        static_cast<float>(revs) * 360.0f, MovementExpression::kCommandMax);
+    if (timeout == 0) {
       Serial.printf(
-          "straight cal: commanded %d cm, actually went %ld -> %.1f cm/s "
-          "(was %.1f)\n",
-          static_cast<int>(g_straightTargetCm), actual,
-          static_cast<double>(updated), static_cast<double>(g_forwardCmPerSec));
-      g_forwardCmPerSec = updated;
-      ++g_forwardCalUpdates;
+          "ERR %ld revolutions will not fit in the %u ms pattern limit at "
+          "the current %u ms/turn calibration; try fewer\n",
+          revs, MovementExpression::kSpinPatternMaxMs,
+          g_spinCalibration.fullTurnMs());
+      return;
+    }
+    // Remember it across the unplug: the turn MUST be untethered, because
+    // the cable measurably restrains rotation.
+    saveScaleCheckRevs(static_cast<uint8_t>(revs));
+    Serial.printf("scale check: %ld revolutions armed (%lums).\n", revs,
+                  static_cast<unsigned long>(timeout));
+    Serial.println(F("  1. mark the floor at the robot's front"));
+    Serial.println(F("  2. unplug USB"));
+    Serial.println(F("  3. press TEST - it will spin, then stop"));
+    Serial.println(F("  4. measure how far PAST the mark it stopped"));
+    Serial.println(F("  5. plug in, run 'scale actual <deg>' (negative = short)"));
+    return;
+  }
+  if (strncmp(argument, "actual", 6) == 0) {
+    if (g_scaleCheckRevs == 0) {
+      Serial.println(F("ERR run 'scale check' first"));
       return;
     }
     char* end = nullptr;
-    const long cm = strtol(argument, &end, 10);
-    int8_t speed = MovementExpression::kSpinSpeed;
-    if (end != nullptr && *end != '\0') {
-      const long parsedSpeed = strtol(end, nullptr, 10);
-      if (parsedSpeed != 0) speed = static_cast<int8_t>(parsedSpeed);
+    const double offset = strtod(argument + 6, &end);
+    if (end == argument + 6) {
+      Serial.println(F("ERR scale actual <degrees past the mark>"));
+      return;
     }
-    startStraightDrive(static_cast<int16_t>(cm), speed);
-    return;
-  }
+    const float commanded =
+        static_cast<float>(g_scaleCheckRevs) * 360.0f;
+    const float trueRotation = commanded + static_cast<float>(offset);
+    if (!(trueRotation > 0.0f)) {
+      Serial.println(F("ERR that offset implies it barely moved"));
+      return;
+    }
+    // The gyro said `commanded`; the floor says `trueRotation`. The ratio is
+    // exactly how much the gyro under-reports.
+    const float correction = trueRotation / commanded;
+    if (!(correction > 0.5f) || !(correction < 2.0f)) {
+      Serial.printf(
+          "ERR implied correction %.3f is outside 0.5..2.0 - re-check the "
+          "measurement rather than applying it\n",
+          static_cast<double>(correction));
+      return;
+    }
 
-  if (strncmp(line, "survey", 6) == 0 &&
-      (line[6] == '\0' || line[6] == ' ')) {
-    // Drives an equilateral triangle, sampling RSSI at each vertex and once
-    // more back at the start. Translation is the only motion that changes range
-    // to an AP, so it is the only motion that can produce RSSI information.
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.printf("survey: phase=%d side=%ucm scans=%u\n",
-                    static_cast<int>(g_surveyPhase),
-                    static_cast<unsigned>(g_surveySideCm),
-                    static_cast<unsigned>(g_surveyScans));
-      Serial.println(F("usage: survey start [sideCm] [scans]  (NEEDS FLOOR)"));
-      return;
-    }
-    if (strcmp(argument, "stop") == 0) {
-      if (g_surveyPhase == SurveyPhase::Idle) {
-        Serial.println(F("survey: not running"));
-        return;
-      }
-      surveyFinish("stopped");
-      return;
-    }
-    if (strncmp(argument, "start", 5) == 0) {
-      uint16_t side = 100;
-      uint16_t scans = 12;
-      const char* rest = argument + 5;
-      char* end = nullptr;
-      const long parsedSide = strtol(rest, &end, 10);
-      if (end != rest && parsedSide > 0) {
-        side = static_cast<uint16_t>(parsedSide);
-        const long parsedScans = strtol(end, nullptr, 10);
-        if (parsedScans > 0 && parsedScans <= 200) {
-          scans = static_cast<uint16_t>(parsedScans);
-        }
-      }
-      startTriangleSurvey(side, scans);
-      return;
-    }
-    Serial.println(F("ERR survey [start [sideCm] [scans]|stop]"));
-    return;
-  }
+    // How well the offset could be read at all. Applying a correction
+    // smaller than this would be false precision: it would encode the
+    // reading error as if it were a sensor property.
+    const float resolution = kMarkReadingUncertaintyDeg / commanded;
+    const float implied = correction > 1.0f ? correction - 1.0f
+                                            : 1.0f - correction;
+    const float boundPercent =
+        (implied > resolution ? implied : resolution) * 100.0f;
 
-  if (strncmp(line, "rfsurvey", 8) == 0 &&
-      (line[8] == '\0' || line[8] == ' ')) {
-    // Samples RSSI at ONE labelled position, averaged over N scans.
-    //
-    // This tests the load-bearing assumption behind using WiFi for absolute
-    // position: does moving the robot change RSSI by more than the scatter at
-    // a fixed point? Predicted signal is 0.63 dB per 0.3 m and 1.98 dB per 1 m
-    // (n=2.5, AP at 5 m); measured fixed-point noise is 1-2 dB. So the answer
-    // is not obvious, averaging is mandatory, and the comparison must be made
-    // against the spread rather than against zero.
-    //
-    // NOTE this is translation, not rotation. Rotating in place changes range
-    // to nothing and produces exactly zero information; moving genuinely does
-    // change range. The two ideas fail or succeed for completely different
-    // reasons and must not be conflated.
-    if (g_turnCmdActive || motionInProgress()) {
-      Serial.println(F("ERR rfsurvey needs the robot stopped"));
-      return;
-    }
-    if (g_overrideUp) {
-      Serial.println(F("ERR rfsurvey cannot run while the override AP is up"));
-      return;
-    }
-    if (g_rfScanActive || g_rfSurveyPosition >= 0) {
-      Serial.println(F("ERR a scan is already running"));
-      return;
-    }
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.println(F("ERR rfsurvey <label> [scans]  |  rfsurvey report|clear"));
-      return;
-    }
-    if (strcmp(argument, "clear") == 0) {
-      g_rfMap.erase();
-      Serial.println(F("rfsurvey: survey erased"));
-      return;
-    }
-    if (strcmp(argument, "report") == 0) {
-      if (g_rfMap.positionCount() == 0 && !g_rfMap.load()) {
-        Serial.println(F("rfsurvey: no stored survey"));
-        return;
-      }
-      Serial.setTxTimeoutMs(20);
-      Serial.printf("rfsurvey report: %u positions, %u APs\n",
-                    static_cast<unsigned>(g_rfMap.positionCount()),
-                    static_cast<unsigned>(g_rfMap.apCount()));
-      for (uint8_t a = 0; a < g_rfMap.apCount(); ++a) {
-        const uint8_t* b = g_rfMap.bssidAt(a);
-        Serial.printf("ap%u %02X:%02X:%02X:%02X:%02X:%02X\n",
-                      static_cast<unsigned>(a), b[0], b[1], b[2], b[3], b[4],
-                      b[5]);
-        for (uint8_t p = 0; p < g_rfMap.positionCount(); ++p) {
-          const RfMap::Reading& r = g_rfMap.readingAt(p, a);
-          if (r.samples == 0) {
-            Serial.printf("   %-12s  (not seen)\n", g_rfMap.labelAt(p));
-            continue;
-          }
-          Serial.printf("   %-12s  %7.2f dBm  spread %5.2f  n=%u\n",
-                        g_rfMap.labelAt(p),
-                        static_cast<double>(r.meanTenthDbm) / 10.0,
-                        static_cast<double>(r.spreadTenthDbm) / 10.0,
-                        static_cast<unsigned>(r.samples));
-        }
-        // The verdict, per AP, for every position pair: is the difference
-        // between positions bigger than the scatter within them?
-        for (uint8_t p = 0; p + 1 < g_rfMap.positionCount(); ++p) {
-          for (uint8_t q = p + 1; q < g_rfMap.positionCount(); ++q) {
-            float delta = 0.0f, spread = 0.0f;
-            uint16_t n = 0;
-            if (!g_rfMap.compare(a, p, q, &delta, &spread, &n)) continue;
-            const float mag = delta < 0 ? -delta : delta;
-            Serial.printf("   %s->%s  delta %+.2f dB vs spread %.2f  -> %s\n",
-                          g_rfMap.labelAt(p), g_rfMap.labelAt(q),
-                          static_cast<double>(delta),
-                          static_cast<double>(spread),
-                          mag > spread ? "SIGNAL" : "below noise");
-          }
-        }
-        Serial.flush();
-        delay(6);
-      }
-      Serial.flush();
-      Serial.setTxTimeoutMs(0);
+    Serial.printf(
+        "scale: gyro said %.0f deg, floor says %.0f (offset %+.1f)\n",
+        static_cast<double>(commanded), static_cast<double>(trueRotation),
+        static_cast<double>(offset));
+    Serial.printf(
+        "scale: implied error %.3f%%, reading resolution %.3f%% over %u revs\n",
+        static_cast<double>(implied * 100.0f),
+        static_cast<double>(resolution * 100.0f),
+        static_cast<unsigned>(g_scaleCheckRevs));
+
+    if (implied <= resolution) {
+      // Indistinguishable from no error. Record that it was CHECKED and
+      // bounded, which is a stronger and more useful statement than an
+      // invented correction — and leave the factory scale alone.
+      saveScaleBound(boundPercent);
+      saveScaleCheckRevs(0);
+      Serial.printf(
+          "scale: VERIFIED - error is below what the check can resolve.\n"
+          "scale: factory scale kept; error bounded to <%.3f%% "
+          "(<%.2f deg per 360)\n",
+          static_cast<double>(boundPercent),
+          static_cast<double>(boundPercent / 100.0f * 360.0f));
       Serial.println(F("OK"));
       return;
     }
 
-    // rfsurvey <label> [scans]
-    char label[RfMap::kLabelLen] = {0};
-    unsigned scans = 16;
-    const char* space = strchr(argument, ' ');
-    if (space == nullptr) {
-      strncpy(label, argument, sizeof(label) - 1);
-    } else {
-      const size_t len = static_cast<size_t>(space - argument);
-      strncpy(label, argument, len < sizeof(label) - 1 ? len
-                                                       : sizeof(label) - 1);
-      const long parsed = strtol(space + 1, nullptr, 10);
-      if (parsed < 1 || parsed > 200) {
-        Serial.println(F("ERR scans 1..200"));
-        return;
-      }
-      scans = static_cast<unsigned>(parsed);
+    const float previous = ImuQmi8658::gyroScaleCorrection();
+    ImuQmi8658::setGyroScaleCorrection(correction);
+    saveGyroScale(correction);
+    saveScaleBound(boundPercent);
+    saveScaleCheckRevs(0);
+    Serial.printf("scale: correction %.4f applied (was %.4f)\n",
+                  static_cast<double>(correction),
+                  static_cast<double>(previous));
+
+    // alpha is measured THROUGH the gyro: alpha = w^2/(2*coast), and both w
+    // and coast scale together, so alpha scales linearly. Adjusting it here
+    // keeps the coast compensation valid instead of silently invalidating
+    // three bench runs of tuning.
+    const float ratio = correction / previous;
+    g_coastAlpha *= ratio;
+    Serial.printf("scale: coast alpha auto-adjusted x%.4f -> %.0f deg/s2\n",
+                  static_cast<double>(ratio),
+                  static_cast<double>(g_coastAlpha));
+    Serial.println(F("scale: re-run 'spin auto' and a bench run to confirm"));
+    if (establishYawAxis()) {
+      Serial.println(F("scale: yaw axis re-established"));
     }
-    if (g_rfMap.positionCount() == 0) g_rfMap.load();
-    const int8_t position = g_rfMap.beginPosition(label);
-    if (position < 0) {
-      Serial.println(F("ERR survey is full (8 positions)"));
-      return;
-    }
-    const int started = WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true);
-    if (started == WIFI_SCAN_FAILED) {
-      Serial.println(F("ERR rfsurvey could not start"));
-      return;
-    }
-    WiFi.mode(WIFI_STA);
-    g_rfScanActive = true;
-    g_rfScanDeadlineMs = millis() + kRfScanTimeoutMs;
-    g_rfSurveyPosition = position;
-    g_rfSurveyRemaining = static_cast<uint16_t>(scans);
-    g_rfSurveyDone = 0;
-    Serial.printf("rfsurvey: \"%s\" x%u scans (~%us), hold still...\n", label,
-                  scans, static_cast<unsigned>((scans * 22) / 10));
+    Serial.println(F("OK"));
     return;
   }
+  Serial.println(F("ERR scale [check [revs]|actual <deg>|reset|status]"));
+  return;
+}
 
-  if (strcmp(line, "rfscan") == 0) {
-    // The 8-heading stop-and-scan pre-check.
-    //
-    // The research verdict on WiFi as a compass is a clear no (see
-    // IMU-RESEARCH.md section 4): rotating an antenna about its own phase
-    // centre produces no range change, so there is no synthetic aperture, and
-    // the published attempt closest to this idea scored F1 0.39 on 90-degree
-    // classification. This command is deliberately NOT the spin-and-log tool
-    // that verdict rules out. It is the cheap experiment that closes the
-    // question with our own data instead of only a citation: stop at a
-    // heading, scan, turn, repeat, and see whether RSSI varies with heading
-    // repeatably. If it does not, the matter is settled empirically.
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR rfscan takes no arguments"));
-      return;
-    }
-    // A scan blocks for seconds. Doing that mid-turn would starve the turn
-    // controller of samples while the motors are running - the one thing the
-    // closed loop must never be denied.
-    if (g_turnCmdActive || motionInProgress()) {
-      Serial.println(F("ERR rfscan needs the robot stopped"));
-      return;
-    }
-    if (g_overrideUp) {
-      // Scanning needs STA mode; switching would drop the joystick client.
-      Serial.println(F("ERR rfscan cannot run while the override AP is up"));
-      return;
-    }
-    if (g_rfScanActive) {
-      Serial.println(F("ERR rfscan already running"));
-      return;
-    }
-
-    const float headingNow = g_headingIntegrator.totalDegrees();
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect(false, false);
-    // Async, NOT blocking. A synchronous scan parks the loop task for several
-    // seconds, which starves the task watchdog and reboots the board - measured
-    // as "task_wdt: Aborting" followed by RTC_SW_CPU_RST. The scan is collected
-    // by serviceRfScan() once loop() sees it finish.
-    const int started = WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true);
-    if (started == WIFI_SCAN_FAILED) {
-      Serial.println(F("ERR rfscan could not start"));
-      return;
-    }
-    g_rfScanActive = true;
-    g_rfScanHeading = headingNow;
-    g_rfScanDeadlineMs = millis() + kRfScanTimeoutMs;
-    Serial.printf("rfscan: scanning at heading %.2f deg...\n",
-                  static_cast<double>(headingNow));
+void cmdCod(char* argument) {
+  // Calibration On Demand: the chip measures and corrects its own gyro SCALE
+  // factor. Worth doing because scale is the one error the zero-velocity
+  // update cannot see — 3% of zero is still zero — so it would otherwise
+  // need an external angle reference (a protractor and a human).
+  if ((argument == nullptr) || (*argument == '\0') ||
+      strcmp(argument, "status") == 0) {
+    Serial.printf("cod: stored=%d gains=(%u,%u,%u)\n",
+                  g_codGains.valid ? 1 : 0,
+                  static_cast<unsigned>(g_codGains.x),
+                  static_cast<unsigned>(g_codGains.y),
+                  static_cast<unsigned>(g_codGains.z));
+    Serial.printf("cod: gyro LPF %s mode %u\n",
+                  ImuQmi8658::gyroLowPassEnabled() ? "ON" : "off",
+                  static_cast<unsigned>(ImuQmi8658::gyroLowPassMode()));
+    Serial.println(F("usage: cod run | cod clear"));
     return;
   }
+  if (strcmp(argument, "clear") == 0) {
+    nvs_handle_t handle = 0;
+    if (nvs_open(kCodNamespace, NVS_READWRITE, &handle) == ESP_OK) {
+      nvs_erase_key(handle, kCodKey);
+      nvs_commit(handle);
+      nvs_close(handle);
+    }
+    g_codGains.valid = false;
+    Serial.println(F("cod: cleared (power-cycle to drop the applied gains)"));
+    return;
+  }
+  if (strcmp(argument, "run") != 0) {
+    Serial.println(F("ERR cod [run|clear|status]"));
+    return;
+  }
+  if (g_turnCmdActive || g_straightActive || motionInProgress()) {
+    Serial.println(F("ERR cod needs the robot stopped"));
+    return;
+  }
+  Serial.println(F("cod: running, ~2s. DO NOT TOUCH THE ROBOT."));
+  Serial.flush();
+  ImuQmi8658::CodResult result{};
+  const bool ok = ImuQmi8658::runCod(result);
+  Serial.printf("cod: status=0x%02X gains=(%u,%u,%u)\n",
+                static_cast<unsigned>(result.status),
+                static_cast<unsigned>(result.gainX),
+                static_cast<unsigned>(result.gainY),
+                static_cast<unsigned>(result.gainZ));
+  if (!ok) {
+    const char* reason = ImuQmi8658::codFailureReason(result.status);
+    Serial.printf("cod: FAILED - %s\n",
+                  reason != nullptr ? reason : "no response from the device");
+    return;
+  }
+  if (result.gainX == 0 || result.gainY == 0 || result.gainZ == 0) {
+    Serial.println(F("cod: refusing a zero gain (would scale the gyro away)"));
+    return;
+  }
+  if (!saveCodGains(result.gainX, result.gainY, result.gainZ)) {
+    Serial.println(F("cod: measured, but FAILED TO SAVE"));
+    return;
+  }
+  Serial.println(F("cod: saved, re-applied automatically at every boot"));
+  // Re-establish the yaw axis and bias: the scale just changed underneath
+  // every previously measured constant.
+  if (establishYawAxis()) {
+    Serial.println(F("cod: yaw axis re-established"));
+  }
+  Serial.println(F("OK"));
+  return;
+}
 
-  if (strcmp(line, "power") == 0) {
-    if ((argument != nullptr) && (*argument != '\0')) {
-      Serial.println(F("ERR power takes no arguments"));
+void cmdLpf(char* argument) {
+  // Gyro low-pass. Runtime-switchable ON PURPOSE: it does NOT reduce
+  // integrated-angle error from white noise (integration is already an
+  // average), but it does prevent servo vibration above Nyquist from
+  // aliasing down into the signal band. It also costs ~38 ms of group delay.
+  // Both effects are measurable with a bench run, so make it easy to A/B.
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.printf("lpf: %s mode %u (%s)\n",
+                  ImuQmi8658::gyroLowPassEnabled() ? "ON" : "off",
+                  static_cast<unsigned>(ImuQmi8658::gyroLowPassMode()),
+                  ImuQmi8658::gyroLowPassEnabled()
+                      ? "~26 Hz bandwidth, ~38 ms group delay"
+                      : "full Nyquist band");
+    Serial.println(F("usage: lpf on [mode 0..3] | lpf off"));
+    return;
+  }
+  if (strcmp(argument, "off") == 0) {
+    if (!ImuQmi8658::setGyroLowPass(false, 0)) {
+      Serial.println(F("ERR could not write CTRL5"));
       return;
     }
-    // Reports the things that cannot be seen over a cable: whether the battery
-    // latch is actually asserted, and whether the backlight is actually up.
-    // A black screen with a healthy log is either backlight=0 or sysEn=0, and
-    // this distinguishes them without needing someone to look at the robot.
+    Serial.println(F("lpf: off"));
+    return;
+  }
+  if (strncmp(argument, "on", 2) == 0) {
+    long mode = 0;
+    if (argument[2] != '\0') mode = strtol(argument + 2, nullptr, 10);
+    if (mode < 0 || mode > 3) {
+      Serial.println(F("ERR mode 0..3"));
+      return;
+    }
+    if (!ImuQmi8658::setGyroLowPass(true, static_cast<uint8_t>(mode))) {
+      Serial.println(F("ERR could not write CTRL5"));
+      return;
+    }
+    Serial.printf("lpf: on, mode %ld\n", mode);
+    return;
+  }
+  Serial.println(F("ERR lpf [on [mode]|off]"));
+  return;
+}
+
+void cmdStraight(char* argument) {
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.printf("straight: %.1f cm/s at full speed (%s)\n",
+                  static_cast<double>(g_forwardCmPerSec),
+                  g_forwardCalUpdates == 0
+                      ? "DERIVED from spin rate, never measured"
+                      : "self-calibrated from inertial distance");
+    Serial.printf("straight: %lu self-calibration updates so far\n",
+                  static_cast<unsigned long>(g_forwardCalUpdates));
+    Serial.println(F("usage: straight <cm> [speed] | straight cal <actual cm>"));
+    return;
+  }
+  if (strncmp(argument, "cal ", 4) == 0) {
+    // Optional override. The robot self-calibrates from inertial distance
+    // after every leg, so this exists only for the case where a tape measure
+    // disagrees with the IMU and you trust the tape.
+    const long actual = strtol(argument + 4, nullptr, 10);
+    if (actual < 5 || actual > 400 || g_straightTargetCm <= 0) {
+      Serial.println(F("ERR straight cal <actual cm>, after a straight run"));
+      return;
+    }
+    const float ratio = static_cast<float>(actual) /
+                        static_cast<float>(g_straightTargetCm);
+    float updated = g_forwardCmPerSec * ratio;
+    if (updated < kForwardCmPerSecMin) updated = kForwardCmPerSecMin;
+    if (updated > kForwardCmPerSecMax) updated = kForwardCmPerSecMax;
     Serial.printf(
-        "power: sysEn=%d sysOut=%d armed=%d triggered=%d backlight=%u pwm=%d "
-        "paused=%d shuttingDown=%d lcd=%d uptime=%lums\n",
-        digitalRead(SYS_EN), digitalRead(SYS_OUT),
-        g_powerButtonArmed ? 1 : 0, g_powerOffTriggered ? 1 : 0,
-        static_cast<unsigned>(g_backlightLevel),
-        g_backlightPwmReady ? 1 : 0, g_paused ? 1 : 0,
-        g_systemShuttingDown ? 1 : 0, static_cast<int>(g_lcdMode),
-        static_cast<unsigned long>(millis()));
+        "straight cal: commanded %d cm, actually went %ld -> %.1f cm/s "
+        "(was %.1f)\n",
+        static_cast<int>(g_straightTargetCm), actual,
+        static_cast<double>(updated), static_cast<double>(g_forwardCmPerSec));
+    g_forwardCmPerSec = updated;
+    ++g_forwardCalUpdates;
+    return;
+  }
+  char* end = nullptr;
+  const long cm = strtol(argument, &end, 10);
+  int8_t speed = MovementExpression::kSpinSpeed;
+  if (end != nullptr && *end != '\0') {
+    const long parsedSpeed = strtol(end, nullptr, 10);
+    if (parsedSpeed != 0) speed = static_cast<int8_t>(parsedSpeed);
+  }
+  startStraightDrive(static_cast<int16_t>(cm), speed);
+  return;
+}
+
+void cmdSurvey(char* argument) {
+  // Drives an equilateral triangle, sampling RSSI at each vertex and once
+  // more back at the start. Translation is the only motion that changes range
+  // to an AP, so it is the only motion that can produce RSSI information.
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.printf("survey: phase=%d side=%ucm scans=%u\n",
+                  static_cast<int>(g_surveyPhase),
+                  static_cast<unsigned>(g_surveySideCm),
+                  static_cast<unsigned>(g_surveyScans));
+    Serial.println(F("usage: survey start [sideCm] [scans]  (NEEDS FLOOR)"));
+    return;
+  }
+  if (strcmp(argument, "stop") == 0) {
+    if (g_surveyPhase == SurveyPhase::Idle) {
+      Serial.println(F("survey: not running"));
+      return;
+    }
+    surveyFinish("stopped");
+    return;
+  }
+  if (strncmp(argument, "start", 5) == 0) {
+    uint16_t side = 100;
+    uint16_t scans = 12;
+    const char* rest = argument + 5;
+    char* end = nullptr;
+    const long parsedSide = strtol(rest, &end, 10);
+    if (end != rest && parsedSide > 0) {
+      side = static_cast<uint16_t>(parsedSide);
+      const long parsedScans = strtol(end, nullptr, 10);
+      if (parsedScans > 0 && parsedScans <= 200) {
+        scans = static_cast<uint16_t>(parsedScans);
+      }
+    }
+    startTriangleSurvey(side, scans);
+    return;
+  }
+  Serial.println(F("ERR survey [start [sideCm] [scans]|stop]"));
+  return;
+}
+
+void cmdRfsurvey(char* argument) {
+  // Samples RSSI at ONE labelled position, averaged over N scans.
+  //
+  // This tests the load-bearing assumption behind using WiFi for absolute
+  // position: does moving the robot change RSSI by more than the scatter at
+  // a fixed point? Predicted signal is 0.63 dB per 0.3 m and 1.98 dB per 1 m
+  // (n=2.5, AP at 5 m); measured fixed-point noise is 1-2 dB. So the answer
+  // is not obvious, averaging is mandatory, and the comparison must be made
+  // against the spread rather than against zero.
+  //
+  // NOTE this is translation, not rotation. Rotating in place changes range
+  // to nothing and produces exactly zero information; moving genuinely does
+  // change range. The two ideas fail or succeed for completely different
+  // reasons and must not be conflated.
+  if (g_turnCmdActive || motionInProgress()) {
+    Serial.println(F("ERR rfsurvey needs the robot stopped"));
+    return;
+  }
+  if (g_overrideUp) {
+    Serial.println(F("ERR rfsurvey cannot run while the override AP is up"));
+    return;
+  }
+  if (g_rfScanActive || g_rfSurveyPosition >= 0) {
+    Serial.println(F("ERR a scan is already running"));
+    return;
+  }
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.println(F("ERR rfsurvey <label> [scans]  |  rfsurvey report|clear"));
+    return;
+  }
+  if (strcmp(argument, "clear") == 0) {
+    g_rfMap.erase();
+    Serial.println(F("rfsurvey: survey erased"));
+    return;
+  }
+  if (strcmp(argument, "report") == 0) {
+    if (g_rfMap.positionCount() == 0 && !g_rfMap.load()) {
+      Serial.println(F("rfsurvey: no stored survey"));
+      return;
+    }
+    Serial.setTxTimeoutMs(20);
+    Serial.printf("rfsurvey report: %u positions, %u APs\n",
+                  static_cast<unsigned>(g_rfMap.positionCount()),
+                  static_cast<unsigned>(g_rfMap.apCount()));
+    for (uint8_t a = 0; a < g_rfMap.apCount(); ++a) {
+      const uint8_t* b = g_rfMap.bssidAt(a);
+      Serial.printf("ap%u %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    static_cast<unsigned>(a), b[0], b[1], b[2], b[3], b[4],
+                    b[5]);
+      for (uint8_t p = 0; p < g_rfMap.positionCount(); ++p) {
+        const RfMap::Reading& r = g_rfMap.readingAt(p, a);
+        if (r.samples == 0) {
+          Serial.printf("   %-12s  (not seen)\n", g_rfMap.labelAt(p));
+          continue;
+        }
+        Serial.printf("   %-12s  %7.2f dBm  spread %5.2f  n=%u\n",
+                      g_rfMap.labelAt(p),
+                      static_cast<double>(r.meanTenthDbm) / 10.0,
+                      static_cast<double>(r.spreadTenthDbm) / 10.0,
+                      static_cast<unsigned>(r.samples));
+      }
+      // The verdict, per AP, for every position pair: is the difference
+      // between positions bigger than the scatter within them?
+      for (uint8_t p = 0; p + 1 < g_rfMap.positionCount(); ++p) {
+        for (uint8_t q = p + 1; q < g_rfMap.positionCount(); ++q) {
+          float delta = 0.0f, spread = 0.0f;
+          uint16_t n = 0;
+          if (!g_rfMap.compare(a, p, q, &delta, &spread, &n)) continue;
+          const float mag = delta < 0 ? -delta : delta;
+          Serial.printf("   %s->%s  delta %+.2f dB vs spread %.2f  -> %s\n",
+                        g_rfMap.labelAt(p), g_rfMap.labelAt(q),
+                        static_cast<double>(delta),
+                        static_cast<double>(spread),
+                        mag > spread ? "SIGNAL" : "below noise");
+        }
+      }
+      Serial.flush();
+      delay(6);
+    }
+    Serial.flush();
+    Serial.setTxTimeoutMs(0);
     Serial.println(F("OK"));
     return;
   }
 
-  if (strcmp(line, "spin") == 0) {
-    if ((argument == nullptr) || (*argument == '\0')) {
-      Serial.println(F("ERR spin <test [ms] [cw|ccw]|auto|set <ms>|show|save confirm|erase confirm>"));
+  // rfsurvey <label> [scans]
+  char label[RfMap::kLabelLen] = {0};
+  unsigned scans = 16;
+  const char* space = strchr(argument, ' ');
+  if (space == nullptr) {
+    strncpy(label, argument, sizeof(label) - 1);
+  } else {
+    const size_t len = static_cast<size_t>(space - argument);
+    strncpy(label, argument, len < sizeof(label) - 1 ? len
+                                                     : sizeof(label) - 1);
+    const long parsed = strtol(space + 1, nullptr, 10);
+    if (parsed < 1 || parsed > 200) {
+      Serial.println(F("ERR scans 1..200"));
       return;
     }
+    scans = static_cast<unsigned>(parsed);
+  }
+  if (g_rfMap.positionCount() == 0) g_rfMap.load();
+  const int8_t position = g_rfMap.beginPosition(label);
+  if (position < 0) {
+    Serial.println(F("ERR survey is full (8 positions)"));
+    return;
+  }
+  const int started = WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true);
+  if (started == WIFI_SCAN_FAILED) {
+    Serial.println(F("ERR rfsurvey could not start"));
+    return;
+  }
+  WiFi.mode(WIFI_STA);
+  g_rfScanActive = true;
+  g_rfScanDeadlineMs = millis() + kRfScanTimeoutMs;
+  g_rfSurveyPosition = position;
+  g_rfSurveyRemaining = static_cast<uint16_t>(scans);
+  g_rfSurveyDone = 0;
+  Serial.printf("rfsurvey: \"%s\" x%u scans (~%us), hold still...\n", label,
+                scans, static_cast<unsigned>((scans * 22) / 10));
+  return;
+}
 
-    // Split off the first token; the rest is the optional remainder.
-    char verb[16];
-    const char* rest = strchr(argument, ' ');
-    size_t verbLength =
-        (rest == nullptr) ? strlen(argument)
-                          : static_cast<size_t>(rest - argument);
-    if (verbLength == 0 || verbLength >= sizeof(verb)) {
-      Serial.println(F("ERR spin <auto|test|set|show|save|erase>"));
-      return;
-    }
-    memcpy(verb, argument, verbLength);
-    verb[verbLength] = '\0';
-    if (rest != nullptr) {
-      while (*rest == ' ') ++rest;
-      if (*rest == '\0') rest = nullptr;
-    }
-
-    if (strcmp(verb, "calib") == 0) {
-      // Same sequence the on-screen button runs: probe slow, probe fast, fit,
-      // predict, verify, save. Exposed on serial so it can be watched.
-      if (rest != nullptr) {
-        Serial.println(F("ERR spin calib takes no arguments"));
-        return;
-      }
-      if (!startTurnCalibration()) {
-        Serial.println(F("ERR could not start calibration"));
-        return;
-      }
-      return;
-    }
-
-    if (strcmp(verb, "show") == 0) {
-      if (rest != nullptr) {
-        Serial.println(F("ERR spin show takes no arguments"));
-        return;
-      }
-      Serial.printf(
-          "spin: effective=%u saved=%u default=%u dirty=%d stored=%d\n",
-          g_spinCalibration.fullTurnMs(), g_spinCalibration.savedMs(),
-          MovementExpression::kSpinDefaultMs,
-          g_spinCalibration.dirty() ? 1 : 0,
-          g_spinCalibration.loadedFromNvs() ? 1 : 0);
-      Serial.println(F("OK"));
-      return;
-    }
-
-    const bool isTest = strcmp(verb, "test") == 0;
-    const bool isAuto = strcmp(verb, "auto") == 0;
-    if (isTest || isAuto) {
-      // `spin test` -> observe -> `spin set <better>` -> `spin test`, or
-      // `spin auto` which measures with the gyro and stages the result itself.
-      uint16_t ms = g_spinCalibration.fullTurnMs();
-      bool clockwise = true;
-      if (rest != nullptr) {
-        char* end = nullptr;
-        const long parsed = strtol(rest, &end, 10);
-        if (end != rest) {
-          if (parsed < 0 || parsed > 65535) {
-            Serial.println(F("ERR turn must be a positive integer"));
-            return;
-          }
-          ms = static_cast<uint16_t>(parsed);
-          while (*end == ' ') ++end;
-          rest = end;
-        }
-        if (rest != nullptr && *rest != '\0') {
-          if (strcmp(rest, "ccw") == 0) {
-            clockwise = false;
-          } else if (strcmp(rest, "cw") == 0) {
-            clockwise = true;
-          } else {
-            Serial.printf("ERR spin %s [ms] [cw|ccw]\n", verb);
-            return;
-          }
-        }
-      }
-      if (isAuto) {
-        if (!startTurnAutoMeasure(ms, clockwise)) {
-          return;
-        }
-        // The result is reported asynchronously once the spin and the coast
-        // after it have both been measured.
-        return;
-      }
-      if (!startSpinCalibration(ms, clockwise)) {
-        return;
-      }
-      Serial.println(F("OK"));
-      return;
-    }
-
-    if (strcmp(verb, "set") == 0) {
-      if (rest == nullptr) {
-        Serial.println(F("ERR spin set <200..2000>"));
-        return;
-      }
-      char* end = nullptr;
-      const long parsed = strtol(rest, &end, 10);
-      if (end == rest || (end != nullptr && *end != '\0') || parsed < 0 ||
-          parsed > 65535) {
-        Serial.println(F("ERR spin set <200..2000>"));
-        return;
-      }
-      if (!g_spinCalibration.stage(static_cast<uint16_t>(parsed))) {
-        Serial.printf("ERR turn must be %u..%u ms in steps of %u\n",
-                      MovementExpression::kSpinMinMs,
-                      MovementExpression::kSpinMaxMs,
-                      MovementExpression::kStepQuantumMs);
-        return;
-      }
-      Serial.printf("spin: staged %u ms (not saved)\n",
-                    g_spinCalibration.fullTurnMs());
-      Serial.println(F("OK"));
-      return;
-    }
-
-    if (strcmp(verb, "save") == 0) {
-      if (rest == nullptr || strcmp(rest, "confirm") != 0) {
-        Serial.println(F("ERR spin save confirm"));
-        return;
-      }
-      if (!g_spinCalibration.save()) {
-        Serial.println(F("ERR spin save failed; nothing persisted"));
-        return;
-      }
-      Serial.printf("spin: saved %u ms\n", g_spinCalibration.savedMs());
-      Serial.println(F("OK"));
-      return;
-    }
-
-    if (strcmp(verb, "erase") == 0) {
-      if (rest == nullptr || strcmp(rest, "confirm") != 0) {
-        Serial.println(F("ERR spin erase confirm"));
-        return;
-      }
-      if (!g_spinCalibration.erase()) {
-        Serial.println(F("ERR spin erase failed"));
-        return;
-      }
-      Serial.printf("spin: erased; using default %u ms\n",
-                    g_spinCalibration.fullTurnMs());
-      Serial.println(F("OK"));
-      return;
-    }
-
-    Serial.println(F("ERR spin <auto|test|set|show|save|erase>"));
+void cmdRfscan(char* argument) {
+  // The 8-heading stop-and-scan pre-check.
+  //
+  // The research verdict on WiFi as a compass is a clear no (see
+  // IMU-RESEARCH.md section 4): rotating an antenna about its own phase
+  // centre produces no range change, so there is no synthetic aperture, and
+  // the published attempt closest to this idea scored F1 0.39 on 90-degree
+  // classification. This command is deliberately NOT the spin-and-log tool
+  // that verdict rules out. It is the cheap experiment that closes the
+  // question with our own data instead of only a citation: stop at a
+  // heading, scan, turn, repeat, and see whether RSSI varies with heading
+  // repeatably. If it does not, the matter is settled empirically.
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR rfscan takes no arguments"));
+    return;
+  }
+  // A scan blocks for seconds. Doing that mid-turn would starve the turn
+  // controller of samples while the motors are running - the one thing the
+  // closed loop must never be denied.
+  if (g_turnCmdActive || motionInProgress()) {
+    Serial.println(F("ERR rfscan needs the robot stopped"));
+    return;
+  }
+  if (g_overrideUp) {
+    // Scanning needs STA mode; switching would drop the joystick client.
+    Serial.println(F("ERR rfscan cannot run while the override AP is up"));
+    return;
+  }
+  if (g_rfScanActive) {
+    Serial.println(F("ERR rfscan already running"));
     return;
   }
 
-  Serial.println(F("ERR unknown command"));
+  const float headingNow = g_headingIntegrator.totalDegrees();
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  // Async, NOT blocking. A synchronous scan parks the loop task for several
+  // seconds, which starves the task watchdog and reboots the board - measured
+  // as "task_wdt: Aborting" followed by RTC_SW_CPU_RST. The scan is collected
+  // by serviceRfScan() once loop() sees it finish.
+  const int started = WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true);
+  if (started == WIFI_SCAN_FAILED) {
+    Serial.println(F("ERR rfscan could not start"));
+    return;
+  }
+  g_rfScanActive = true;
+  g_rfScanHeading = headingNow;
+  g_rfScanDeadlineMs = millis() + kRfScanTimeoutMs;
+  Serial.printf("rfscan: scanning at heading %.2f deg...\n",
+                static_cast<double>(headingNow));
+  return;
+}
+
+void cmdPower(char* argument) {
+  if ((argument != nullptr) && (*argument != '\0')) {
+    Serial.println(F("ERR power takes no arguments"));
+    return;
+  }
+  // Reports the things that cannot be seen over a cable: whether the battery
+  // latch is actually asserted, and whether the backlight is actually up.
+  // A black screen with a healthy log is either backlight=0 or sysEn=0, and
+  // this distinguishes them without needing someone to look at the robot.
+  Serial.printf(
+      "power: sysEn=%d sysOut=%d armed=%d triggered=%d backlight=%u pwm=%d "
+      "paused=%d shuttingDown=%d lcd=%d uptime=%lums\n",
+      digitalRead(SYS_EN), digitalRead(SYS_OUT),
+      g_powerButtonArmed ? 1 : 0, g_powerOffTriggered ? 1 : 0,
+      static_cast<unsigned>(g_backlightLevel),
+      g_backlightPwmReady ? 1 : 0, g_paused ? 1 : 0,
+      g_systemShuttingDown ? 1 : 0, static_cast<int>(g_lcdMode),
+      static_cast<unsigned long>(millis()));
+  Serial.println(F("OK"));
+  return;
+}
+
+void cmdSpin(char* argument) {
+  if ((argument == nullptr) || (*argument == '\0')) {
+    Serial.println(F("ERR spin <test [ms] [cw|ccw]|auto|set <ms>|show|save confirm|erase confirm>"));
+    return;
+  }
+
+  // Split off the first token; the rest is the optional remainder.
+  char verb[16];
+  const char* rest = strchr(argument, ' ');
+  size_t verbLength =
+      (rest == nullptr) ? strlen(argument)
+                        : static_cast<size_t>(rest - argument);
+  if (verbLength == 0 || verbLength >= sizeof(verb)) {
+    Serial.println(F("ERR spin <auto|test|set|show|save|erase>"));
+    return;
+  }
+  memcpy(verb, argument, verbLength);
+  verb[verbLength] = '\0';
+  if (rest != nullptr) {
+    while (*rest == ' ') ++rest;
+    if (*rest == '\0') rest = nullptr;
+  }
+
+  if (strcmp(verb, "calib") == 0) {
+    // Same sequence the on-screen button runs: probe slow, probe fast, fit,
+    // predict, verify, save. Exposed on serial so it can be watched.
+    if (rest != nullptr) {
+      Serial.println(F("ERR spin calib takes no arguments"));
+      return;
+    }
+    if (!startTurnCalibration()) {
+      Serial.println(F("ERR could not start calibration"));
+      return;
+    }
+    return;
+  }
+
+  if (strcmp(verb, "show") == 0) {
+    if (rest != nullptr) {
+      Serial.println(F("ERR spin show takes no arguments"));
+      return;
+    }
+    Serial.printf(
+        "spin: effective=%u saved=%u default=%u dirty=%d stored=%d\n",
+        g_spinCalibration.fullTurnMs(), g_spinCalibration.savedMs(),
+        MovementExpression::kSpinDefaultMs,
+        g_spinCalibration.dirty() ? 1 : 0,
+        g_spinCalibration.loadedFromNvs() ? 1 : 0);
+    Serial.println(F("OK"));
+    return;
+  }
+
+  const bool isTest = strcmp(verb, "test") == 0;
+  const bool isAuto = strcmp(verb, "auto") == 0;
+  if (isTest || isAuto) {
+    // `spin test` -> observe -> `spin set <better>` -> `spin test`, or
+    // `spin auto` which measures with the gyro and stages the result itself.
+    uint16_t ms = g_spinCalibration.fullTurnMs();
+    bool clockwise = true;
+    if (rest != nullptr) {
+      char* end = nullptr;
+      const long parsed = strtol(rest, &end, 10);
+      if (end != rest) {
+        if (parsed < 0 || parsed > 65535) {
+          Serial.println(F("ERR turn must be a positive integer"));
+          return;
+        }
+        ms = static_cast<uint16_t>(parsed);
+        while (*end == ' ') ++end;
+        rest = end;
+      }
+      if (rest != nullptr && *rest != '\0') {
+        if (strcmp(rest, "ccw") == 0) {
+          clockwise = false;
+        } else if (strcmp(rest, "cw") == 0) {
+          clockwise = true;
+        } else {
+          Serial.printf("ERR spin %s [ms] [cw|ccw]\n", verb);
+          return;
+        }
+      }
+    }
+    if (isAuto) {
+      if (!startTurnAutoMeasure(ms, clockwise)) {
+        return;
+      }
+      // The result is reported asynchronously once the spin and the coast
+      // after it have both been measured.
+      return;
+    }
+    if (!startSpinCalibration(ms, clockwise)) {
+      return;
+    }
+    Serial.println(F("OK"));
+    return;
+  }
+
+  if (strcmp(verb, "set") == 0) {
+    if (rest == nullptr) {
+      Serial.println(F("ERR spin set <200..2000>"));
+      return;
+    }
+    char* end = nullptr;
+    const long parsed = strtol(rest, &end, 10);
+    if (end == rest || (end != nullptr && *end != '\0') || parsed < 0 ||
+        parsed > 65535) {
+      Serial.println(F("ERR spin set <200..2000>"));
+      return;
+    }
+    if (!g_spinCalibration.stage(static_cast<uint16_t>(parsed))) {
+      Serial.printf("ERR turn must be %u..%u ms in steps of %u\n",
+                    MovementExpression::kSpinMinMs,
+                    MovementExpression::kSpinMaxMs,
+                    MovementExpression::kStepQuantumMs);
+      return;
+    }
+    Serial.printf("spin: staged %u ms (not saved)\n",
+                  g_spinCalibration.fullTurnMs());
+    Serial.println(F("OK"));
+    return;
+  }
+
+  if (strcmp(verb, "save") == 0) {
+    if (rest == nullptr || strcmp(rest, "confirm") != 0) {
+      Serial.println(F("ERR spin save confirm"));
+      return;
+    }
+    if (!g_spinCalibration.save()) {
+      Serial.println(F("ERR spin save failed; nothing persisted"));
+      return;
+    }
+    Serial.printf("spin: saved %u ms\n", g_spinCalibration.savedMs());
+    Serial.println(F("OK"));
+    return;
+  }
+
+  if (strcmp(verb, "erase") == 0) {
+    if (rest == nullptr || strcmp(rest, "confirm") != 0) {
+      Serial.println(F("ERR spin erase confirm"));
+      return;
+    }
+    if (!g_spinCalibration.erase()) {
+      Serial.println(F("ERR spin erase failed"));
+      return;
+    }
+    Serial.printf("spin: erased; using default %u ms\n",
+                  g_spinCalibration.fullTurnMs());
+    Serial.println(F("OK"));
+    return;
+  }
+
+  Serial.println(F("ERR spin <auto|test|set|show|save|erase>"));
+  return;
+}
+
+// Dispatch/help table.  Rows are in help-print order; dispatch match is by
+// strcmp on `name`, so order is irrelevant for correctness.
+const SerialCommand kSerialCommands[] = {
+  { "help", cmdHelp, "help", nullptr, nullptr },
+  { "ping", cmdPing, "ping", nullptr, nullptr },
+  { "status", cmdStatus, "status", nullptr, nullptr },
+  { "mood", cmdMood, "mood <default|bored|annoyed|tired|angry|happy|sad|think|error|\n      surprised|scared|wink|sleeping|love|confused|curious>", nullptr, nullptr },
+  { "look", cmdLook, "look <default|center|n|ne|e|se|s|sw|w|nw>", nullptr, nullptr },
+  { "blink", cmdBlink, "blink", nullptr, nullptr },
+  { "wander", cmdWander, "wander <on|off>", nullptr, nullptr },
+  { "dims", cmdDims, "dims <w> <h> <r>", nullptr, nullptr },
+  { "motion", cmdMotion, "motion <x> <y>", nullptr, nullptr },
+  { "blinkrate", cmdBlinkrate, "blinkrate <sec> <jitter>", nullptr, nullptr },
+  { "color", cmdColor, "color <RRGGBB|green|cyan|red|blue|yellow|white|magenta|orange>", nullptr, nullptr },
+  { "headgain", cmdHeadgain, "headgain <xDiv> <yDiv>", nullptr, nullptr },
+  { "tone", cmdTone, "tone <hz>", nullptr, nullptr },
+  { "sleep", cmdSleep, "sleep", nullptr, nullptr },
+  { "wake", cmdWake, "wake", nullptr, nullptr },
+  { "demo", cmdDemo, "demo", nullptr, nullptr },
+  { "motorstate", cmdMotorstate, "motorstate", nullptr, nullptr },
+  { "cal", cmdCal, "cal show\ncal set <left|right> <stop|fwdstart|revstart|fwdmax|revmax> <1000..2000>\ncal validate\ncal save confirm\ncal reset confirm  (draft only; NVS reloads after reboot)\ncal erase confirm  (erase persisted calibration; drive remains locked)", nullptr, nullptr },
+  { "servooff", cmdServooff, "servooff         (safe drive powerdown only)", nullptr, nullptr },
+  { "gesture", cmdGesture, nullptr, printGestureUsage, nullptr },
+  { "test", cmdTest, "test                     360 fast cw, rezero, 360 slow ccw", nullptr, nullptr },
+  { "heading", cmdHeading, "heading [zero]          relative heading + drift state", nullptr, nullptr },
+  { "turn", cmdTurn, "turn <deg> [cw|ccw] [speed]  closed-loop, gyro-stopped", nullptr, nullptr },
+  { "power", cmdPower, "power                    battery latch + backlight state", nullptr, nullptr },
+  { "spin", cmdSpin, "spin calib               probe+model+verify, saves itself\nspin auto [ms] [cw|ccw]  measure the turn with the gyro\nspin test [ms] [cw|ccw]  run one measurement turn\nspin set <200..2000>     stage the measured full turn\nspin show                staged vs saved vs default\nspin save confirm\nspin erase confirm", nullptr, nullptr },
+  { "sound", cmdSound, "sound <happy|sad|confused>   compose + play (fresh each time)\nsound stop", nullptr, "-- expression --" },
+  { "wifi", cmdWifi, "wifi                     AP mode, IP, MAC, stations, tx power", nullptr, "-- network / UI --" },
+  { "state", cmdState, "state                    override state machine + LCD mode", nullptr, nullptr },
+  { "swipe", cmdSwipe, "swipe <down|up>          queue a wake / teardown gesture", nullptr, nullptr },
+  { "lcdspi", cmdLcdspi, "lcdspi [hz]              show/set SPI clock (8M..80M, reboot to apply)", nullptr, "-- display diagnostics --" },
+  { "lcdprobe", cmdLcdprobe, "lcdprobe                 read panel RDDPM: is it awake and on?", nullptr, nullptr },
+  { "lcdpush", cmdLcdpush, "lcdpush                  full canvas->panel push only", nullptr, nullptr },
+  { "lcdbus", cmdLcdbus, "lcdbus                   re-init the SPI peripheral only", nullptr, nullptr },
+  { "crash", cmdCrash, "crash [clear]            last fault: reason + phase + heap", nullptr, nullptr },
+  { "straight", cmdStraight, "straight <cm> [speed]    gyro-corrected straight run", nullptr, "-- motion / IMU --" },
+  { "sense", cmdSense, "sense                    bump/shake/lifted detector state", nullptr, nullptr },
+  { "lead", cmdLead, "lead [alpha]             turn coast-compensation constant", nullptr, nullptr },
+  { "scale", cmdScale, "scale [actual <deg>]     gyro scale check / correction", nullptr, nullptr },
+  { "cod", cmdCod, "cod [run|status]         on-demand gyro calibration", nullptr, nullptr },
+  { "lpf", cmdLpf, "lpf [0..3]               gyro low-pass filter mode", nullptr, nullptr },
+  { "bench", cmdBench, "bench <arm|report|clear> unattended measurement run", nullptr, nullptr },
+  { "survey", cmdSurvey, "survey ...               dead-reckoning position survey", nullptr, "-- survey / RF --" },
+  { "rfscan", cmdRfscan, "rfscan / rfsurvey        RSSI scan + per-position store", nullptr, nullptr },
+  { "rfsurvey", cmdRfsurvey, nullptr, nullptr, nullptr },
+  { "touchinfo", cmdTouchinfo, "touchinfo / touchlog / touchdebug / touchreset", nullptr, "-- touch --" },
+  { "touchlog", cmdTouchlog, nullptr, nullptr, nullptr },
+  { "touchdebug", cmdTouchdebug, nullptr, nullptr, nullptr },
+  { "touchreset", cmdTouchreset, nullptr, nullptr, nullptr },
+};
+
+constexpr size_t kSerialCommandCount =
+    sizeof(kSerialCommands) / sizeof(kSerialCommands[0]);
+
+void printHelp() {
+  serialConsolePrintHelp(kSerialCommands, kSerialCommandCount);
+}
+
+void dispatchCommand(char* line) {
+  serialConsoleDispatch(line, kSerialCommands, kSerialCommandCount);
 }
 
 void drainSerial() {
