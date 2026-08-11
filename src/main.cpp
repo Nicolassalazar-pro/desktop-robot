@@ -1475,6 +1475,25 @@ volatile OverrideState g_orState           = ORS_IDLE;
 volatile uint32_t      g_orStateEnterMs    = 0;
 volatile bool          g_orPendingSwipeDown = false;
 volatile bool          g_orPendingSwipeUp   = false;
+// ---------------------------------------------------------------------------
+// Drag-to-commit state.
+//
+// A swipe used to be an instant, all-or-nothing event: the chip decided a
+// gesture had happened and the screen changed. There was no way to start the
+// motion, see what it was going to do, and change your mind.
+//
+// These track a finger continuously so the screen can follow it 1:1 and only
+// commit on release (design-craft 1 direct manipulation, 8 "confirm on
+// touch-up, drag-off cancels"). Written from the touch callback, read by the
+// loop, hence volatile; each is a single aligned word so a torn read is not
+// possible on this MCU.
+volatile bool          g_dragActive         = false;
+volatile bool          g_dragReleased       = false;
+volatile int16_t       g_dragStartY         = 0;
+volatile int16_t       g_dragCurrentY       = 0;
+// Commit distance. ~29% of the panel: far enough that a tap or a stray graze
+// cannot reach it, short enough to complete comfortably with one thumb.
+constexpr int16_t      kDragCommitPx        = 80;
 volatile uint32_t      g_orTouchEventCount  = 0;
 // Streams raw gesture IDs and touch coordinates so the panel-to-screen axis
 // mapping can be established by measurement rather than assumption. The chip
@@ -9724,7 +9743,79 @@ void pushCanvasBanded(bool downward) {
   }
 }
 
-// Two-dot step indicator for the pairing flow.
+// Push the canvas offset vertically, with the vacated strip painted as a
+// commit hint. This is what makes the pairing screens track a finger.
+//
+// dy > 0 slides the content DOWN (finger dragging down), exposing a band at the
+// top; dy < 0 slides it UP, exposing a band at the bottom.
+//
+// Cost is the same order as a normal full push: one address window, one
+// contiguous blast of framebuffer rows, plus a small solid band. No second
+// framebuffer, no memmove of 134 KB, no per-frame re-render -- the canvas is
+// never touched, only the destination window moves. That matters on a board
+// with a 5 s task watchdog (design-craft 6b).
+//
+// `armed` means the drag has passed the commit threshold. It is signalled by
+// the band's TEXT as well as its shade, because state must never be carried by
+// colour alone (design-craft 3).
+void pushCanvasShiftedToLcd(int16_t dy, bool armed) {
+  if ((g_canvas == nullptr) || (g_gfx == nullptr)) return;
+  uint16_t* framebuffer = g_canvas->getFramebuffer();
+  if (framebuffer == nullptr) return;
+  if (dy == 0) {
+    pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
+    return;
+  }
+  if (dy > kScreenH) dy = kScreenH;
+  if (dy < -kScreenH) dy = -kScreenH;
+
+  ++g_lcdPushCount;
+  g_lcdLastPushMs = millis();
+  Arduino_TFT* tft = static_cast<Arduino_TFT*>(g_gfx);
+  const int16_t visible = static_cast<int16_t>(kScreenH - (dy > 0 ? dy : -dy));
+  if (visible > 0) {
+    breadcrumb(kCrumbLcdPush, 1);
+    tft->startWrite();
+    if (dy > 0) {
+      // Content down: LCD rows [dy..H) show canvas rows [0..visible).
+      tft->writeAddrWindow(0, static_cast<uint16_t>(dy),
+                           static_cast<uint16_t>(kScreenW),
+                           static_cast<uint16_t>(visible));
+      tft->writePixels(&framebuffer[0],
+                       static_cast<uint32_t>(kScreenW) *
+                           static_cast<uint32_t>(visible));
+    } else {
+      // Content up: LCD rows [0..visible) show canvas rows [-dy..H).
+      tft->writeAddrWindow(0, 0, static_cast<uint16_t>(kScreenW),
+                           static_cast<uint16_t>(visible));
+      tft->writePixels(&framebuffer[static_cast<int32_t>(-dy) * kScreenW],
+                       static_cast<uint32_t>(kScreenW) *
+                           static_cast<uint32_t>(visible));
+    }
+    tft->endWrite();
+    breadcrumb(kCrumbLcdPush, 5);
+  }
+
+  // The vacated band. Filled directly on the panel rather than through the
+  // canvas, so the canvas still holds the untouched screen and releasing the
+  // drag can restore it with a single ordinary push.
+  const int16_t bandH = static_cast<int16_t>(dy > 0 ? dy : -dy);
+  const int16_t bandY = static_cast<int16_t>(dy > 0 ? 0 : kScreenH - bandH);
+  const uint16_t bandColour = armed ? kQrBlack : 0x2104;  // near-black vs dim
+  g_gfx->fillRect(0, bandY, kScreenW, bandH, bandColour);
+  if (bandH >= 22) {
+    const char* label = armed ? "RELEASE" : "keep going";
+    const uint8_t size = armed ? 2 : 1;
+    const int16_t textW =
+        static_cast<int16_t>(strlen(label) * 6 * size);
+    g_gfx->setTextSize(size);
+    g_gfx->setTextColor(armed ? kQrWhite : 0x8410);
+    g_gfx->setTextWrap(false);
+    g_gfx->setCursor(static_cast<int16_t>((kScreenW - textW) / 2),
+                     static_cast<int16_t>(bandY + (bandH / 2) - (4 * size)));
+    g_gfx->print(label);
+  }
+}
 //
 // The flow is Wi-Fi QR -> URL QR, and nothing used to say so. Scanning the
 // first code makes the screen change, and the operator cannot tell whether they
@@ -10099,9 +10190,30 @@ void OverrideTouchObserver::touchNotification(int x, int y, bool bCurrentlyPress
   g_lastTouchX = screenX;
   g_lastTouchY = screenY;
 
+  // Track the finger for drag-to-commit. Stamp only -- all rendering and every
+  // state change happens on the loop task, because this runs inside the I2C
+  // callback and must return immediately.
+  if (bCurrentlyPressed) {
+    if (!g_dragActive) {
+      g_dragActive = true;
+      g_dragStartY = screenY;
+    }
+    g_dragCurrentY = screenY;
+  } else if (g_dragActive) {
+    g_dragCurrentY = screenY;
+    g_dragActive   = false;
+    g_dragReleased = true;
+  }
+
   // Only stamp intent here. Starting a gesture takes the drive mutex and
   // paints the LCD, neither of which belongs in a touch callback.
-  if (g_lcdMode == LCD_MODE_GESTURE_MENU) {
+  //
+  // Latched on RELEASE, not on press. With movement notifications enabled this
+  // callback now fires repeatedly for the duration of a touch, so latching on
+  // any event would re-arm the same button many times per press. Release is
+  // also the correct semantics regardless: it lets a finger slide off a button
+  // to cancel (design-craft 8).
+  if (g_lcdMode == LCD_MODE_GESTURE_MENU && !bCurrentlyPressed) {
     const int8_t hit = gestureButtonAt(screenX, screenY);
     if (hit >= 0) {
       g_gesturePendingButton = hit;
@@ -10112,6 +10224,98 @@ void OverrideTouchObserver::touchNotification(int x, int y, bool bCurrentlyPress
     Serial.printf("touch: point raw=(%d,%d) screen=(%d,%d) pressed=%d\n", x, y,
                   static_cast<int>(screenX), static_cast<int>(screenY),
                   bCurrentlyPressed ? 1 : 0);
+  }
+}
+
+// Render a drag in progress and act on its release. Loop task only.
+//
+// !! CURRENTLY INERT ON THIS HARDWARE -- see PROJECT-HISTORY R48. !!
+// CST816Touch_HWMode reports only completed gestures, never intermediate touch
+// points, so touchNotification does not fire mid-drag and g_dragActive is never
+// set. Confirmed by dragging a finger and reading `touchlog`: three entries,
+// all gesture IDs with pressed=0, zero touch points. This code is correct and
+// starts working the moment those points arrive; unlocking them means either
+// switching to CST816Touch_SWMode (which replaces the calibrated hardware
+// gesture detection) or reading the coordinate registers directly (which adds
+// traffic to an I2C bus with an unexplained stall). Left in place deliberately
+// rather than deleted, because the decision is open and the work is done.
+//
+// It costs one mode comparison per loop pass while dormant.
+//
+// Direction is decided by what the current screen can actually do, so the
+// motion always follows the finger toward a real outcome (design-craft 6a):
+//   QR screens  -> drag UP to exit    (upward only)
+//   idle face   -> drag DOWN to pair  (downward only)
+// Dragging the other way does nothing and shows nothing, which is the honest
+// answer: there is no action there to preview.
+//
+// Nothing commits until release, and releasing short of the threshold snaps
+// back. That is the whole point -- a swipe used to be an irreversible instant
+// event, and this makes it inspectable and cancellable.
+static void serviceDragTransition() {
+  static int16_t s_renderedDy = 0;
+
+  const bool onQr   = (g_lcdMode == LCD_MODE_QR_WIFI) ||
+                      (g_lcdMode == LCD_MODE_QR_URL);
+  const bool onFace = (g_lcdMode == LCD_MODE_FACE) &&
+                      (g_orState == ORS_IDLE);
+  if (!onQr && !onFace) {
+    // Mode changed mid-drag (the AP came up, a phone connected). Abandon
+    // quietly; the mode switch has already repainted the panel.
+    s_renderedDy   = 0;
+    g_dragReleased = false;
+    return;
+  }
+
+  if (g_dragActive) {
+    int16_t dy = static_cast<int16_t>(g_dragCurrentY - g_dragStartY);
+    if (onQr  && dy > 0) dy = 0;   // QR: only upward means anything
+    if (onFace && dy < 0) dy = 0;  // face: only downward means anything
+    // Rubber band past the commit point: the finger keeps moving but the
+    // screen gives, so the control feels physical instead of hitting a wall
+    // (design-craft 6a).
+    const int16_t mag = static_cast<int16_t>(dy < 0 ? -dy : dy);
+    if (mag > kDragCommitPx) {
+      const int16_t over = static_cast<int16_t>(mag - kDragCommitPx);
+      const int16_t eased =
+          static_cast<int16_t>(kDragCommitPx + (over / 3));
+      dy = static_cast<int16_t>(dy < 0 ? -eased : eased);
+    }
+    if (dy != s_renderedDy) {
+      pushCanvasShiftedToLcd(dy, mag >= kDragCommitPx);
+      s_renderedDy = dy;
+    }
+    return;
+  }
+
+  if (!g_dragReleased) {
+    return;
+  }
+  g_dragReleased = false;
+  const int16_t dy  = static_cast<int16_t>(g_dragCurrentY - g_dragStartY);
+  const int16_t mag = static_cast<int16_t>(dy < 0 ? -dy : dy);
+  const bool commit = (mag >= kDragCommitPx) &&
+                      ((onQr && dy < 0) || (onFace && dy > 0));
+  if (commit) {
+    // Hand off to the existing swipe path rather than duplicating it, so drag
+    // and the chip's own gesture detection converge on identical behaviour.
+    if (onQr) {
+      g_orPendingSwipeUp = true;
+    } else {
+      g_orPendingSwipeDown = true;
+    }
+    Serial.printf("drag: committed %s (%d px)\n", onQr ? "up" : "down",
+                  static_cast<int>(mag));
+  } else if (s_renderedDy != 0) {
+    Serial.printf("drag: cancelled (%d px, needed %d)\n",
+                  static_cast<int>(mag), static_cast<int>(kDragCommitPx));
+  }
+  // Restore in both cases. On commit the mode switch repaints anyway, but the
+  // panel must not be left holding a half-shifted image if that switch is
+  // delayed or refused.
+  if (s_renderedDy != 0) {
+    pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
+    s_renderedDy = 0;
   }
 }
 
@@ -11064,6 +11268,22 @@ void setup() {
                   ImuQmi8658::whoAmI());
   }
   if (g_orTouch.begin(Wire, &g_orTouchObs, TP_INT, TP_RST, TP_ADDR)) {
+    // NOTE ON CONTINUOUS REPORTING.
+    //
+    // setNotificationsOnAllEvents / setNotifyOnMovement / setMovementInterval
+    // are PROTECTED on CST816Touch and are only exposed by the SW-mode
+    // subclass. This board deliberately runs CST816Touch_HWMode, where the
+    // chip itself detects swipes and we poll its gesture register -- a choice
+    // that costs ~0 CPU when idle and whose gesture IDs were calibrated on
+    // this exact hardware (kTouchSwipeDownId/UpId above).
+    //
+    // Switching to SW mode to unlock those setters would replace that
+    // calibrated hardware gesture detection with a software reimplementation,
+    // risking the primary UI to gain a transition. Not worth it, and not done
+    // on a guess: whether HW mode already streams intermediate touch points
+    // during a drag is a question the hardware can answer directly, via the
+    // touch log. Drag-to-commit is wired up and will work the moment those
+    // points arrive; if they do not, this is where the decision gets revisited.
     // Do NOT disable auto-sleep here. On this chip the interrupt pin is what
     // drives event reporting, and setAutoSleep(false) silently killed ALL
     // touch and gesture events even though I2C identity reads kept working —
@@ -11213,6 +11433,10 @@ void loop() {
                   static_cast<unsigned long>(g_rtcTouchSlowCount));
   }
   serviceTouchBeep(millis());
+  // Render any drag in progress. Immediately after the poll so the screen
+  // tracks the finger with the shortest possible lag -- perceived latency is
+  // the master variable (design-craft 7).
+  serviceDragTransition();
   // Pump override HTTP server + drive-watchdog
   breadcrumb(kCrumbLoopOverride);
   overrideLoop();

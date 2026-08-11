@@ -930,6 +930,49 @@ use-after-free in R45; once that was fixed the flash stopped.
 
 ---
 
+### R48 — Drag-to-commit LCD transitions (blocked by the touch driver mode)
+**Tried:** full drag tracking for the pairing screens — content follows the
+finger 1:1, a commit band appears past ~80 px, release either commits or snaps
+back. Asked for directly: *"slide it gradually where it moves with the drag but
+doesn't change until i let go and complete the action."*
+**Why:** it is the correct interaction. A swipe was an instant, irreversible
+event with no way to begin it, see what it would do, and change your mind
+(design-craft §1 direct manipulation, §8 confirm-on-touch-up).
+**Why blocked:** `CST816Touch_HWMode` never reports intermediate touch points.
+Verified on hardware rather than assumed — a finger dragged across the panel
+produced only three `touchlog` entries, all gesture IDs with `pressed=0`:
+
+    #0 gid=1 xy=(63,128) pressed=0
+    #1 gid=2 xy=(192,119) pressed=0
+    #2 gid=1 xy=(49,108) pressed=0
+
+Zero `gid=-1` touch points. The chip decides that a gesture happened and reports
+only the outcome, so `touchNotification` never fires mid-drag and the drag
+machinery receives no input at all.
+
+`setNotificationsOnAllEvents` / `setNotifyOnMovement` / `setMovementInterval`
+would fix it, but they are **protected** on `CST816Touch` and exposed only by
+`CST816Touch_SWMode`. Switching modes replaces the chip's hardware gesture
+detection with a software reimplementation — and this board's swipe IDs
+(`kTouchSwipeDownId=1`, `kTouchSwipeUpId=2`) had to be calibrated on this exact
+hardware because the chip's axes sit 90° off the panel. Risking the primary UI
+for a transition was not judged worth it.
+
+**Status:** the plumbing is in place and inert (`pushCanvasShiftedToLcd`,
+`serviceDragTransition`, the drag state vars). It begins working the moment
+intermediate points arrive. Three ways forward, none taken:
+  a) switch to `CST816Touch_SWMode` and re-verify every gesture on hardware;
+  b) read the CST816T coordinate registers directly from the loop while leaving
+     the library to handle gestures — but that adds I2C traffic to a bus with an
+     unexplained stall still under investigation;
+  c) leave it, and keep the ordered-band reveal.
+**Lesson worth keeping:** an API existing is not the same as the data arriving.
+One `touchlog` read would have settled this before the state machine was
+written.
+**Basis:** MEASURED (hardware touch log, 2026-08-11).
+
+---
+
 ## 4. Hardware facts and measured constants
 
 ### 4.1 Pin map (final)
