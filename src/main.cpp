@@ -9621,6 +9621,60 @@ static void qrCenterTextDark(int16_t y, uint8_t textSize, const char* s) {
 //   y=246  size 2 (or 1 if it does not fit) pw:<current password>
 //
 // Buffer size: version 4 needs ~150 B; 200 is comfortable headroom.
+// Push the whole canvas as ordered horizontal bands so the new screen arrives
+// travelling in a direction, instead of appearing all at once.
+//
+// Design-craft §6a: motion must follow the direction of the gesture that caused
+// it. Forward progress through the pairing flow reveals downward (the operator
+// swiped DOWN to get here); going backwards reveals upward.
+//
+// Design-craft §6b: this costs NOTHING extra and cannot stall the loop. It is
+// the same total pixel count as the single full-screen push it replaces -- only
+// the SPI window is set 8 times instead of once. There is no delay(), no frame
+// pacing and no added state, which is exactly why it is safe on a board with a
+// 5 s task watchdog and a history of loop-stall blackouts. A tweened transition
+// would have needed either delay() (a pending reset) or a tick state machine
+// (real complexity); an ordered repaint buys the directional read for free.
+void pushCanvasBanded(bool downward) {
+  constexpr int16_t kBands = 8;
+  constexpr int16_t kBandH = kScreenH / kBands;
+  for (int16_t i = 0; i < kBands; ++i) {
+    const int16_t band = downward ? i : (kBands - 1 - i);
+    const int16_t y    = static_cast<int16_t>(band * kBandH);
+    const int16_t h    = (band == kBands - 1)
+                             ? static_cast<int16_t>(kScreenH - y)
+                             : kBandH;
+    pushCanvasRectToLcd(0, y, kScreenW, h);
+  }
+}
+
+// Two-dot step indicator for the pairing flow.
+//
+// The flow is Wi-Fi QR -> URL QR, and nothing used to say so. Scanning the
+// first code makes the screen change, and the operator cannot tell whether they
+// are finished or whether something else is expected of them.
+//
+// Design-craft §18 (goal-gradient): never show someone a flow at zero. By the
+// time this screen exists the operator has already powered the robot on and
+// swiped down, so step 1 is genuinely underway -- marking it filled is honest
+// reporting, not a fabricated head start. Shape carries the state (filled vs
+// hollow), never colour alone (§3, DSGN-5).
+static void drawPairingStepDots(int16_t y, uint8_t step) {
+  if (g_canvas == nullptr) return;
+  constexpr int16_t kR    = 4;
+  constexpr int16_t kGap  = 18;
+  const int16_t cx = kScreenW / 2;
+  for (uint8_t i = 0; i < 2U; ++i) {
+    const int16_t x =
+        static_cast<int16_t>(cx - (kGap / 2) + (i * kGap));
+    if (i < step) {
+      g_canvas->fillCircle(x, y, kR, kQrBlack);
+    } else {
+      g_canvas->drawCircle(x, y, kR, kQrBlack);
+    }
+  }
+}
+
 static void drawQrScreenWifi() {
   if (g_canvas == nullptr) return;
   g_canvas->fillScreen(kQrWhite);
@@ -9645,9 +9699,18 @@ static void drawQrScreenWifi() {
   const int16_t y  = 6;
   drawQrToCanvas(&wifiQr, x, y, kQrWifiPixelScale);
 
-  qrCenterText(/*y=*/210, /*size=*/1, "Scan to join Wi-Fi");
-  qrCenterTextFit(/*y=*/224, credentials.ssid);
-  qrCenterTextFit(/*y=*/246, passwordLabel);
+  qrCenterText(/*y=*/206, /*size=*/1, "Scan to join Wi-Fi");
+  qrCenterTextFit(/*y=*/220, credentials.ssid);
+  qrCenterTextFit(/*y=*/240, passwordLabel);
+  // Step 1 of 2. Without this the operator scans, watches the screen change,
+  // and has no way to know whether that was the end of it (design-craft §6a
+  // multi-step indicators, §18 goal-gradient). Filled/hollow is a SHAPE
+  // difference, so it survives the screen being photographed or read by
+  // someone who cannot separate the hues (§3).
+  drawPairingStepDots(/*y=*/264, /*step=*/1U);
+  // The swipe is otherwise invisible: an unsignalled gesture does not exist
+  // (design-craft §1, §8).
+  qrCenterText(/*y=*/272, /*size=*/1, "swipe up to exit");
   secureZero(wifiBuf, sizeof(wifiBuf));
   secureZero(passwordLabel, sizeof(passwordLabel));
   secureZero(wifiPayload, sizeof(wifiPayload));
@@ -9679,25 +9742,36 @@ static void drawQrScreenUrl() {
   const int16_t y  = 20;
   drawQrToCanvas(&urlQr, x, y, kQrUrlPixelScale);
 
-  qrCenterText(/*y=*/252, /*size=*/1, "Scan to open control");
+  qrCenterText(/*y=*/240, /*size=*/1, "Scan to open control");
+  drawPairingStepDots(/*y=*/264, /*step=*/2U);
+  qrCenterText(/*y=*/272, /*size=*/1, "swipe up to exit");
   secureZero(urlBuf, sizeof(urlBuf));
   secureZero(accessUrl, sizeof(accessUrl));
 }
 
 // Switch into Wi-Fi QR mode. Idempotent.
+//
+// Reveals UPWARD when arriving from the URL screen, because that is a step
+// BACKWARDS through the pairing flow (the phone left the AP). Downward on first
+// entry, following the swipe-down that started the session. Design-craft §6a:
+// motion follows the direction of the thing that caused it.
 static void enterLcdQrWifiMode() {
   if (g_lcdMode == LCD_MODE_QR_WIFI) return;
+  const bool steppingBack = (g_lcdMode == LCD_MODE_QR_URL);
   drawQrScreenWifi();
-  pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
+  pushCanvasBanded(/*downward=*/!steppingBack);
   g_lcdMode = LCD_MODE_QR_WIFI;
   Serial.println(F("lcd: -> QR_WIFI"));
 }
 
 // Switch into URL QR mode. Idempotent.
+//
+// Always forward progress (a station joined the AP), so it always reveals
+// downward.
 static void enterLcdQrUrlMode() {
   if (g_lcdMode == LCD_MODE_QR_URL) return;
   drawQrScreenUrl();
-  pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
+  pushCanvasBanded(/*downward=*/true);
   g_lcdMode = LCD_MODE_QR_URL;
   Serial.println(F("lcd: -> QR_URL"));
 }
