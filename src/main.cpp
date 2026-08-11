@@ -5794,14 +5794,48 @@ void rollbackProvisionalDriveAdmission(const WsEvent& event, uint32_t now) {
                      0, 0, 0, now);
 }
 
-void closeWsEventClient(const WsEvent& event, uint16_t code,
-                        const char* reason) {
-  AsyncWebSocketClient* eventClient = g_orWs.client(event.client);
-  if (eventClient == nullptr ||
-      reinterpret_cast<uintptr_t>(eventClient) != event.transportToken) {
+// Records that a client's authority was revoked. DOES NOT TOUCH THE CLIENT.
+//
+// This previously did `g_orWs.client(id)` followed by `close()`, from the LOOP
+// task, at seven call sites -- the exact cross-task pattern that corrupted the
+// heap (RELY-4/RELY-5). close() reaches AsyncWebSocketClient::_queueControl,
+// which does an unsynchronised `_controlQueue.add()` (AsyncWebSocket.cpp:561),
+// racing AsyncTCP's own _onData on the same unlocked LinkedList. The observed
+// result was a fault inside the allocator's free-list unlink:
+//
+//     _onData -> _queueControl -> operator new -> tlsf_malloc
+//             -> block_locate_free -> remove_free_block   StoreProhibited
+//
+// Dropping the close costs nothing, for two independent reasons.
+//
+// 1. Authority is already gone. Every caller revokes through our own atomics
+//    BEFORE reaching here: the client is stale, faulted or a non-owner to begin
+//    with, or rejectWsTransportAdmission cleared the owner token first. A
+//    revoked client cannot drive, cannot be re-admitted, and its frames are
+//    ignored on the non-owner path.
+//
+// 2. The socket still gets closed -- from the correct task. Both telemetry send
+//    paths in orOnWsEvent re-check ownership and close on mismatch
+//    (main.cpp:8982, 9192). Those run on AsyncTCP, driven by the client's own
+//    next frame, so a live phone is dropped within one control tick. A phone
+//    that sends nothing is already gone and needs no close. The web app's 4 s
+//    telemetry-staleness watchdog is the backstop for anything else.
+//
+// Rate-limited and FIFO-gated: a client wedged in a revoked state can generate
+// these at control-frame rate, and an unbounded Serial.printf on the loop task
+// is its own hazard (RELY-6).
+void revokeWsEventClient(const WsEvent& event, const char* reason) {
+  static uint32_t s_lastRevokeLogMs = 0;
+  const uint32_t nowMs = millis();
+  if (static_cast<int32_t>(nowMs - s_lastRevokeLogMs) < 1000) {
     return;
   }
-  eventClient->close(code, reason);
+  s_lastRevokeLogMs = nowMs;
+  if (!serialCanWrite()) {
+    return;
+  }
+  Serial.printf("ws: client #%lu revoked (%s)\n",
+                static_cast<unsigned long>(event.client), reason);
 }
 
 // ---------------------------------------------------------------------------
@@ -5846,7 +5880,7 @@ void rejectWsTransportAdmission(const WsEvent& event, const char* reason) {
     g_wsTransportOpenCount.store(0U, std::memory_order_release);
   }
   unlockWsTransportState();
-  closeWsEventClient(event, 1008, reason);
+  revokeWsEventClient(event, reason);
   g_lcdNextPollMs = 0;
 }
 
@@ -9279,14 +9313,14 @@ static void serviceDriveControl(uint32_t now) {
         g_wsTransportGeneration.load(std::memory_order_acquire)) {
       if (event.type != WsEventType::Disconnect &&
           event.type != WsEventType::TransportFailure) {
-        closeWsEventClient(event, 1008, "Stale");
+        revokeWsEventClient(event, "Stale");
       }
       continue;
     }
     const bool terminalFault =
         (event.transportFlags & kWsEventTerminalFault) != 0U;
     if (!terminalFault && wsEventTransportFaulted(event)) {
-      closeWsEventClient(event, 1002, "Protocol fault");
+      revokeWsEventClient(event, "Protocol fault");
       continue;
     }
     const bool ownerTransport =
@@ -9295,7 +9329,7 @@ static void serviceDriveControl(uint32_t now) {
         (event.transportFlags & kWsEventDriveSessionOwner) != 0U;
     if (event.type != WsEventType::TransportFailure && !ownerTransport) {
       if (event.type != WsEventType::Disconnect) {
-        closeWsEventClient(event, 1008, "Forbidden");
+        revokeWsEventClient(event, "Forbidden");
       }
       continue;
     }
@@ -9310,7 +9344,7 @@ static void serviceDriveControl(uint32_t now) {
           break;
         }
         if (!wsEventMatchesCurrentTransport(event)) {
-          closeWsEventClient(event, 1008, "Stale");
+          revokeWsEventClient(event, "Stale");
           Serial.printf("ws: client #%lu discarded; stale transport connect\n",
                         static_cast<unsigned long>(event.client));
           break;
@@ -9336,7 +9370,7 @@ static void serviceDriveControl(uint32_t now) {
         const bool admittedFromGrace = g_orState == ORS_GRACE;
         DriveSession::Decision decision = {};
         if (!publishProvisionalDriveSessionTransport(event, decision)) {
-          closeWsEventClient(event, 1008, "Stale");
+          revokeWsEventClient(event, "Stale");
           Serial.printf("ws: client #%lu discarded; transport closed during admission\n",
                         static_cast<unsigned long>(event.client));
           break;
@@ -9353,7 +9387,7 @@ static void serviceDriveControl(uint32_t now) {
         }
         if (!finalizeDriveSessionTransportAdmission(event)) {
           rollbackProvisionalDriveAdmission(event, eventNow);
-          closeWsEventClient(event, 1008, "Stale");
+          revokeWsEventClient(event, "Stale");
           Serial.printf(
               "ws: client #%lu rolled back; transport closed during admission\n",
               static_cast<unsigned long>(event.client));
