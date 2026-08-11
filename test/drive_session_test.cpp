@@ -151,6 +151,118 @@ void testSequenceDeltaAndCommandBoundaries() {
          Action::PowerDown, State::WaitNeutral, Reason::MalformedCommand);
 }
 
+// The finding, verified against src/drive_session.cpp:41-57 as of this
+// commit: calling disconnect() with a non-owner token slams the true owner
+// back to WaitNeutral. The relevant code:
+//
+//   Decision DriveSession::disconnect(uint32_t client) {
+//     ...
+//     if (!hasOwner_ || owner_ != client) {
+//       if (hasOwner_ && state_ != State::Manual) {
+//         state_ = State::WaitNeutral;
+//         resetNeutral();
+//       }
+//       return decide(Action::PowerDown, 0, 0, Reason::NonOwner, ...);
+//     }
+//     ...
+//   }
+//
+// So YES, a spurious disconnect(strangerId) call while a legitimate owner
+// is driving will kick the operator out of Active and force them to
+// re-centre both sticks and count out five neutral frames before the
+// robot moves again. Ownership itself is NOT taken away (hasOwner_ stays
+// true, owner_ stays as the true owner), so the previous suite's
+// assertion of `session.hasOwner()` after `disconnect(5)` correctly holds
+// -- but the previous suite happened to call disconnect from WaitNeutral,
+// where the slam is a no-op. Nothing pins the interesting Active case.
+//
+// The main.cpp WsEventType::Disconnect handler currently guards
+// `driveSessionOwnerMatchesEvent(event)` before calling into
+// DriveSession, so the transport layer prevents this from firing today
+// (main.cpp:9024-9026). This test pins the DriveSession side of the
+// contract, so a future maintainer who removes the transport guard
+// thinking "the session will DTRT" gets a clear signal that no, it will
+// not, and the transport-layer guard is load-bearing.
+//
+// Physically: WaitNeutral means the operator's sticks have to travel
+// back to zero, hold zero for five frames (~150 ms at 30 Hz), and only
+// then does drive re-arm. A hostile client that could reach the
+// disconnect path could grief a legitimate driver.
+//
+// A note on intent: I'm treating the CURRENT behaviour as intentional
+// (the same failSafe/clear-neutral pattern is applied to every other
+// non-owner touch of the session, and it fails safe -- the wheels stop),
+// and pinning it as-is. If the team decides the disconnect path should
+// instead be a pure NonOwner NO-OP (leave state_ alone), this test must
+// be updated in the same change -- which is exactly the kind of
+// deliberate decision the pin exists to force.
+void testNonOwnerDisconnectSlamsActiveOwnerBackToWaitNeutral() {
+  DriveSession session;
+  session.connect(10, 0);
+  arm(session, 10, 1, 0);
+  // Take the owner all the way into Active with a real drive frame.
+  const DriveSession::Decision drive = session.frame(10, 6, 50, 50, 200, true);
+  expect(drive, Action::Drive, State::Active, Reason::DriveAccepted);
+  assert(session.state() == State::Active);
+  const uint32_t ownerBefore = session.owner();
+  const uint32_t generationBefore = session.generation();
+
+  // A stranger's disconnect arrives. The session logic slams the state
+  // back to WaitNeutral and clears the neutral-frame counter.
+  const DriveSession::Decision spurious = session.disconnect(11);
+  expect(spurious, Action::PowerDown, State::WaitNeutral, Reason::NonOwner);
+
+  // Ownership itself survives: the true owner is still owner. Otherwise
+  // a stranger could steal the session by just calling disconnect().
+  assert(session.hasOwner());
+  assert(session.owner() == ownerBefore);
+  assert(session.generation() == generationBefore);
+
+  // The neutral-frame counter has been reset, so the true owner must
+  // send kNeutralFramesRequired zeros again before they get another
+  // Drive decision. This is the physical cost to the operator.
+  //
+  // Prove it by streaming neutrals and confirming we walk the arming
+  // ramp from scratch, not just get an immediate ArmedOff.
+  for (uint8_t i = 0; i < DriveSession::kNeutralFramesRequired - 1U; ++i) {
+    const DriveSession::Decision d =
+        session.frame(10, static_cast<uint8_t>(7 + i), 0, 0,
+                      210U + static_cast<uint32_t>(i) * 30U, true);
+    expect(d, Action::PowerDown, State::WaitNeutral, Reason::NeutralProgress);
+  }
+  const DriveSession::Decision armed = session.frame(
+      10, static_cast<uint8_t>(7 + DriveSession::kNeutralFramesRequired - 1U),
+      0, 0, 210U + (DriveSession::kNeutralFramesRequired - 1U) * 30U, true);
+  expect(armed, Action::PowerDown, State::ArmedOff, Reason::NeutralReady);
+}
+
+// The Manual carve-out in disconnect(): a spurious non-owner disconnect
+// while the session is in Manual must NOT drop it out of Manual. The
+// source code explicitly guards this (drive_session.cpp:48
+// `if (hasOwner && state_ != State::Manual)`), and the guard is why the
+// LCD Manual mode can safely co-exist with a phantom disconnect from a
+// stale AsyncTCP thread.
+//
+// This case is not actually reachable in production because Manual
+// clears the owner first (enterManual() calls clearOwner()), so hasOwner
+// is false and the outer `!hasOwner` branch fires without entering the
+// inner clause. Still worth pinning because the code as written IS
+// defensive against a hypothetical future path that keeps ownership
+// through Manual.
+void testNonOwnerDisconnectInManualDoesNotEscapeManual() {
+  DriveSession session;
+  session.enterManual();
+  assert(session.state() == State::Manual);
+  assert(!session.hasOwner());
+
+  const DriveSession::Decision d = session.disconnect(42);
+  // hasOwner_ is false, so the branch returns Reason::NonOwner without
+  // touching state. Manual survives. (Note the reason is still NonOwner,
+  // not ManualMode, because the outer `!hasOwner_` shortcut fires first.)
+  expect(d, Action::PowerDown, State::Manual, Reason::NonOwner);
+  assert(session.state() == State::Manual);
+}
+
 void testManualShutdownAndReset() {
   DriveSession session;
   session.connect(8, 0);
@@ -178,6 +290,8 @@ int main() {
   testOwnershipAndGeneration();
   testTimeoutAndTimeWrap();
   testSequenceDeltaAndCommandBoundaries();
+  testNonOwnerDisconnectSlamsActiveOwnerBackToWaitNeutral();
+  testNonOwnerDisconnectInManualDoesNotEscapeManual();
   testManualShutdownAndReset();
   return 0;
 }

@@ -15,6 +15,17 @@ Two sources of drift are covered here:
    file locks their documented values so a bare-number tweak in the source
    surfaces here.
 
+3. The binary frame SHAPES agree between firmware and web app. Opcodes only
+   name a channel; every actual byte of every frame is also duplicated
+   across the wire. The firmware validates control/mood/gesture/sound frame
+   lengths with ``if (len != N)`` checks and builds a 30-byte telemetry
+   frame at fixed byte offsets; the web app allocates a matching
+   ``ArrayBuffer`` for outbound frames and asserts ``v.byteLength !== 30``
+   for the inbound telemetry frame, then decodes it at hard-coded offsets.
+   Any mismatch here is SILENT -- the phone sends bytes the firmware
+   rejects (or worse, the firmware writes bytes the phone decodes as
+   garbage), and nothing surfaces the error anywhere.
+
 Failure messages are written to tell the maintainer what to do next.
 """
 
@@ -213,6 +224,265 @@ class WsProtocolDriftTests(unittest.TestCase):
             f"(matches movement_expression.h refresh contract). Found "
             f"{match.group(1)}. If deliberate, update the comment and "
             f"this test.",
+        )
+
+    # ------------------------------------------------------------------
+    # Frame-shape drift. Not just "which byte means what channel", but
+    # the actual sizes and offsets the two sides encode/decode at. If any
+    # of these disagree, the phone sends or reads bytes nobody validates
+    # and no error is surfaced anywhere.
+    # ------------------------------------------------------------------
+
+    def _cpp_int(self, source: str, pattern: str, name: str) -> int:
+        match = re.search(pattern, source)
+        self.assertIsNotNone(
+            match,
+            f"Expected pattern for {name} not found: {pattern}",
+        )
+        assert match is not None
+        return int(match.group(1))
+
+    def test_telemetry_frame_size_agrees_between_firmware_and_web(
+        self,
+    ) -> None:
+        # The C++ side declares the frame size once and everything else
+        # (the atomic snapshot buffer, the local stack frame in
+        # orBuildTelemetry, the ws send) reads from it. The web app hard-
+        # codes 30 in `v.byteLength !== 30`. This test is the only place
+        # they meet.
+        firmware_size = self._cpp_int(
+            MAIN,
+            r"constexpr\s+size_t\s+kTelemetryFrameSize\s*=\s*(\d+)\s*;",
+            "kTelemetryFrameSize",
+        )
+        self.assertEqual(
+            firmware_size, 30,
+            f"kTelemetryFrameSize was 30 bytes by design (opcode + raw mV + "
+            f"display mV + pct + mood + charging + eligible + drive state + "
+            f"10 uint16 calibration fields). Found {firmware_size}. If this "
+            f"is a deliberate change, update the web app's byteLength check "
+            f"in src/override_html.cpp and this test in the same commit.",
+        )
+
+        # The web app rejects any frame that isn't exactly this size.
+        # This regex is deliberately tight -- if the guard is rewritten
+        # in a way that still checks 30 but doesn't match, we WANT this
+        # test to fail so the maintainer explicitly re-audits both sides.
+        js_match = re.search(
+            r"v\.byteLength\s*!==\s*(\d+)",
+            WEB_UI,
+        )
+        self.assertIsNotNone(
+            js_match,
+            "The web app used to reject telemetry frames whose byteLength "
+            "did not match the firmware's kTelemetryFrameSize. That check "
+            "is gone from src/override_html.cpp. Without it, a stale/short "
+            "frame slips into the decoder and getUint16(28) reads past the "
+            "end of the DataView.",
+        )
+        assert js_match is not None
+        self.assertEqual(
+            int(js_match.group(1)), firmware_size,
+            f"src/main.cpp builds a {firmware_size}-byte telemetry frame "
+            f"but src/override_html.cpp rejects everything except "
+            f"{js_match.group(1)}. The phone will drop every telemetry "
+            f"frame silently and the app will sit forever on 'live · "
+            f"LOCKED'. Bring both sides back into agreement in the same "
+            f"change.",
+        )
+
+    def test_telemetry_byte_offsets_written_by_firmware_match_web_decode(
+        self,
+    ) -> None:
+        # The web app decodes the telemetry frame at hard-coded offsets:
+        #
+        #   getUint8(0)  == OP_TELEMETRY
+        #   getUint16(3) == dspMv       (divided by 1000 for display volts)
+        #   getUint8(5)  == pct
+        #   getUint8(6)  == mood
+        #   getUint8(7)  == charging
+        #   getUint8(8)  == eligible
+        #   getUint8(9)  == drive state
+        #
+        # The firmware writes at matching offsets in orBuildTelemetry
+        # (main.cpp around line 8384). Any disagreement is silent
+        # miscoding -- the operator sees the wrong battery percentage,
+        # the wrong drive state, or the wrong charging light with no
+        # error anywhere.
+        #
+        # We scrape both sides for these coordinates and pin the mapping.
+        # The scrape is by SYMBOL (kOpTelemetry, out[N]) and by SHAPE
+        # (v.getUint*(N)), not by line number, because main.cpp is
+        # actively edited by another agent.
+
+        # (byte offset, firmware code, web-side decoder call, label)
+        expectations = [
+            (0,  "out[0]  = kOpTelemetry;",  "getUint8(0)",   "opcode"),
+            (5,  "out[5]  = g_batPercent;",   "getUint8(5)",   "battery pct"),
+            (6,  "out[6]  = static_cast<uint8_t>(g_eyes.getMood());",
+             "getUint8(6)",  "current mood"),
+            (7,  "out[7]  = g_batCharging ? 1 : 0;",
+             "getUint8(7)",  "charging flag"),
+            (8,  "out[8]  = g_driveCalibration.eligible() ? 1U : 0U;",
+             "getUint8(8)",  "calibration eligible"),
+            (9,  "out[9]  = static_cast<uint8_t>(g_driveSession.state());",
+             "getUint8(9)",  "drive session state"),
+        ]
+
+        for offset, firmware_assign, web_call, label in expectations:
+            with self.subTest(offset=offset, label=label):
+                self.assertIn(
+                    firmware_assign, MAIN,
+                    f"Expected firmware to write telemetry offset {offset} "
+                    f"({label}) as `{firmware_assign}`. Not found in "
+                    f"src/main.cpp. If the write was refactored, either "
+                    f"restore the expected offset or update the web decode "
+                    f"and this test.",
+                )
+                self.assertIn(
+                    web_call, WEB_UI,
+                    f"Expected web app to decode telemetry offset {offset} "
+                    f"({label}) as `{web_call}` in src/override_html.cpp. "
+                    f"Not found. If the decode moved, update the firmware "
+                    f"write and this test in the same change.",
+                )
+
+        # The two-byte fields (bytes 1-2 raw mV, 3-4 dspMv) are big-
+        # endian. Pin the shape on both sides.
+        for offset, hi_assign, lo_assign, web_call, label in [
+            (1, "out[1]  = static_cast<uint8_t>(rawMv >> 8);",
+             "out[2]  = static_cast<uint8_t>(rawMv & 0xFF);",
+             None, "raw mV"),
+            (3, "out[3]  = static_cast<uint8_t>(dspMv >> 8);",
+             "out[4]  = static_cast<uint8_t>(dspMv & 0xFF);",
+             "getUint16(3)", "display mV"),
+        ]:
+            with self.subTest(offset=offset, label=label):
+                self.assertIn(hi_assign, MAIN)
+                self.assertIn(lo_assign, MAIN)
+                if web_call is not None:
+                    self.assertIn(
+                        web_call, WEB_UI,
+                        f"Web app must read {label} at offset {offset} as "
+                        f"`{web_call}` (big-endian uint16). Not found.",
+                    )
+
+        # Calibration fields are ten big-endian uint16s at offsets 10..29.
+        # Prove that the loop writes them (structurally) and that offset
+        # 29 is the last byte written. If someone stops at 28 or 27, the
+        # 30-byte size assertion above still passes but a couple of
+        # calibration cells go unwritten.
+        loop_pattern = (
+            r"out\[10U\s*\+\s*i\s*\*\s*2U\]\s*="
+        )
+        self.assertRegex(
+            MAIN, loop_pattern,
+            "Firmware calibration loop that writes offsets 10..29 in the "
+            "telemetry frame was removed or refactored. Restore the loop "
+            "or update this test AND the (currently absent) web decode of "
+            "these bytes together.",
+        )
+        # Sanity: the loop counter goes to 10U (five per motor × two).
+        self.assertIn("for (size_t i = 0; i < 10U; ++i)", MAIN)
+
+    def test_control_frame_length_is_four_on_both_sides(self) -> None:
+        # Firmware refuses len != 4 for kOpControl, and the web app
+        # allocates a 4-byte ArrayBuffer for sendCtrl. Any drift here is
+        # a hard hang: the firmware fails safe (MalformedControl), the
+        # phone doesn't notice, and the operator sees the robot refuse
+        # to move without a clue why.
+        firmware_guard = re.search(
+            r"case\s+kOpControl:\s*\{[^}]*?len\s*!=\s*(\d+)U",
+            MAIN,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            firmware_guard,
+            "src/main.cpp's kOpControl handler used to guard `len != 4U`. "
+            "That guard is missing. Restore it -- without it, a short "
+            "frame reads uninitialised stack as the drive values.",
+        )
+        assert firmware_guard is not None
+        self.assertEqual(
+            int(firmware_guard.group(1)), 4,
+            f"Firmware rejects control frames of every size except 4 B, "
+            f"but this guard now requires {firmware_guard.group(1)} B. "
+            f"Bring the web app's ArrayBuffer allocation into agreement.",
+        )
+
+        web_alloc = re.search(
+            r"function\s+sendCtrl\s*\([^)]*\)\s*\{.*?"
+            r"new\s+ArrayBuffer\((\d+)\).*?"
+            r"d\.setUint8\(\s*0\s*,\s*OP_CONTROL\s*\)",
+            WEB_UI,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            web_alloc,
+            "src/override_html.cpp's sendCtrl used to allocate an "
+            "ArrayBuffer whose size is what the firmware validates and "
+            "then write OP_CONTROL into byte 0. That pair is not "
+            "detectable in the source -- restore it, or update this "
+            "test AND the firmware guard together.",
+        )
+        assert web_alloc is not None
+        self.assertEqual(
+            int(web_alloc.group(1)), 4,
+            f"sendCtrl allocates a {web_alloc.group(1)}-byte buffer but "
+            f"the firmware requires exactly 4. Every control frame will "
+            f"be dropped as MalformedControl and the transport will fault.",
+        )
+
+    def test_three_byte_channels_agree_on_length(self) -> None:
+        # Mood/Gesture/Sound all use the same 3-byte shape: op, id, seq.
+        # The firmware validates each with `if (len != 3U)`. The web app
+        # sends them via the shared send3 helper.
+        for opcode_name in ("kOpMood", "kOpGesture", "kOpSound"):
+            with self.subTest(opcode=opcode_name):
+                guard = re.search(
+                    rf"case\s+{opcode_name}:\s*\{{[^}}]*?len\s*!=\s*(\d+)U",
+                    MAIN,
+                    re.DOTALL,
+                )
+                self.assertIsNotNone(
+                    guard,
+                    f"src/main.cpp's {opcode_name} handler no longer "
+                    f"guards its payload length. Without it the handler "
+                    f"reads past the end of the ws frame.",
+                )
+                assert guard is not None
+                self.assertEqual(
+                    int(guard.group(1)), 3,
+                    f"{opcode_name} guard requires "
+                    f"{guard.group(1)} B, but the web app's shared "
+                    f"send3(op, id) allocates 3 B. Bring both sides "
+                    f"into agreement.",
+                )
+
+        # The web app's send3 must actually allocate 3 bytes. If someone
+        # widens it silently, every mood/gesture/sound frame will fail
+        # the firmware guard as ProtocolFailure and the transport will
+        # fault-and-revoke.
+        web_send3 = re.search(
+            r"function\s+send3\(op,\s*id\)\s*\{[^}]*?"
+            r"new\s+ArrayBuffer\((\d+)\)",
+            WEB_UI,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            web_send3,
+            "src/override_html.cpp's send3(op, id) helper is missing or "
+            "was rewritten in a shape this test cannot recognise. It is "
+            "load-bearing -- every mood, gesture, and sound frame ships "
+            "through it.",
+        )
+        assert web_send3 is not None
+        self.assertEqual(
+            int(web_send3.group(1)), 3,
+            f"send3 now allocates {web_send3.group(1)} bytes; firmware "
+            f"guards demand exactly 3. Every mood/gesture/sound frame "
+            f"will be rejected as ProtocolFailure and the socket will "
+            f"be closed by the fault path.",
         )
 
 

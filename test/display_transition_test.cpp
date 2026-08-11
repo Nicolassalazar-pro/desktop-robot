@@ -72,6 +72,17 @@ void testSmoothstepIsMonotonicAndBounded() {
   }
   assert(DisplayTransition::smoothstep8(0U, 12U) == 0U);
   assert(DisplayTransition::smoothstep8(12U, 12U) == 255U);
+
+  // The endpoint assertions above are silently satisfied by a broken
+  // smoothstep that returns 0 for every intermediate step and 255 only
+  // at step==12 -- which visually would be a snap, not a fade. Assert
+  // that SOMETHING between the endpoints is strictly between 0 and 255,
+  // and specifically that the midpoint has already climbed past a
+  // quarter of full brightness. If it hasn't, the fade will look flat
+  // for its first half and then snap on.
+  const uint8_t mid = DisplayTransition::smoothstep8(6U, 12U);
+  assert(mid > 64U);
+  assert(mid < 191U);
 }
 
 }  // namespace

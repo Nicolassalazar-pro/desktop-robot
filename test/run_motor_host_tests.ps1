@@ -121,6 +121,17 @@ try {
         'test\ws_owner_reaper_test.cpp'
     )
 
+    Invoke-NativeTest -Name 'ws-ingress-drain' -Sources @(
+        'test\ws_ingress_drain_test.cpp'
+    )
+
+    Invoke-NativeTest -Name 'ws-nonowner-filter' -IncludeArgs @(
+        '-Isrc'
+    ) -Sources @(
+        'test\ws_nonowner_filter_test.cpp',
+        'src\drive_session.cpp'
+    )
+
     # The gesture-menu test mirrors constants that live in main.cpp. Verify the
     # copies still match, so the geometry cannot silently drift out of sync.
     $mainSrc = Get-Content 'src\main.cpp' -Raw

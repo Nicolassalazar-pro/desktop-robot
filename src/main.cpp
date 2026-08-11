@@ -315,6 +315,20 @@ struct NamedColor {
   uint16_t color;
 };
 
+// READ-6/READ-9: three mood tables in this file must stay in sync.
+//   1. kMoodCommands below            -- name -> id lookup for the serial
+//                                        console and WS command dispatch.
+//   2. kDemoMoods                     -- the subset the idle demo cycles.
+//   3. moodToUpperName() around line 2100 -- id -> UPPER-CASE label used
+//                                        on the wire (mood label overlay).
+// If you add or rename a mood you MUST update all three (and also
+// EyeEngine's own mood tables in lib/EyeEngine).
+//
+// READ-9: row order in kMoodCommands is not cosmetic. moodName() returns
+// the FIRST row whose id matches; the mapping goes out on the wire and
+// shows up in serial replies. Put the CANONICAL name first and aliases
+// after (e.g. {"think", ...} before {"thinking", ...}). Reordering these
+// pairs silently renames moods for external clients.
 const NamedMood kMoodCommands[] = {
     {"default", MOOD_DEFAULT},
     {"bored", MOOD_BORED},
@@ -339,6 +353,11 @@ const NamedMood kMoodCommands[] = {
     {"curious", MOOD_CURIOUS},
 };
 
+// READ-6: subset of kMoodCommands that the idle demo cycles through.
+// Order matters -- processDemo() steps through this table linearly and
+// the demo transcript is what the operator sees. If you add a mood here
+// bump kDemoMoodCount / kDemoTotalSteps below, and confirm it also
+// appears in kMoodCommands above.
 const NamedMood kDemoMoods[] = {
     {"default", MOOD_DEFAULT},
     {"bored", MOOD_BORED},
@@ -1689,6 +1708,34 @@ void applyDriveDecision(const DriveSession::Decision& decision,
 // Forward decls for battery meter overlay
 static float   batteryReadVoltage();
 static uint8_t batteryVoltsToPercent(float v);
+// PERF-2: battery meter push gating.
+//
+// Data source ticks at 1 Hz (kBatUpdateIntervalMs) but drawBatteryMeter()
+// used to fire every eye-render frame whose dirty rect brushed the strip
+// (SURPRISED/SCARED at ~50 Hz), and every g_forceFullPush. That is 50+
+// LCD pushes/s for content that changes at 1 Hz.
+//
+// Gate: cache (rawMv, dspMv, pct, charging) and only re-render into
+// canvas + push when either
+//   (a) the content actually changed, OR
+//   (b) the canvas strip has been clobbered (eye bled into it, or the
+//       mascot background was just repainted), so canvas is stale.
+//
+// Callers set g_batStripCanvasFresh=false BEFORE calling drawBatteryMeter
+// whenever they know the strip in canvas is now something other than the
+// last battery text (eye pixels, mascot pixels, etc). drawBatteryMeter
+// sets it TRUE on successful render. When the content matches AND the
+// canvas is fresh, drawBatteryMeter is a no-op.
+struct BatteryMeterSignature {
+  uint16_t rawMv;
+  uint16_t dspMv;
+  uint8_t  pct;
+  bool     charging;
+  bool     valid;
+};
+static BatteryMeterSignature g_batMeterLastSig = {0, 0, 0, false, false};
+static bool g_batStripCanvasFresh = false;
+
 static void    drawBatteryMeter();
 static void    updateBatteryMeter();
 // True if [y, y+h) intersects the battery-meter strip at the top of the
@@ -1795,6 +1842,10 @@ static void setEyesMood(EyeMood m) {
   g_demoMoodLabel = moodToUpperName(m);
   drawDemoMoodLabel();
   if (g_batSeeded) {
+    // PERF-2: the full-mascot repaint above clobbers the meter strip in
+    // canvas -- invalidate so drawBatteryMeter() re-renders even when
+    // the numeric content has not moved.
+    g_batStripCanvasFresh = false;
     drawBatteryMeter();
   }
   // [DEBUG-DELETE] END
@@ -1804,6 +1855,12 @@ void drawMascotToCanvas(int16_t originX, int16_t originY) {
   if (g_canvas == nullptr) {
     return;
   }
+
+  // PERF-2: the mascot bitmap is full-screen, so drawing it wipes the
+  // battery strip in canvas. Anyone who then calls drawBatteryMeter()
+  // must see that the canvas strip is stale, even when the numeric
+  // content has not moved since the last render.
+  g_batStripCanvasFresh = false;
 
   g_canvas->draw16bitRGBBitmap(originX,
                                originY,
@@ -2077,6 +2134,10 @@ static void runWakeLogoAnimation() {
 // Renders the current mood name in RED, all-caps, in the bottom-right
 // corner. Used during mood-review demos only. Remove this block + all
 // matching `// [DEBUG-DELETE]` lines before ship.
+//
+// READ-6: this table must stay in sync with kMoodCommands and kDemoMoods
+// near the top of this file. Adding a new mood requires updating all
+// three (plus EyeEngine's own tables in lib/EyeEngine).
 static const char* moodToUpperName(EyeMood m) {
   switch (m) {
     case MOOD_DEFAULT:   return "DEFAULT";
@@ -2095,6 +2156,16 @@ static const char* moodToUpperName(EyeMood m) {
     case MOOD_LOVE:      return "LOVE";
     case MOOD_CONFUSED:  return "CONFUSED";
     case MOOD_CURIOUS:   return "CURIOUS";
+  }
+  // READ-11: an unmapped mood used to fall through silently -- if
+  // EyeEngine ever emits a new EyeMood before this switch is extended
+  // we would just start rendering "?" on the overlay with no clue why.
+  // Log once per unmapped id (gated so a spurious high-rate call cannot
+  // saturate the CDC FIFO); the label still renders as "?" so nothing
+  // higher up crashes.
+  if (serialCanWrite()) {
+    Serial.printf("moodToUpperName: unmapped mood id=%d -> \"?\"\n",
+                  static_cast<int>(m));
   }
   return "?";
 }
@@ -2149,6 +2220,27 @@ static void drawBatteryMeter() {
   if ((g_canvas == nullptr) || (g_gfx == nullptr)) {
     return;
   }
+
+  // PERF-2 gate: build a small signature from the render inputs and
+  // compare against the last successful render. If the inputs match AND
+  // canvas is fresh (nobody clobbered our strip since last time), we can
+  // return without touching canvas or LCD -- the previous push is still
+  // valid on screen.
+  const BatteryMeterSignature sig = {
+      static_cast<uint16_t>(g_batVoltageRaw * 1000.0f + 0.5f),
+      static_cast<uint16_t>(g_batVoltage    * 1000.0f + 0.5f),
+      g_batPercent,
+      g_batCharging,
+      /*valid=*/true,
+  };
+  if (g_batMeterLastSig.valid && g_batStripCanvasFresh &&
+      g_batMeterLastSig.rawMv    == sig.rawMv &&
+      g_batMeterLastSig.dspMv    == sig.dspMv &&
+      g_batMeterLastSig.pct      == sig.pct  &&
+      g_batMeterLastSig.charging == sig.charging) {
+    return;
+  }
+
   // Top row: raw (unfiltered) voltage straight off the ADC.
   // Bottom row: filtered/displayed voltage + slew-limited percentage,
   // plus a CHG tag when we think USB power is connected.
@@ -2188,6 +2280,9 @@ static void drawBatteryMeter() {
   g_canvas->print(dspBuf);
 
   pushCanvasRectToLcd(0, kBatLabelY, kScreenW, kBatLabelH);
+
+  g_batMeterLastSig     = sig;
+  g_batStripCanvasFresh = true;
 }
 
 static void updateBatteryMeter() {
@@ -3684,7 +3779,12 @@ void cmdLcdpush(char* argument) {
   const uint32_t startedUs = micros();
   pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
   const uint32_t tookUs = micros() - startedUs;
-  if (g_batSeeded) drawBatteryMeter();
+  if (g_batSeeded) {
+    // PERF-2: after an explicit lcdpush command, force a fresh meter
+    // render so the operator sees the current voltage no matter what.
+    g_batStripCanvasFresh = false;
+    drawBatteryMeter();
+  }
   Serial.printf("lcdpush: full push %lux%lu took %lu us (SPI %lu MHz)\n",
                 static_cast<unsigned long>(kScreenW),
                 static_cast<unsigned long>(kScreenH),
@@ -5164,7 +5264,26 @@ void processDemo() {
                     static_cast<unsigned>(kDemoTotalSteps),
                     moodStep.name);
     }
-  } else if (g_demoStep < static_cast<uint8_t>(kDemoMoodCount + kDemoLookCount)) {
+  }
+#if 0
+  // READ-7: the look and blink phases below are provably unreachable
+  // while kDemoTotalSteps == kDemoMoodCount (see the constexpr on line
+  // ~418). Proof:
+  //   1. Line above clamps g_demoStep to 0 when it hits kDemoTotalSteps.
+  //   2. kDemoTotalSteps == kDemoMoodCount, so after the clamp
+  //      g_demoStep < kDemoMoodCount always holds when we reach the if.
+  //   3. Therefore the first `if` above is always taken, and the two
+  //      branches below never execute.
+  //   4. g_demoStep is only written by processDemo() (this function --
+  //      the ++ below and the =0 above) and by startDemo/stopDemo
+  //      which reset to 0. No other writer can push it into the
+  //      look/blink range.
+  // Kept as source-only documentation so the wiring is obvious when we
+  // want to restore look/blink cycling: change the constexpr on line
+  // ~418 back to `kDemoMoodCount + kDemoLookCount + 1U` AND flip this
+  // `#if 0` to `#if 1` (or remove the guard). Do not delete -- the two
+  // must move together to avoid a table drift bug.
+  else if (g_demoStep < static_cast<uint8_t>(kDemoMoodCount + kDemoLookCount)) {
     const uint8_t lookIndex = static_cast<uint8_t>(g_demoStep - kDemoMoodCount);
     const NamedLook& lookStep = kDemoLooks[lookIndex];
     g_eyes.setPosition(lookStep.position);
@@ -5182,6 +5301,7 @@ void processDemo() {
                     static_cast<unsigned>(kDemoTotalSteps));
     }
   }
+#endif
 
   ++g_demoStep;
   g_demoNextStepMs = now + kDemoStepIntervalMs;
@@ -5261,7 +5381,25 @@ static_assert(sizeof("TheGarageAtl") <= kApPasswordMaxLength + 1,
 constexpr uint16_t     kOverridePort         = 80;       // we own port 80 (no more WiFiManager)
 constexpr uint16_t     kOverrideDnsPort      = 53;       // captive-portal DNS catch-all
 constexpr uint8_t      kOverrideApChannel    = 6;        // pinned (2.4 GHz mid-band, low congestion)
-constexpr uint8_t      kOverrideApMaxClients = 4;
+// Raised 4 -> 10 (SEC-1). 10 is the ESP-IDF softAP cap
+// (CONFIG_ESP_WIFI_SOFTAP_MAX_STA_NUM), so this is the ceiling, not a guess.
+//
+// It does NOT close the 802.11-layer slot-exhaustion hole: anyone with the WPA2
+// password (which is printed on the pairing screen) can still occupy every slot
+// and lock the operator out. It raises the cost 2.5x and, more usefully, gives
+// headroom against the mundane case -- a phone that walked out of range without
+// disassociating, or a household device re-associating, squatting a slot while
+// the operator is refused.
+//
+// The elaborate fix (track idle stations and esp_wifi_deauth_sta them) was
+// considered and rejected: it needs MAC<->IP correlation to tell a real
+// operator mid-captive-portal from a squatter, and an over-eager timeout would
+// deauth the operator while they are scanning the QR. Three "clever" fixes had
+// to be reverted this week; smallest-change wins.
+//
+// Physical access remains the real trump card: swipe up, swipe down, new
+// credentials, new QR.
+constexpr uint8_t      kOverrideApMaxClients = 10;
 constexpr int8_t       kOverrideApTxPowerQdb = 44;       // 11.0 dBm = ~12 mW (44 quarter-dB units)
                                                           // Lower than max — phones handshake more reliably
 constexpr uint32_t     kMotorIdlePowerOffMs  = 1000;
@@ -8373,9 +8511,45 @@ bool isValidMoodId(uint8_t id) {
   return (id <= 16) && (id != 4);
 }
 
-// Build telemetry in-place. Bytes 1..4 are raw/display millivolts, bytes
-// 8..9 are calibration eligibility/session state, and bytes 10..29 are the
-// five big-endian native microsecond fields for left followed by right.
+// Build telemetry in-place.
+//
+// Wire format (30 bytes = kTelemetryFrameSize):
+//   [0]      kOpTelemetry (opcode)
+//   [1..2]   rawMv       (big-endian, mV before display filtering)
+//   [3..4]   dspMv       (big-endian, mV after display filtering)
+//   [5]      batPercent  (0..100)
+//   [6]      current mood id (EyeMood enum, skips 4)
+//   [7]      charging flag (0/1)
+//   [8]      drive calibration eligible flag (0/1)
+//   [9]      drive session state (DriveSession::State enum)
+//   [10..29] DEAD PAYLOAD -- see below.
+//
+// Bytes 10..29 hold ten big-endian uint16 microsecond calibration values
+// (left {stop, fwdStart, revStart, fwdMax, revMax} then the same five for
+// right). They ARE NOT DECODED by any client -- the phone-side calibration
+// UI that consumed them was retired long ago, and `grep CAL_KEYS src lib
+// docs` returns nothing. `src/override_html.cpp:273` asserts the wire is
+// exactly 30 bytes and reads only bytes 0, 3, 5, 6, 7, 8, 9. That check
+// -- and `test/test_motor_us_contract.py` around lines 161..193, which
+// asserts each of these 10 values is written in this exact big-endian
+// layout -- pins the frame size to 30 today.
+//
+// Shrinking the frame (option (a) in the task list) is deliberately NOT
+// done here because it requires coordinated changes in files outside
+// this agent's ownership:
+//   * src/override_html.cpp    -- byteLength check must drop 30 -> 10.
+//   * test/test_motor_us_contract.py -- the "10 uint16 values" pin must
+//                                       be removed and the frame-size
+//                                       assertion updated to 10.
+// Until those two land together with a matching kTelemetryFrameSize
+// reduction here, leave the wire format alone: shrinking one side
+// unilaterally hangs a mismatched-length assertion on every telemetry
+// tick and breaks the host test suite. ~100 B/s of trash over softAP is
+// not free but it is not on any hot budget either.
+//
+// TODO(cross-file): when the three-file change lands, drop the writes to
+// bytes 10..29, cut kTelemetryFrameSize to 10, and update the two files
+// above. Keep this comment as a tombstone until then.
 void orBuildTelemetry(uint8_t* out) {
   const DriveCalibration::Snapshot calibration = g_driveCalibration.snapshot();
 
@@ -8525,8 +8699,14 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     AsyncWebServerRequest* request =
         static_cast<AsyncWebServerRequest*>(arg);
     if (!requestHasValidAccessToken(request)) {
-      Serial.printf("ws: client #%lu rejected; activation token required\n",
-                    static_cast<unsigned long>(clientId));
+      // RELY-6: gate on serialCanWrite() so a full CDC FIFO drops the line
+      // instead of truncating it mid-frame. No rate-limit -- a
+      // token-missing upgrade past WsAuthGuardHandler is diagnostic and
+      // we want every occurrence when a host is reading.
+      if (serialCanWrite()) {
+        Serial.printf("ws: client #%lu rejected; activation token required\n",
+                      static_cast<unsigned long>(clientId));
+      }
       wsStep(3);
       client->close(1008, "Forbidden");
       wsStep(4);
@@ -8591,13 +8771,26 @@ void orOnWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
     unlockWsTransportState();
 
     if (!accepted) {
-      Serial.printf("ws: client #%lu rejected; %s\n",
-                    static_cast<unsigned long>(clientId),
-                    activationFaulted
-                        ? "activation terminal-faulted"
-                        : (transportFaultClosePending
-                               ? "faulted transport closing"
-                               : "transport owner busy"));
+      // RELY-6: a stubborn phone can churn connect -> reject -> close ->
+      // reconnect at ~2-5 Hz, which is fast enough to overrun the CDC FIFO
+      // and truncate the printf mid-line. Gate on serialCanWrite() so we
+      // drop cleanly rather than corrupt, and rate-limit to 1 Hz to match
+      // revokeWsEventClient's pattern -- the reason string does not change
+      // between reject attempts on the same fault, so once-a-second is
+      // enough to see it without swamping the CDC.
+      static uint32_t s_lastRejectLogMs = 0;
+      const uint32_t nowMs = millis();
+      if (static_cast<int32_t>(nowMs - s_lastRejectLogMs) >= 1000 &&
+          serialCanWrite()) {
+        s_lastRejectLogMs = nowMs;
+        Serial.printf("ws: client #%lu rejected; %s\n",
+                      static_cast<unsigned long>(clientId),
+                      activationFaulted
+                          ? "activation terminal-faulted"
+                          : (transportFaultClosePending
+                                 ? "faulted transport closing"
+                                 : "transport owner busy"));
+      }
       client->close(1008,
                     (activationFaulted || transportFaultClosePending)
                         ? "Unavailable"
@@ -9304,22 +9497,40 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       // AsyncTCP allocates per connection. If a restart follows a client
       // joining, this line is the last reading before it and shows whether
       // memory was already collapsing.
-      Serial.printf("wifi-evt: AP_STACONNECTED  client mac=%02X:%02X:%02X:%02X:%02X:%02X"
-          "  heap=%lu min=%lu largest=%lu\n",          info.wifi_ap_staconnected.mac[0], info.wifi_ap_staconnected.mac[1],
-          info.wifi_ap_staconnected.mac[2], info.wifi_ap_staconnected.mac[3],
-          info.wifi_ap_staconnected.mac[4], info.wifi_ap_staconnected.mac[5],
-          static_cast<unsigned long>(ESP.getFreeHeap()),
-          static_cast<unsigned long>(ESP.getMinFreeHeap()),
-          static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+      //
+      // RELY-6: gate on serialCanWrite() only (no rate-limit) so a full CDC
+      // FIFO drops the line instead of stalling the WiFi event task mid-
+      // printf. Every joining phone gets one STA_CONNECTED, so with a live
+      // reader we still see them all; without one, we never lose our
+      // crash-adjacent evidence to a truncated line either.
+      if (serialCanWrite()) {
+        Serial.printf("wifi-evt: AP_STACONNECTED  client mac=%02X:%02X:%02X:%02X:%02X:%02X"
+            "  heap=%lu min=%lu largest=%lu\n",          info.wifi_ap_staconnected.mac[0], info.wifi_ap_staconnected.mac[1],
+            info.wifi_ap_staconnected.mac[2], info.wifi_ap_staconnected.mac[3],
+            info.wifi_ap_staconnected.mac[4], info.wifi_ap_staconnected.mac[5],
+            static_cast<unsigned long>(ESP.getFreeHeap()),
+            static_cast<unsigned long>(ESP.getMinFreeHeap()),
+            static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+      }
       break;
     case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
-      Serial.printf("wifi-evt: AP_STADISCONNECTED  client mac=%02X:%02X:%02X:%02X:%02X:%02X\n",
-          info.wifi_ap_stadisconnected.mac[0], info.wifi_ap_stadisconnected.mac[1],
-          info.wifi_ap_stadisconnected.mac[2], info.wifi_ap_stadisconnected.mac[3],
-          info.wifi_ap_stadisconnected.mac[4], info.wifi_ap_stadisconnected.mac[5]);
+      // RELY-6: gate on serialCanWrite() only. Paired with the connect
+      // burst above -- if a phone bounces on and off, the two events
+      // interleave and it is that interleave that saturates the CDC. Drop
+      // the line rather than truncate.
+      if (serialCanWrite()) {
+        Serial.printf("wifi-evt: AP_STADISCONNECTED  client mac=%02X:%02X:%02X:%02X:%02X:%02X\n",
+            info.wifi_ap_stadisconnected.mac[0], info.wifi_ap_stadisconnected.mac[1],
+            info.wifi_ap_stadisconnected.mac[2], info.wifi_ap_stadisconnected.mac[3],
+            info.wifi_ap_stadisconnected.mac[4], info.wifi_ap_stadisconnected.mac[5]);
+      }
       break;
     case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
-      Serial.println(F("wifi-evt: AP_STAIPASSIGNED (DHCP lease handed out)"));
+      // RELY-6: gate on serialCanWrite() only. Follows CONNECT for every
+      // client that requests DHCP; part of the same burst.
+      if (serialCanWrite()) {
+        Serial.println(F("wifi-evt: AP_STAIPASSIGNED (DHCP lease handed out)"));
+      }
       break;
     case ARDUINO_EVENT_WIFI_AP_PROBEREQRECVED:
       // suppressed — fires for every scan, too noisy
@@ -9372,6 +9583,18 @@ static void qrCenterText(int16_t y, uint8_t textSize, const char* s) {
   g_canvas->print(s);
 }
 
+// DSGN-6: prefer size 2 for legibility; drop to size 1 only when the
+// caller passed a string long enough to overflow the 240-px canvas at
+// size 2. Keeps SSID/password readable across the room without truncating
+// off-screen when a longer credential lands. Text color follows qrCenterText
+// (black on the Wi-Fi QR white background).
+static void qrCenterTextFit(int16_t y, const char* s) {
+  const size_t len = strlen(s);
+  const uint8_t textSize =
+      (static_cast<int16_t>(len * 6 * 2) <= kScreenW) ? 2 : 1;
+  qrCenterText(y, textSize, s);
+}
+
 // Like qrCenterText, but for the "Establishing Server..." dark splash:
 // white text on black background.
 static void qrCenterTextDark(int16_t y, uint8_t textSize, const char* s) {
@@ -9384,11 +9607,18 @@ static void qrCenterTextDark(int16_t y, uint8_t textSize, const char* s) {
   g_canvas->print(s);
 }
 
-// Paint the "scan to join Wi-Fi" screen.// Layout (240×280): big QR with current SSID and password below.
+// Paint the "scan to join Wi-Fi" screen.
+// Layout (240x280): big QR with instruction line and current credentials
+// below. DSGN-6: previously the SSID/password were 8 px tall and there was
+// no explanation of what the QR was for. QR module count is fixed (v4-M @
+// scale 6 = 198 px, near the safe encoding limit for the ricmoo/QRCode
+// library -- see PROJECT-HISTORY D17), so we hold the QR size constant
+// and repurpose the space around it.
 //
-//   y=30  WIFI QR scale 6 (198×198) at x=21 (ends y=228)
-//   y=244 current SSID
-//   y=260 current password
+//   y=6    WIFI QR scale 6 (198x198) at x=21 (ends y=204)
+//   y=210  size 1 "Scan to join Wi-Fi" instruction
+//   y=224  size 2 (or 1 if it does not fit) current SSID
+//   y=246  size 2 (or 1 if it does not fit) pw:<current password>
 //
 // Buffer size: version 4 needs ~150 B; 200 is comfortable headroom.
 static void drawQrScreenWifi() {
@@ -9412,11 +9642,12 @@ static void drawQrScreenWifi() {
   qrcode_initText(&wifiQr, wifiBuf, kQrWifiVersion, ECC_MEDIUM, wifiPayload);
   const int16_t px = static_cast<int16_t>(wifiQr.size * kQrWifiPixelScale);
   const int16_t x  = static_cast<int16_t>((kScreenW - px) / 2);
-  const int16_t y  = 30;
+  const int16_t y  = 6;
   drawQrToCanvas(&wifiQr, x, y, kQrWifiPixelScale);
 
-  qrCenterText(/*y=*/244, /*size=*/1, credentials.ssid);
-  qrCenterText(/*y=*/260, /*size=*/1, passwordLabel);
+  qrCenterText(/*y=*/210, /*size=*/1, "Scan to join Wi-Fi");
+  qrCenterTextFit(/*y=*/224, credentials.ssid);
+  qrCenterTextFit(/*y=*/246, passwordLabel);
   secureZero(wifiBuf, sizeof(wifiBuf));
   secureZero(passwordLabel, sizeof(passwordLabel));
   secureZero(wifiPayload, sizeof(wifiPayload));
@@ -9597,12 +9828,71 @@ static void drawEstablishingScreen() {
   qrCenterTextDark(/*y=*/145, /*size=*/2, "Server...");
 }
 
+// DSGN-13: give the "Establishing Server..." splash a progress signal so
+// a stall is distinguishable from normal startup. Two changes:
+//
+//   1. A row of three dots animates left-to-right at ~4 Hz so the operator
+//      can tell the LCD is being serviced (not that we've frozen behind a
+//      blocking WiFi call).
+//   2. An "elapsed X.Y s" line ticks up so the operator can gauge how far
+//      into the 10 s safety window we are.
+//
+// Called from the ORS_WIFI_BOOT pump in overrideTick(). Only redraws the
+// progress strip (y=170..240) -- the "Establishing Server..." headline
+// painted by drawEstablishingScreen() stays put.
+static uint32_t g_orEstablishAnimNextMs = 0;
+static uint8_t  g_orEstablishAnimPhase  = 0;
+
+static void tickEstablishingScreen(uint32_t now) {
+  if (g_canvas == nullptr) return;
+  if (g_lcdMode != LCD_MODE_ESTABLISHING) return;
+  if (static_cast<int32_t>(now - g_orEstablishAnimNextMs) < 0) return;
+  g_orEstablishAnimNextMs = now + 250;                    // 4 Hz update
+  g_orEstablishAnimPhase  = static_cast<uint8_t>((g_orEstablishAnimPhase + 1) % 4);
+
+  // Clear the progress strip (y=170..240) so old dots/elapsed text vanish.
+  const int16_t stripY = 170;
+  const int16_t stripH = 240 - stripY;
+  g_canvas->fillRect(0, stripY, kScreenW, stripH, 0x0000);
+
+  // Dot row centred at y=180. Draw three dots; light up 0..3 filled based
+  // on phase. 12 px diameter, 24 px pitch -> 3 dots span 60 px, centred.
+  const int16_t dotY = stripY + 20;
+  const int16_t dotR = 6;
+  const int16_t pitch = 24;
+  const int16_t totalW = pitch * 2;                       // 2 gaps between 3 dots
+  const int16_t startX = static_cast<int16_t>((kScreenW - totalW) / 2);
+  for (uint8_t i = 0; i < 3; ++i) {
+    const int16_t cx = static_cast<int16_t>(startX + i * pitch);
+    if (i < g_orEstablishAnimPhase) {
+      g_canvas->fillCircle(cx, dotY, dotR, kQrWhite);
+    } else {
+      g_canvas->drawCircle(cx, dotY, dotR, kQrWhite);
+    }
+  }
+
+  // Elapsed seconds at y=220 size 1.
+  const uint32_t elapsedMs = now - g_orStateEnterMs;
+  char elapsedLabel[24];
+  snprintf(elapsedLabel, sizeof(elapsedLabel), "elapsed %lu.%01lu s",
+           static_cast<unsigned long>(elapsedMs / 1000U),
+           static_cast<unsigned long>((elapsedMs / 100U) % 10U));
+  qrCenterTextDark(/*y=*/220, /*size=*/1, elapsedLabel);
+
+  // Push only the strip we touched.
+  pushCanvasRectToLcd(0, stripY, kScreenW, stripH);
+}
+
 // Switch into "Establishing Server..." mode. Idempotent.
 static void enterLcdEstablishingMode() {
   if (g_lcdMode == LCD_MODE_ESTABLISHING) return;
   drawEstablishingScreen();
   pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
   g_lcdMode = LCD_MODE_ESTABLISHING;
+  // DSGN-13: reset animation state so tickEstablishingScreen() fires
+  // immediately on the next overrideTick.
+  g_orEstablishAnimNextMs = 0;
+  g_orEstablishAnimPhase  = 0;
   Serial.println(F("lcd: -> ESTABLISHING"));
 }
 
@@ -10110,6 +10400,10 @@ void overrideLoop() {
           !g_apExpectedStopPending.load(std::memory_order_acquire)) {
         startWifiServer();
       }
+      // DSGN-13: animate the "Establishing Server..." splash so a stall
+      // reads as different from normal startup. Cheap: only touches a
+      // 70 px-tall strip below the headline.
+      tickEstablishingScreen(now);
       // Wait for AP IP. esp_wifi typically gives us a real IP within 200-500 ms;
       // safety abort at kOrWifiBootMaxMs (10 s).
       IPAddress ip = WiFi.softAPIP();
@@ -10346,6 +10640,24 @@ void setup() {
   pinMode(BOOST_EN_GPIO, OUTPUT);
   pinMode(kServoRightPin, OUTPUT);
   pinMode(kServoLeftPin, OUTPUT);
+  // READ-10: SYS_EN bookend. This looks like three lines that do the
+  // same thing; they do not. The pin is wired to the latch that keeps the
+  // power controller enabled -- if it goes LOW even for a few micro-
+  // seconds during boot, the whole board self-latches OFF and you have
+  // to press PWR again. Sequence, from the outside in:
+  //   digitalWrite(SYS_EN, HIGH)  -- set the OUTPUT latch register to
+  //     HIGH BEFORE we tell the GPIO matrix this pin is an output. On
+  //     ESP32-S3 the pinMode() call that follows reconfigures the pin's
+  //     matrix routing, and if the output latch was still 0 (the reset
+  //     default) there is a brief window where the pin drives LOW as
+  //     soon as it becomes an output. Pre-loading HIGH closes that
+  //     window.
+  //   pinMode(SYS_EN, OUTPUT)     -- flip the pin to push-pull output.
+  //   digitalWrite(SYS_EN, HIGH)  -- re-assert HIGH after the mode change
+  //     as belt-and-braces, since pinMode() has historically clobbered
+  //     the level on some IDF revisions. This is the visible ON assert.
+  // DO NOT collapse these three lines. The battery latch depends on them
+  // and a "clean up" here means the robot cannot boot from the PWR button.
   digitalWrite(SYS_EN, HIGH);
   pinMode(SYS_EN, OUTPUT);
   digitalWrite(SYS_EN, HIGH);
@@ -10732,7 +11044,12 @@ void loop() {
     pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
     g_forceFullPush = false;
     g_forceEyeRedraw = false;
-    // Re-overlay battery meter on top of full repaint
+    // Re-overlay battery meter on top of full repaint.
+    // PERF-2: a full push is usually driven by a mode change that also
+    // repaints the mascot background, which clobbers the meter strip in
+    // canvas. Invalidate so drawBatteryMeter() re-renders unconditionally
+    // here even if the numeric content has not changed.
+    g_batStripCanvasFresh = false;
     if (g_batSeeded) drawBatteryMeter();
   } else if (g_forceEyeRedraw) {
     breadcrumb(kCrumbLoopPush, 2);
@@ -10740,6 +11057,10 @@ void loop() {
     g_forceEyeRedraw = false;
     // Eye region may extend up into the meter strip
     if (g_batSeeded && rectTouchesBatStrip(g_eyeRegionY, g_eyeRegionH)) {
+      // PERF-2: the eye region overlapped the strip, so canvas strip is
+      // eye pixels right now. Invalidate so drawBatteryMeter() knows to
+      // rebuild the strip rather than short-circuit on unchanged data.
+      g_batStripCanvasFresh = false;
       drawBatteryMeter();
     }
   }
@@ -10772,6 +11093,9 @@ void loop() {
     // Expressive-mood eyes (SURPRISED/SCARED) animate up
     // into the meter strip; repaint the meter so it stays on top.
     if (g_batSeeded && rectTouchesBatStrip(dirtyY, dirtyH)) {
+      // PERF-2: eye dirty rect overlapped the strip, canvas strip is
+      // eye pixels now -- invalidate so drawBatteryMeter() rebuilds.
+      g_batStripCanvasFresh = false;
       drawBatteryMeter();
     }
   }
