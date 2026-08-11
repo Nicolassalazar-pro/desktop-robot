@@ -159,6 +159,45 @@ RTC_NOINIT_ATTR uint32_t g_crumbMagic;RTC_NOINIT_ATTR uint32_t g_crumbPhase;
 RTC_NOINIT_ATTR uint32_t g_crumbDetail;
 RTC_NOINIT_ATTR uint32_t g_crumbSeq;
 
+// ---------------------------------------------------------------------------
+// Stall forensics. RTC memory, because the event we are hunting RESETS THE
+// BOARD -- anything in normal RAM dies with it, and the serial line is exactly
+// what we cannot trust (a full CDC FIFO was itself a stall cause once).
+//
+// The open question: a TASK_WDT fired with the breadcrumb at "loop: touch
+// poll", meaning the loop task entered g_orTouch.control() and never reached
+// the next crumb. But the watchdog only proves the loop went 5 s without being
+// fed; it does not prove WHERE the time went. These counters answer that.
+//
+// Recording BOTH the touch-poll worst case and the whole-loop worst case is the
+// point. If they track each other, the touch poll is the stall. If the loop max
+// is far larger than the touch max, the time is going somewhere else entirely
+// and the touch breadcrumb was just the last one written before the reset --
+// which is precisely how the earlier "websocket frame" crumb misled us.
+//
+// Microseconds, because the interesting range spans a 50 ms I2C timeout, a
+// 120 ms chip reset, and a 5 s watchdog.
+RTC_NOINIT_ATTR uint32_t g_rtcStallMagic;
+RTC_NOINIT_ATTR uint32_t g_rtcTouchMaxUs;      // worst g_orTouch.control()
+RTC_NOINIT_ATTR uint32_t g_rtcTouchSlowCount;  // calls over kStallWarnUs
+RTC_NOINIT_ATTR uint32_t g_rtcLoopMaxUs;       // worst whole loop() pass
+RTC_NOINIT_ATTR uint32_t g_rtcLoopMaxPhase;    // crumb phase during that pass
+constexpr uint32_t kStallMagic  = 0x5A11EDU;
+constexpr uint32_t kStallWarnUs = 20000U;      // 20 ms: well past a healthy poll
+
+inline void stallStatsReset() {
+  g_rtcStallMagic     = kStallMagic;
+  g_rtcTouchMaxUs     = 0;
+  g_rtcTouchSlowCount = 0;
+  g_rtcLoopMaxUs      = 0;
+  g_rtcLoopMaxPhase   = 0;
+}
+inline void stallStatsInitIfCold() {
+  if (g_rtcStallMagic != kStallMagic) {
+    stallStatsReset();
+  }
+}
+
 inline void breadcrumb(uint32_t phase, uint32_t detail = 0) {
   g_crumbMagic = kCrumbMagic;
   g_crumbPhase = phase;
@@ -3725,6 +3764,16 @@ void cmdCrash(char* argument) {
     return;
   }
   nvs_handle_t handle = 0;
+  // Stall timings live in RTC memory, not NVS, so they are worth printing even
+  // when no crash record exists -- they describe the CURRENT uptime and are the
+  // main readout while hunting the touch-poll stall.
+  Serial.printf(
+      "stall: touch max %lu us, slow(>%lu us) %lu | loop max %lu us in \"%s\"\n",
+      static_cast<unsigned long>(g_rtcTouchMaxUs),
+      static_cast<unsigned long>(kStallWarnUs),
+      static_cast<unsigned long>(g_rtcTouchSlowCount),
+      static_cast<unsigned long>(g_rtcLoopMaxUs),
+      crumbName(g_rtcLoopMaxPhase));
   if (nvs_open("crashlog", NVS_READONLY, &handle) != ESP_OK) {
     Serial.println(F("crash: none recorded"));
     return;
@@ -10616,7 +10665,7 @@ void overrideLoop() {
         const int32_t ageMs =
             static_cast<int32_t>(now - g_lastControlEventMs);
         if (serialCanWrite())
-        Serial.printf("diag: ctrl_rx=%u/s mood_rx=%u/s raw=(%d,%d) effective=(%d,%d) requestedUs=(%u,%u) readbackUs=(%u,%u) ageMs=%lu rail=%u outputValid=%u session=%s cal=%s wsClients=%u touchEvts=%u\n",
+        Serial.printf("diag: ctrl_rx=%u/s mood_rx=%u/s raw=(%d,%d) effective=(%d,%d) requestedUs=(%u,%u) readbackUs=(%u,%u) ageMs=%lu rail=%u outputValid=%u session=%s cal=%s wsClients=%u touchEvts=%u touchMaxUs=%lu loopMaxUs=%lu\n",
             static_cast<unsigned>(g_diagCtrlRx),
             static_cast<unsigned>(g_diagMoodRx),
             static_cast<int>(g_lastRawDriveL),
@@ -10639,7 +10688,13 @@ void overrideLoop() {
             g_driveCalibration.eligible() ? "ELIGIBLE" : "LOCKED",
             static_cast<unsigned>(
                 g_wsTransportOpenCount.load(std::memory_order_acquire)),
-            static_cast<unsigned>(g_orTouchEventCount));
+            static_cast<unsigned>(g_orTouchEventCount),
+            static_cast<unsigned long>(g_rtcTouchMaxUs),
+            static_cast<unsigned long>(g_rtcLoopMaxUs));
+        // Outside the serialCanWrite() guard on purpose: these are per-SECOND
+        // rates, so they must reset whether or not the line was printable. If
+        // they only reset when the FIFO had room, a congested link would make
+        // them read as a rising total and misreport the traffic rate.
         g_diagCtrlRx = 0;
         g_diagMoodRx = 0;
       }
@@ -10779,6 +10834,19 @@ void setup() {
                     static_cast<unsigned long>(g_crumbPhase),
                     static_cast<unsigned long>(g_crumbDetail),
                     static_cast<unsigned long>(g_crumbSeq));
+      // Stall timings from the run that just died. Printed HERE, before setup
+      // starts writing its own, because these are the numbers that say whether
+      // the breadcrumb above named the real culprit or merely the last task to
+      // touch it.
+      if (g_rtcStallMagic == kStallMagic) {
+        Serial.printf(
+            "boot: stall stats from the failed run -- touch max %lu us, "
+            "slow %lu, loop max %lu us in \"%s\"\n",
+            static_cast<unsigned long>(g_rtcTouchMaxUs),
+            static_cast<unsigned long>(g_rtcTouchSlowCount),
+            static_cast<unsigned long>(g_rtcLoopMaxUs),
+            crumbName(g_rtcLoopMaxPhase));
+      }
       // Persist it. The RTC crumb is overwritten within milliseconds by this
       // very boot (setup writes one), so unless it is snapshotted here the
       // evidence is gone before anyone can ask for it -- which is exactly what
@@ -10823,6 +10891,11 @@ void setup() {
                   static_cast<unsigned long>(ESP.getMaxAllocHeap()),
                   static_cast<unsigned long>(ESP.getFreePsram()));
   }
+  // Start each run with fresh maxima, but only AFTER the failed run's numbers
+  // have been printed above. A cold boot seeds them; a reset clears them so the
+  // next figure describes the next run rather than the whole power-on lifetime.
+  stallStatsInitIfCold();
+  stallStatsReset();
   // Logged rather than assumed: if this reads LOW while nobody is touching the
   // button, GPIO40 is floating and the button guard is what stops it being
   // read as a 3-second hold.
@@ -11007,6 +11080,24 @@ void setup() {
 
 void loop() {
   ++g_loopIterations;
+  // Whole-pass timer, paired with the touch-poll timer.
+  //
+  // A watchdog reset proves only that the loop went 5 s unfed; it does not say
+  // where the time went, and the breadcrumb records the last write from ANY
+  // task (which is how "websocket frame" once pointed at AsyncTCP while the
+  // loop was stuck elsewhere). Measuring the whole pass alongside the touch
+  // poll disambiguates it: if the two maxima track, the touch poll IS the
+  // stall; if the loop max is far larger, the time is going somewhere the
+  // breadcrumb never named.
+  static uint32_t s_loopStartUs = 0;
+  if (s_loopStartUs != 0) {
+    const uint32_t passUs = micros() - s_loopStartUs;
+    if (passUs > g_rtcLoopMaxUs) {
+      g_rtcLoopMaxUs    = passUs;
+      g_rtcLoopMaxPhase = g_crumbPhase;
+    }
+  }
+  s_loopStartUs = micros();
   // Push/loop activity at 1 Hz, in EVERY state and before any early return.
   //
   // This is deliberately passive instrumentation. Every "fix" for the black
@@ -11057,8 +11148,29 @@ void loop() {
   // to tell whether the clock fix actually works.
   drainSerial();
   // §16: pump the CST816T (cheap — just reads INT/I2C if pending).
+  //
+  // TIMED, because a TASK_WDT fired with the breadcrumb sitting exactly here.
+  // The measurement is two subtractions and a compare; it cannot itself be the
+  // stall, and it is written to RTC memory so it survives the reset we are
+  // trying to catch.
   breadcrumb(kCrumbLoopTouch);
+  const uint32_t touchStartUs = micros();
   g_orTouch.control();
+  const uint32_t touchUs = micros() - touchStartUs;
+  if (touchUs > g_rtcTouchMaxUs) {
+    g_rtcTouchMaxUs = touchUs;
+  }
+  if (touchUs > kStallWarnUs) {
+    ++g_rtcTouchSlowCount;
+    // Ungated and unthrottled ON PURPOSE. This fires only when a single touch
+    // poll has already burned 20 ms, which by definition is rare -- and if the
+    // board is about to spend 5 s in here, this line is the last thing it will
+    // ever say about why.
+    Serial.printf("STALL touch poll %lu us (max %lu, count %lu)\n",
+                  static_cast<unsigned long>(touchUs),
+                  static_cast<unsigned long>(g_rtcTouchMaxUs),
+                  static_cast<unsigned long>(g_rtcTouchSlowCount));
+  }
   serviceTouchBeep(millis());
   // Pump override HTTP server + drive-watchdog
   breadcrumb(kCrumbLoopOverride);
