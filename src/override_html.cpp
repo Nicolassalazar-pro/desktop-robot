@@ -17,84 +17,133 @@ const char OVERRIDE_HTML[] PROGMEM = R"OD(<!doctype html><html lang=en><head><me
 <meta name=viewport content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
 <title>Override</title>
 <style>
-:root{color-scheme:dark;--bg:#0a0a0a;--surf:#141414;--surf2:#1c1c1c;--text:#f3f3f3;--muted:#9aa0a6;--accent:#1db954;--danger:#ef4444}
+/* Semantic tokens only. Any hex or rgba that appears in a rule below should
+   trace back to one of these — a palette swap should ride a single :root
+   override, not a scattergun edit across the CSS. See DSGN-10. */
+:root{color-scheme:dark;
+  --bg:#0a0a0a;--surf:#141414;--surf2:#1c1c1c;--surf-lo:#0d0d0d;--surf-hi:#1a1a1a;
+  --text:#f3f3f3;--muted:#9aa0a6;--on-accent:#0a0a0a;
+  --accent:#1db954;--accent-lo:#0e5a2a;--accent-hi:#3ad975;
+  --danger:#ef4444;--warn:#d29922;
+  --accent-a12:rgba(29,185,84,.12);--accent-a16:rgba(29,185,84,.16);
+  --accent-a18:rgba(29,185,84,.18);--accent-a45:rgba(29,185,84,.45);
+  --overlay-5:rgba(255,255,255,.05);--overlay-6:rgba(255,255,255,.06);
+  --overlay-10:rgba(255,255,255,.1);--scrim:rgba(0,0,0,.7);--scrim-lo:rgba(0,0,0,.55)}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none}
 html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-user-select:none;user-select:none;overscroll-behavior:none}
 body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
 h1{font:600 18px/1.2 system-ui;letter-spacing:-.02em;margin:0}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);display:inline-block;margin-right:6px;vertical-align:middle;transition:background .18s}
-.dot.live{background:var(--accent);box-shadow:0 0 0 3px rgba(29,185,84,.18)}
+.dot.live{background:var(--accent);box-shadow:0 0 0 3px var(--accent-a18)}
 .badge{display:inline-flex;align-items:center;padding:4px 10px;border-radius:999px;font:600 11px/1.5 system-ui;background:var(--surf2);color:var(--muted)}
-.badge.charging{background:rgba(29,185,84,.16);color:var(--accent)}
+.badge.charging{background:var(--accent-a16);color:var(--accent)}
 .card{background:var(--surf);border:1px solid var(--surf2);border-radius:12px;padding:12px}
 button{appearance:none;border:0;border-radius:8px;font:600 14px/1 system-ui;cursor:pointer;min-height:44px;transition:transform .18s cubic-bezier(.2,.8,.2,1);color:var(--text)}
 button:active{transform:scale(.97)}
-.primary{background:var(--accent);color:#0a0a0a}
+.primary{background:var(--accent);color:var(--on-accent)}
 /* The one dangerous control on the page must not share the colour of every
    positive state (live dot, active mood, battery bar, stick thumbs). STOP
    keeps its unique shape and position and now gets a unique colour too.
    `.stopped` is the latched state: the whole surface reports it, not just
    the button, and it is text-labelled as well as coloured. */
-.danger{background:var(--danger);color:#fff}
+.danger{background:var(--danger);color:var(--text)}
 .dot.stopped{background:var(--danger)}
 body.stopped .stick-pad,body.stopped .vstick{opacity:.45;filter:grayscale(1)}
-body.stopped .stopBig{outline:2px solid #fff;outline-offset:-4px}
+body.stopped .stopBig{outline:2px solid var(--text);outline-offset:-4px}
 .ghost{background:transparent;color:var(--text);border:1px solid var(--surf2)}
 .bigV{font:600 24px/1 system-ui;letter-spacing:-.02em}
 .bigV small{font:500 12px/1 system-ui;color:var(--muted);margin-left:2px}
 .pct{font:600 13px/1 system-ui;color:var(--muted)}
 .bar{height:4px;background:var(--surf2);border-radius:2px;margin-top:8px;overflow:hidden}
-.bar>div{height:100%;background:var(--accent);width:0;transition:width .3s ease}
+.bar>div{height:100%;background:var(--accent);width:0;transition:width .3s ease,background .18s}
+/* DSGN-5, DSGN-9: state must never be conveyed by colour alone. The battery
+   badge grows a leading "!" glyph when we drop below the danger threshold, so
+   a monochrome screenshot or a colour-blind operator still reads "low". */
+body.batLow .pct::before{content:"! ";color:var(--danger);font-weight:800}
+body.batLow #chg{border:1px solid var(--danger)}
 .battline{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
-.faces{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
-.face{appearance:none;background:var(--surf2);border:1px solid transparent;color:var(--text);border-radius:8px;padding:8px 4px;font:500 11px/1.2 system-ui;text-transform:lowercase;cursor:pointer;min-height:38px;transition:border-color .18s,background .18s}
-.face.active{border-color:var(--accent);background:rgba(29,185,84,.12);color:var(--accent)}
-.stick-pad{position:relative;background:radial-gradient(circle at center,#1a1a1a 0%,#0d0d0d 70%);border:1px solid var(--surf2);border-radius:50%;touch-action:none;overflow:hidden}
-.stick-pad::before{content:"";position:absolute;inset:8px;border-radius:50%;border:1px dashed rgba(255,255,255,.06);pointer-events:none}
-.thumb{position:absolute;width:64px;height:64px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#3ad975 0%,#1db954 50%,#0e5a2a 100%);box-shadow:0 6px 18px rgba(29,185,84,.45),inset 0 0 0 1px rgba(255,255,255,.1);left:50%;top:50%;transform:translate(-50%,-50%);transition:transform .14s cubic-bezier(.2,.8,.2,1);pointer-events:none}
+/* Main-view expression row. 44 px min-height clears the Fitts baseline; the
+   sheet override below then becomes decoration, not correction. See DSGN-4.
+   The global lowercase text-transform that used to live here moved down onto
+   `.sheet .face` — the sheet tags (mood/gesture/sound) still read best
+   lowercase, but the main-view buttons are named actions and should stay
+   capitalised as written. See DSGN-12. */
+.faces{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.face{appearance:none;background:var(--surf2);border:1px solid transparent;color:var(--text);border-radius:8px;padding:10px 4px;font:500 12px/1.2 system-ui;cursor:pointer;min-height:44px;transition:border-color .18s,background .18s}
+/* Active-mood state carries shape (leading dot) + weight, in addition to
+   colour. Colour-blind and printed-monochrome operators can still read
+   which mood is active. See DSGN-5. */
+.face.active{border-color:var(--accent);background:var(--accent-a12);color:var(--accent);font-weight:700}
+.face.active::before{content:"\25CF\00a0";color:var(--accent)}
+.stick-pad{position:relative;background:radial-gradient(circle at center,var(--surf-hi) 0%,var(--surf-lo) 70%);border:1px solid var(--surf2);border-radius:50%;touch-action:none;overflow:hidden}
+.stick-pad::before{content:"";position:absolute;inset:8px;border-radius:50%;border:1px dashed var(--overlay-6);pointer-events:none}
+.thumb{position:absolute;width:64px;height:64px;border-radius:50%;background:radial-gradient(circle at 35% 35%,var(--accent-hi) 0%,var(--accent) 50%,var(--accent-lo) 100%);box-shadow:0 6px 18px var(--accent-a45),inset 0 0 0 1px var(--overlay-10);left:50%;top:50%;transform:translate(-50%,-50%);transition:transform .14s cubic-bezier(.2,.8,.2,1);pointer-events:none}
 .stick-pad.live .thumb{transition:none}
-.vstick{position:relative;background:linear-gradient(180deg,#161616,#0d0d0d);border:1px solid var(--surf2);border-radius:16px;touch-action:none;overflow:hidden;flex:1;min-height:0}
-.vstick::before{content:"";position:absolute;left:50%;top:8px;bottom:8px;width:4px;background:rgba(255,255,255,.05);border-radius:2px;transform:translateX(-50%);pointer-events:none}
-.vstick::after{content:"";position:absolute;left:8px;right:8px;top:50%;height:1px;background:rgba(255,255,255,.06);pointer-events:none}
-.vthumb{position:absolute;left:50%;top:50%;width:64px;height:64px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#3ad975 0%,#1db954 50%,#0e5a2a 100%);box-shadow:0 6px 18px rgba(29,185,84,.45),inset 0 0 0 1px rgba(255,255,255,.1);transform:translate(-50%,-50%);transition:transform .14s cubic-bezier(.2,.8,.2,1);pointer-events:none}
+.vstick{position:relative;background:linear-gradient(180deg,var(--surf-hi),var(--surf-lo));border:1px solid var(--surf2);border-radius:16px;touch-action:none;overflow:hidden;flex:1;min-height:0}
+.vstick::before{content:"";position:absolute;left:50%;top:8px;bottom:8px;width:4px;background:var(--overlay-5);border-radius:2px;transform:translateX(-50%);pointer-events:none}
+.vstick::after{content:"";position:absolute;left:8px;right:8px;top:50%;height:1px;background:var(--overlay-6);pointer-events:none}
+.vthumb{position:absolute;left:50%;top:50%;width:64px;height:64px;border-radius:50%;background:radial-gradient(circle at 35% 35%,var(--accent-hi) 0%,var(--accent) 50%,var(--accent-lo) 100%);box-shadow:0 6px 18px var(--accent-a45),inset 0 0 0 1px var(--overlay-10);transform:translate(-50%,-50%);transition:transform .14s cubic-bezier(.2,.8,.2,1);pointer-events:none}
 .vstick.live .vthumb{transition:none}
 .vlabel{position:absolute;left:50%;transform:translateX(-50%);font:700 9px/1 system-ui;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);pointer-events:none}
 .vlabel.top{top:8px}
 .vlabel.bot{bottom:8px}
-.vval{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);font:600 14px/1 system-ui;color:var(--muted);font-variant-numeric:tabular-nums;pointer-events:none}
+.vval{position:absolute;left:50%;bottom:24px;transform:translateX(-50%);font:600 14px/1 system-ui;color:var(--muted);font-variant-numeric:tabular-nums;pointer-events:none}
+/* Drive-state overlay. This is the fix for DSGN-3: the operator is looking
+   at their thumb, not the header pill, so the pad has to carry the mode.
+   `paintDriveState()` sets `.stateLbl` textContent for LOCKED, WAIT NEUTRAL,
+   SAFE OFF, LINK STALE, STOPPED, and "reconnecting…" for a down socket,
+   then toggles `.on` on the label. When drive is ARMED and the link is up
+   the label is empty and hidden - the pad is fully live. */
+.stateLbl{position:absolute;inset:0;display:none;align-items:center;justify-content:center;padding:8px;background:var(--scrim-lo);color:var(--text);font:700 12px/1.2 system-ui;text-transform:uppercase;letter-spacing:.06em;text-align:center;border-radius:inherit;pointer-events:none}
+.stateLbl.on{display:flex}
+body[data-drive="LOCKED"] .stick-pad,body[data-drive="LOCKED"] .vstick,
+body[data-drive="WAIT NEUTRAL"] .stick-pad,body[data-drive="WAIT NEUTRAL"] .vstick,
+body[data-link="down"] .stick-pad,body[data-link="down"] .vstick{opacity:.55}
+body[data-drive="LOCKED"] .thumb,body[data-drive="LOCKED"] .vthumb,
+body[data-drive="WAIT NEUTRAL"] .thumb,body[data-drive="WAIT NEUTRAL"] .vthumb,
+body[data-link="down"] .thumb,body[data-link="down"] .vthumb{background:var(--surf2);box-shadow:none}
 .subhead{font:600 11px/1 system-ui;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin:0 0 8px}
 /* NOTE: `up` is still used by the .sheet panel animation below. The #hint
    rules that also used it were removed - no #hint element exists. */
 @keyframes up{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-.sheet{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:30;display:none;align-items:flex-end;justify-content:center}
+.sheet{position:fixed;inset:0;background:var(--scrim);z-index:30;display:none;align-items:flex-end;justify-content:center}
 .sheet.show{display:flex}
 .sheet .p{background:var(--surf);border-radius:16px 16px 0 0;width:100%;max-width:520px;padding:16px;padding-bottom:max(16px,env(safe-area-inset-bottom));animation:up .24s cubic-bezier(.2,.8,.2,1)}
 .sheet .faces{grid-template-columns:repeat(4,1fr);gap:8px}
-.sheet .face{min-height:48px;font-size:12px}
-.sheet .x{margin-top:10px;width:100%;background:var(--surf2)}
+/* Mood tags and audition names (happy/sad/curious…) read best in lowercase.
+   Scoped here rather than globally so the main-view Face…/Sound…/Move…
+   buttons keep the capitalisation their labels were typed with. DSGN-12. */
+.sheet .face{min-height:48px;font-size:12px;text-transform:lowercase}
+.sheet .x{margin-top:12px;width:100%;background:var(--surf2)}
 /* Tap confirmation. Faces show selection via .active, but a sound or a
    movement leaves no visible state behind, so without this a tap looks like
-   nothing happened — the robot responds a beat later, off-screen. */
-.face.picked{background:var(--accent);color:#0a0a0a}
-.sheet .hint{margin:10px 0 0;font-size:12px;color:var(--muted);text-align:center}
+   nothing happened - the robot responds a beat later, off-screen. Only ever
+   applied to the sheet audition grids, never the main-view opener row -
+   that would mean "the robot did something" when nothing but a sheet had
+   opened. See sheetGrid vs nameGrid, and DSGN-11. */
+.face.picked{background:var(--accent);color:var(--on-accent)}
+.sheet .hint{margin:12px 0 0;font-size:12px;color:var(--muted);text-align:center}
 @media (orientation:portrait){
   body{overflow:auto;min-height:100vh}
-  .grid{display:flex;flex-direction:column;gap:10px;padding:12px;max-width:520px;margin:0 auto}
+  .grid{display:flex;flex-direction:column;gap:12px;padding:12px;max-width:520px;margin:0 auto}
   .tank{display:none!important}
-  .joy-card{display:flex;flex-direction:column;align-items:center;gap:10px}
+  .joy-card{display:flex;flex-direction:column;align-items:center;gap:8px}
   .joy-card .stick-pad{width:min(86vw,360px);aspect-ratio:1/1}
-  .joy-vals{display:flex;gap:18px;color:var(--muted);font:600 13px/1 system-ui;font-variant-numeric:tabular-nums}
+  .joy-vals{display:flex;gap:16px;color:var(--muted);font:600 13px/1 system-ui;font-variant-numeric:tabular-nums}
   .header-l{display:flex;justify-content:space-between;align-items:baseline}
   .battline .pct,.battline .badge{margin-left:auto}
   .stopBig{width:100%;padding:16px 12px;font-size:17px}
 }
 @media (orientation:landscape){
   html,body{overflow:hidden;height:100vh;height:100dvh}
+  /* Landscape uses a deliberately tight 6/6 spacing budget - the three
+     columns plus a full-width STOP bar must fit on a 360x160 phone in
+     landscape without introducing scroll. Off-scale by design; see DSGN-14. */
   .grid{display:grid;grid-template-columns:1.05fr 1.3fr 1.05fr;grid-template-rows:1fr auto;gap:6px;padding:6px;height:100%}
   .joy-card{display:none!important}
   .tank{display:flex;flex-direction:column;min-height:0}
-  .center{display:flex;flex-direction:column;gap:6px;min-height:0;overflow:hidden}
-  .center .card{padding:10px}
+  .center{display:flex;flex-direction:column;gap:8px;min-height:0;overflow:hidden}
+  .center .card{padding:12px}
   /* STOP is the emergency control, so it spans the full width under all three
      columns rather than sitting in the centre column. Fitts: the widest target
      on screen, and always in the same place regardless of orientation. */
@@ -110,6 +159,7 @@ body.stopped .stopBig{outline:2px solid #fff;outline-offset:-4px}
       <div class="vthumb"></div>
       <span class="vval" id="VLv">0</span>
       <span class="vlabel bot">L REV</span>
+      <span class="stateLbl" aria-live="polite"></span>
     </div>
   </div>
   <div class="center">
@@ -117,7 +167,7 @@ body.stopped .stopBig{outline:2px solid #fff;outline-offset:-4px}
     <div class="card"><div class="battline"><div class="bigV"><span id="dsp">--</span><small>V</small></div><div class="pct"><span id="pct">--</span>%</div><span class="badge" id="chg">--</span></div><div class="bar"><div id="pctbar"></div></div></div>
     <div class="joy-card card">
       <p class="subhead">Joystick · drag to drive</p>
-      <div class="stick-pad" id="JOY"><div class="thumb"></div></div>
+      <div class="stick-pad" id="JOY"><div class="thumb"></div><span class="stateLbl" aria-live="polite"></span></div>
       <div class="joy-vals"><span>L <span id="JLv">0</span></span><span>R <span id="JRv">0</span></span></div>
     </div>
     <div class="card">
@@ -131,6 +181,7 @@ body.stopped .stopBig{outline:2px solid #fff;outline-offset:-4px}
       <div class="vthumb"></div>
       <span class="vval" id="VRv">0</span>
       <span class="vlabel bot">R REV</span>
+      <span class="stateLbl" aria-live="polite"></span>
     </div>
   </div>
   <button class="danger stopBig" onclick="stopAll()">STOP</button>
@@ -159,7 +210,24 @@ function paintLink(){const d=$('dot'),t=$('linkT');d.classList.toggle('live',lin
   /* STOPPED outranks link state in the pill: while latched, that is the single
      most important thing on screen. Shown as text, not colour alone. */
   t.textContent=stopLatched?'STOPPED · tap a stick to resume':(linkLive?'live · '+driveStatus:'connecting · '+driveStatus);
-  document.body.classList.toggle('stopped',stopLatched)}
+  document.body.classList.toggle('stopped',stopLatched);
+  /* DSGN-3: pad-visible state. `data-drive` and `data-link` gate the CSS
+     that dims the pads and greys the thumbs; `paintDriveState()` writes the
+     matching text into the .stateLbl overlays inside each stick, so the
+     operator sees the mode without having to look at the header pill. */
+  document.body.dataset.drive=driveStatus;
+  document.body.dataset.link=linkLive?'live':'down';
+  paintDriveState()}
+function paintDriveState(){
+  let msg='';
+  if(stopLatched)msg='STOPPED · tap to resume';
+  else if(!linkLive)msg='reconnecting…';
+  else if(driveStatus==='LOCKED')msg='LOCKED';
+  else if(driveStatus==='WAIT NEUTRAL')msg='centre stick';
+  else if(driveStatus==='SAFE OFF')msg='SAFE OFF';
+  else if(driveStatus==='LINK STALE')msg='LINK STALE';
+  document.querySelectorAll('.stateLbl').forEach(el=>{el.textContent=msg;el.classList.toggle('on',!!msg)});
+}
 function setLink(live){linkLive=live;paintLink()}
 function setDriveStatus(eligible,state){driveStatus=!eligible?'LOCKED':state===1?'WAIT NEUTRAL':state>=2&&state<=4?'ARMED':'SAFE OFF';paintLink()}
 function bGrid(host,ids){host.innerHTML='';ids.forEach(id=>{const m=MOODS.find(x=>x[0]===id);if(!m)return;const b=document.createElement('button');b.className='face';b.textContent=m[1];b.dataset.id=id;b.onclick=()=>sendMood(id);host.appendChild(b)})}
@@ -207,7 +275,14 @@ function openWs(){
     const dsp=v.getUint16(3)/1000,pct=v.getUint8(5),mood=v.getUint8(6),chg=v.getUint8(7);
     $('dsp').textContent=dsp.toFixed(2);
     $('pct').textContent=pct;
-    $('pctbar').style.width=pct+'%';
+    const bar=$('pctbar');
+    bar.style.width=pct+'%';
+    /* DSGN-9: three-level battery ramp with a matching non-colour cue.
+       The bar changes hue; the badge grows a leading "!" so a colour-blind
+       or monochrome reader still sees "low". Amber warn tone is out of the
+       accent palette on purpose - a low battery is not part of the brand. */
+    bar.style.background=pct<15?'var(--danger)':pct<30?'var(--warn)':'var(--accent)';
+    document.body.classList.toggle('batLow',pct<15);
     const c=$('chg');c.textContent=chg?'charging':'unplugged';c.classList.toggle('charging',!!chg);
     if(mood!==curMood)paintFace(mood);
     setDriveStatus(!!v.getUint8(8),v.getUint8(9));
@@ -339,7 +414,13 @@ function sendMood(id){paintFace(id);send3(OP_MOOD,id)}
 function sendSound(id){send3(OP_SOUND,id)}
 function sendMove(id){send3(OP_GESTURE,id)}
 function flashPick(host,i){const b=host.children[i];if(!b)return;b.classList.add('picked');setTimeout(()=>b.classList.remove('picked'),260)}
+/* nameGrid stays on the audition sheets where a tap MEANS "the robot did
+   something" - the pick flash confirms exactly that. sheetGrid drops the
+   flash for the main-view opener row: those buttons only open a picker,
+   and reusing the audition-confirm flash there taught the operator to
+   read the flash as meaningless. See DSGN-11. */
 function nameGrid(host,names,fn){host.innerHTML='';names.forEach((n,i)=>{const b=document.createElement('button');b.className='face';b.textContent=n;b.onclick=()=>{flashPick(host,i);fn(i)};host.appendChild(b)})}
+function sheetGrid(host,names,fn){host.innerHTML='';names.forEach((n,i)=>{const b=document.createElement('button');b.className='face';b.textContent=n;b.onclick=()=>fn(i);host.appendChild(b)})}
 function openMoods(){bGrid($('allF'),MOODS.map(m=>m[0]));paintFace(curMood);$('moodM').classList.add('show')}
 function closeMoods(){$('moodM').classList.remove('show')}
 function openSounds(){nameGrid($('allS'),SOUNDS,sendSound);$('sndM').classList.add('show')}
@@ -348,8 +429,9 @@ function openMoves(){nameGrid($('allM'),MOVES,sendMove);$('movM').classList.add(
 function closeMoves(){$('movM').classList.remove('show')}
 /* One button per expression CHANNEL. Each opens its own picker, so a face, a
    sound and a movement can be auditioned independently while the vocabulary
-   is still being decided. */
-nameGrid($('expF'),['Faces','Sounds','Movement'],i=>[openMoods,openSounds,openMoves][i]());
+   is still being decided. Labels are named actions ending in "…" to signal
+   that a tap opens a picker rather than firing an expression. DSGN-12. */
+sheetGrid($('expF'),['Face…','Sound…','Move…'],i=>[openMoods,openSounds,openMoves][i]());
 openWs();paintVals();
 </script>
 </body></html>

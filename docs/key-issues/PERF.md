@@ -1,6 +1,8 @@
 ## Performance [PERF]
 
 > Reviewer: perf-review agent (embedded-translated scope)
+> Last reviewed: 2026-08-07 | **Revised 2026-08-11**
+> Open: 6 (PERF-2..6) | Fixed: 1 (PERF-1, commit `9fc63c8`) | Informational: 2 (PERF-7 documented cost, PERF-9 documented bound) | Verified: 1 (PERF-8)
 > Scope: ESP32-S3R8 firmware — render/loop hot path, memory footprint, bus contention, task starvation.
 > Read-only pass. No source changes. Costs tagged **measured / calculated / estimated** with arithmetic.
 > Baseline: 240×280 ST7789V2 @ 40 MHz SPI, full-screen push = 32.5 ms (HARDWARE.md), 50 fps animating / 15 fps idle, loop 850–890 iter/s, WDT 5 s, drive lease 300 ms, gyro ~1.0 ms mean sample interval.
@@ -10,9 +12,8 @@
 ---
 
 ### PERF-1 — 45 KB of internal RAM locked up by `g_eyeRegionBackup` for a feature that is OFF by default
-
-- Severity: CRITICAL (memory footprint)
-- Status: Open
+- Severity: HIGH
+- Status: **FIXED (commit `9fc63c8`).** `g_eyeRegionBackup` is now `nullptr` at declaration (`src/main.cpp:1074`) and lazily allocated via `ps_malloc` at the first frame that actually needs it (`src/main.cpp:2277`), moving the buffer out of internal RAM into PSRAM and out of the always-on cost path — 45 KB of internal RAM returned, feature intact when enabled.
 - File: `src/main.cpp:1068` (declaration), `src/main.cpp:242-253` (size constants), `src/main.cpp:5189-5192` (only real caller)
 - Problem:
   ```

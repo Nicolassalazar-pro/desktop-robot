@@ -1,1 +1,10 @@
-{"name": "EyeEngine", "version": "0.1.0", "frameworks": "arduino", "platforms": "espressif32", "dependencies": {"moononournation/GFX Library for Arduino": "*"}}
+{
+    "name": "EyeEngine",
+    "version": "0.1.0",
+    "frameworks": "arduino",
+    "platforms": "espressif32",
+    "description": "In-tree eye rendering engine. GFX is pinned to the exact version the root platformio.ini pins (1.3.9) — do NOT widen this. GFX 1.4.x requires ESP32-Arduino v3.x, which espressif32@7.0.1 (Arduino-ESP32 v2.x) does not ship. See platformio.ini and docs/HARDWARE.md. If a future contributor bumps this to a wildcard or a 1.4.x range, the root pin currently wins under LDF, but any change to lib_ldf_mode / resolver precedence would silently pull in 1.4.x and break the build with obscure Arduino-ESP32 v3 API errors.",
+    "dependencies": {
+        "moononournation/GFX Library for Arduino": "1.3.9"
+    }
+}

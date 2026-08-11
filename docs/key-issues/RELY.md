@@ -1,11 +1,13 @@
 ## Reliability [RELY]
 
 > Last reviewed: 2026-08-07 | **Revised against hardware evidence: 2026-08-08, 2026-08-11**
-> Open: 3 (RELY-6, the teardown half of RELY-4, and the demo-only note) | Fixed: 4 | Won't fix: 1
+> Open: 1 (RELY-6) | Fixed: 6 (RELY-1, RELY-3, RELY-5, RELY-7, RELY-8, and the reaper half of RELY-4) | Partially fixed: 1 (RELY-4 teardown paths — quarantined by design) | Won't fix: 1 (RELY-2)
 >
 > **2026-08-11 — the loop-task/AsyncTCP defect class is now CLOSED.** RELY-1, RELY-4 and RELY-5 were
 > three faces of one bug: the loop task calling into `AsyncWebSocket`. There are no such calls left
-> in the firmware. The rule below is now enforced everywhere, not aspirational.
+> in the firmware. The rule below is now enforced everywhere, not aspirational. RELY-3, RELY-7 and
+> RELY-8 were closed the same week — a movement-abort atomic, a `WIFI_OFF`-halt-path documentation
+> comment, and a constant-time-compare hardening respectively.
 >
 > **2026-08-08 — read this before acting on any finding below.**
 > A hardware debugging session confirmed some findings, refuted one, and showed that two of the
@@ -70,7 +72,6 @@
 
 ### RELY-2 — `client->close()` calls inside `WS_EVT_CONNECT` retain the INT_WDT crash pattern for non-auth rejection paths
 - Severity: HIGH
-- Status: OPEN
 - File: `src/main.cpp:8679, 8690, 8734, 8756, 8764`
 - Problem: The `WsAuthGuardHandler` at `main.cpp:1595` was added specifically because "closing a
   websocket client from inside its own `WS_EVT_CONNECT` callback" crashed the board with
@@ -109,7 +110,12 @@
 
 ### RELY-3 — A running gesture is not aborted when the drive session is force-reset to `SafeOff`; wheels keep spinning after a WS transport failure
 - Severity: HIGH
-- Status: OPEN
+- Status: **FIXED (2026-08-11, commit `13511b2`).** A `g_movementAbortPending` atomic is set inside
+  `resetDriveControl` (`src/main.cpp:5979`), cleared once handled (`src/main.cpp:6449`), and checked
+  at the top of `serviceMovementGesture` (`src/main.cpp:8256`) — exactly the "signal orthogonal to
+  `session.state()`" the finding proposed. WS queue-overflow and hardware-trip both flow through the
+  same `resetDriveControl`, so all four fault paths named in the finding now cancel a running
+  gesture within one loop tick rather than letting it run to the 8 s pattern cap.
 - File: `src/main.cpp:8084-8110`; contrast with `main.cpp:9314, 9326, 9332`
 - Problem: `serviceMovementGesture` aborts only when the session is in `Active`, `Manual`, or
   `Shutdown` (`main.cpp:8099-8102`). But `resetDriveControl(...)` — invoked on
@@ -281,8 +287,14 @@
 
 ### RELY-7 — `haltAfterDisplayInitFailure` still calls `WiFi.mode(WIFI_OFF)` — the exact pattern R6 rejects
 - Severity: LOW
-- Status: OPEN
-- File: `src/main.cpp:10377`
+- Status: **FIXED (commit `cceaf47`).** The `WiFi.mode(WIFI_OFF)` at `src/main.cpp:10364` is now
+  preceded by a comment block (`src/main.cpp:10358-10363`) that names R6, states the halt-path
+  invariant ("Safe here, and ONLY here — the board never brings an AP up again from this function"),
+  and asks a future refactor not to unify this call with the teardown path. The finding's proposed
+  fix was to replace the call with `WiFi.softAPdisconnect(false)`; the fix that shipped instead
+  keeps the call but documents it as the halt-only variant, on the reasoning that a `[[noreturn]]`
+  halt is not the teardown case R6 was written about. Documented deliberate divergence.
+- File: `src/main.cpp:10357-10385`
 - Problem: PROJECT-HISTORY §R6 and the two extensive comments at `main.cpp:9909-9932` and
   `main.cpp:10018-10023` explicitly reject `WiFi.mode(WIFI_OFF)` and `esp_wifi_stop()` in teardown
   because they corrupt the netstack (`E wifi_init_default: netstack cb reg failed with 12308`),
@@ -301,8 +313,12 @@
 
 ### RELY-8 — Constant-time access-token compare short-circuits on wrong length, leaking length via response timing
 - Severity: LOW
-- Status: OPEN
-- File: `src/main.cpp:5408-5441`
+- Status: **FIXED (commit `cceaf47`).** `requestHasValidAccessToken` (`src/main.cpp:5480-5524`)
+  now always runs the full 16-iteration XOR compare against a fixed-length local copy of the
+  expected token, and folds the length mismatch into the accumulated difference at return rather
+  than short-circuiting. `secureZero` is called on both the probe and the expected copy before
+  return. Matches the finding's proposed fix exactly.
+- File: `src/main.cpp:5480-5524`
 - Problem: `requestHasValidAccessToken` runs a constant-time XOR compare, but ONLY when the
   supplied token length matches `kAccessTokenHexLength` (`main.cpp:5433-5438`). A wrong-length
   token returns immediately with the loop unexecuted.

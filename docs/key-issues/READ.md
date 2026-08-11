@@ -16,7 +16,7 @@
 
 ### READ-1 — Stale `[DEBUG-DELETE]` markers wrap shipping features
 - Severity: HIGH
-- Status: **FIXED (2026-08-11).** All 38 marker sites triaged by which feature they wrap. Removed from
+- Status: **FIXED (2026-08-11, commit `11d95a6`).** All 38 marker sites triaged by which feature they wrap. Removed from
   the battery meter (14 sites, permanent per §4.6/D19) and the Override phone UI (6 sites, permanent
   per D6–D8), keeping every line of code and the descriptive text. **Preserved verbatim on the 12
   mood-name-overlay sites**, which genuinely are dev-only. Four ambiguous markers (L393 demo cycle,
@@ -41,7 +41,7 @@
 
 ### READ-3 — `sense`/`motion` naming note is attached to the wrong command block
 - Severity: HIGH
-- Status: **FIXED (2026-08-11).** Comment moved from above `sound` to immediately above the `sense`
+- Status: **FIXED (2026-08-11, commit `11d95a6`).** Comment moved from above `sound` to immediately above the `sense`
   handler and expanded to explain both the shadowing history and why the output still prints
   `motion:` labels (external scripts grep for them). Confirmed by reading that the handler does emit
   `motion:`-prefixed lines.
@@ -52,7 +52,7 @@
 
 ### READ-4 — Extract the 275-line inlined `OVERRIDE_HTML` raw string to its own translation unit
 - Severity: MEDIUM
-- Status: **FIXED (2026-08-11). This is Phase A of the READ-12 split.** Now `src/override_html.h`
+- Status: **FIXED (2026-08-11, commit `11d95a6`). This is Phase A of the READ-12 split.** Now `src/override_html.h`
   (extern declaration) + `src/override_html.cpp` (definition). Internal linkage removed so it can
   link externally; the only reference is `beginResponse_P(..., OVERRIDE_HTML)`, and no
   `sizeof(OVERRIDE_HTML)` use existed. PlatformIO auto-globs `src/*.cpp`, so no `platformio.ini`

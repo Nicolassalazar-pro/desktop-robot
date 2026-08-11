@@ -1,5 +1,10 @@
 ## Testing [TEST]
-> Last reviewed: 2026-08-07 | Open: 10
+> Last reviewed: 2026-08-07 | **Revised 2026-08-11** | Open: 11
+>
+> **2026-08-11 count fix:** the header previously read "Open: 10" but the file has always contained
+> TEST-1 through TEST-11 (11 findings). No test was added since the review; the count was simply
+> wrong. TEST.md is otherwise unchanged — none of the closed reliability/design/perf fixes this
+> week added a host test that would flip any TEST-N to FIXED.
 
 ### TEST-1 — The WS transport ownership state machine is inlined in main.cpp and untested; three of the four recent bugs live in it
 - Severity: CRITICAL

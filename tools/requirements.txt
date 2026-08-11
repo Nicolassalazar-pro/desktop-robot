@@ -1,0 +1,68 @@
+# Python host-tool dependencies.
+#
+# ------------------------------------------------------------------------
+# HOW TO INSTALL THIS FILE
+# ------------------------------------------------------------------------
+# Everything under `tools/` and the Python tests under `test/` are host-side
+# scripts (they don't run on the ESP32). The project convention is that they
+# run from PlatformIO's bundled venv, NOT system Python:
+#
+#     & "$env:USERPROFILE\.platformio\penv\Scripts\python.exe"   <script>
+#     & "$env:USERPROFILE\.platformio\penv\Scripts\pip.exe"      install -r tools\requirements.txt
+#     & "$env:USERPROFILE\.platformio\penv\Scripts\pytest.exe"   test\test_audio_to_piezo_stream.py
+#
+# That venv already ships `pyserial` and `pytest` (declared here for
+# completeness so a fresh clone on another PC is reproducible), and using it
+# also gets you the exact `platformio` CLI you build the firmware with.
+#
+# DO NOT `pip install -r tools\requirements.txt` into system Python. On
+# Windows, `python -m pip install ...` without activating the PIO venv puts
+# these packages into whatever system-Python happens to be on PATH, and then
+# `pio run` and `python tools\audio_to_piezo.py ...` see two different sets
+# of libraries — which is exactly the "why does it work for you and not for
+# me" trap this convention is trying to prevent.
+#
+# ------------------------------------------------------------------------
+# WHAT'S HERE
+# ------------------------------------------------------------------------
+# These are the real third-party imports scanned out of `tools/*.py` and
+# `test/*.py` on 2026-08-11:
+#
+#     numpy           -- tools/audio_to_piezo.py
+#     librosa         -- tools/audio_to_piezo.py       (transcribes WAV -> notes)
+#     imageio-ffmpeg  -- tools/audio_to_piezo.py       (feeds ffmpeg to librosa)
+#     mido            -- tools/audio_to_piezo.py, tools/midi_serial_bridge.py
+#     pyserial        -- tools/apply_calibration.py, tools/audio_to_piezo.py,
+#                        tools/mascot.py, tools/melody_player.py,
+#                        tools/midi_serial_bridge.py
+#     Pillow (PIL)    -- tools/render_garage_logo.py
+#     python-rtmidi   -- tools/midi_serial_bridge.py   (dynamically loaded as
+#                        the mido backend; ImportError if missing)
+#     pytest          -- test/test_*.py                (runner, already in PIO venv)
+#
+# tools/requirements-midi-bridge.txt is intentionally kept as-is because
+# `tools/midi_serial_bridge.py` references it by filename in its
+# ImportError message. Installing this broader requirements.txt is a
+# superset — you do not also need to install the midi-bridge file.
+#
+# ------------------------------------------------------------------------
+# VERSION CONSTRAINTS
+# ------------------------------------------------------------------------
+# These are lower bounds with an upper bound at the next major, following
+# standard Python packaging practice for host tooling. They intentionally
+# do NOT match the exact-pin discipline the firmware `lib_deps` follow --
+# host scripts are not load-bearing for hardware behavior, unlike the
+# firmware libraries.
+#
+# `mido` and `pyserial` bounds are chosen to include the versions already
+# pinned in tools/requirements-midi-bridge.txt (mido==1.3.3, pyserial==3.5)
+# so nothing regresses for MIDI-bridge users.
+
+numpy>=1.24,<3
+librosa>=0.10,<0.11
+imageio-ffmpeg>=0.4.9,<1
+mido>=1.3,<2
+pyserial>=3.5,<4
+Pillow>=10.0,<12
+python-rtmidi>=1.5,<2
+pytest>=7,<9

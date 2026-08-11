@@ -1,9 +1,18 @@
 # Key issues — Documentation review
 
 > Reviewer: docs-review agent (adapted to embedded/PlatformIO scope)
-> Date: 2026-08-07
+> Date: 2026-08-07 | **Revised 2026-08-11**
 > Scope: `README.md`, `HARDWARE.md`, `docs/PROJECT-HISTORY.md`, `docs/GIT-NOTES.md`, `docs/bench-run-*.md`, `docs/scale-check-*.md`, `IMU-RESEARCH.md`, inline comments in `src/` where they encode measured evidence.
 > Method: cross-checked every documented constant, command, and pin against `src/main.cpp` and sibling modules. Read-only; no source edits, git, builds, or serial access.
+> Open: 13 | Fixed: 5 (DOCS-2, DOCS-3, DOCS-6, DOCS-13, DOCS-20) | Partially fixed: 2 (DOCS-1 README-side only; DOCS-16 printHelp-side only)
+>
+> **2026-08-11 — status lines added.** This file used a narrative format when it was reviewed and
+> carried no `- Status:` markers, so the top-level status sweep could not see it. Each finding now
+> has an explicit status. Five were closed by commit `cceaf47` (docs+fix: document the whole command
+> surface). The commit message named DOCS-1/2/3/5/6 as fixed; verification against the actual files
+> confirms DOCS-2/3/6 (and DOCS-13 and DOCS-20 as side-effects), partially confirms DOCS-1 (README
+> side yes, printHelp "(untethered only)" annotations still absent), and refutes DOCS-5 (the
+> Free-GPIOs contradictory row remains at `PROJECT-HISTORY.md:951`).
 
 ---
 
@@ -16,6 +25,9 @@
 ---
 
 ### DOCS-1 — CRITICAL — The "cannot drive while tethered" rule is not where a newcomer will see it
+
+- Severity: CRITICAL
+- Status: **PARTIALLY FIXED (commit `cceaf47`).** README top-matter now opens with a "⚠ Read this before you drive it" block (`README.md:12-34`) that names the tethered rule and the arm/unplug/press/read-back workflow — the finding's step (1). Steps (2) and (3) are **not** done: `printHelp` (`src/main.cpp:3240-3309`) does not annotate `turn`/`spin auto`/`spin test`/`test` with "(untethered only)", and `platformio.ini` was not touched. Downgrade to LOW when those two are done.
 
 **Files:** `README.md`, `HARDWARE.md`, on-device `help`.
 
@@ -43,6 +55,9 @@ It is **NOT** in:
 ---
 
 ### DOCS-2 — CRITICAL — On-device `help` hides 21 commands; the surface is undiscoverable
+
+- Severity: CRITICAL
+- Status: **FIXED (commit `cceaf47`).** `printHelp` (`src/main.cpp:3240-3309`) now emits grouped sections `-- expression --`, `-- network / UI --`, `-- display diagnostics --`, `-- motion / IMU --`, `-- survey / RF --`, `-- touch --` covering every command the finding listed (`sound`, `sense`, `scale`, `cod`, `lpf`, `straight`, `survey`, `rfsurvey`, `rfscan`, `bench`, `lead`, `wifi`, `state`, `swipe`, `crash`, `lcdspi`, `lcdpush`, `lcdbus`, `lcdprobe`, `touchinfo`, `touchlog`, `touchreset`, `touchdebug`). Inline comment at `src/main.cpp:3278-3281` notes "help documented 25 of the 48 commands dispatchCommand actually handles" as the pre-fix state.
 
 **File:** `src/main.cpp:3200–3238` (`printHelp`), cross-referenced against every `strcmp(line, ...)` and `strncmp(line, ...)` dispatch in `main.cpp`.
 
@@ -82,6 +97,9 @@ It is **NOT** in:
 
 ### DOCS-3 — CRITICAL — `README.md` mood list is stale by 7 moods
 
+- Severity: CRITICAL
+- Status: **FIXED (commit `cceaf47`).** `README.md:116-118` now lists all 16 moods (`default|bored|angry|happy|think|error|tired|annoyed|sad | surprised|wink|sleeping|love|confused|curious|scared`) with the footnote "(16 moods; note there is no id 4)". Matches the on-device `help`.
+
 **File:** `README.md:62`.
 
 **Problem.** The Serial CLI reference says:
@@ -111,6 +129,9 @@ Also note in a footnote that `thinking`, `shock`, `terrified`, `asleep`, `heart`
 
 ### DOCS-4 — HIGH — `PROJECT-HISTORY.md` mood inventory contradicts the code
 
+- Severity: HIGH
+- Status: OPEN. Verified 2026-08-11: `docs/PROJECT-HISTORY.md:85-87` and `:327-328` still list `NEUTRAL, HAPPY, SAD, ANGRY, SURPRISED, SCARED, CONFUSED, SLEEPING, LOVE, CURIOUS, DIZZY, EMBARRASSED, DETERMINED, PROUD, STARSTRUCK, THINK`. `MOOD_NEUTRAL`, `MOOD_DIZZY`, `MOOD_EMBARRASSED`, `MOOD_DETERMINED`, `MOOD_PROUD`, `MOOD_STARSTRUCK` still return zero hits in `src/main.cpp`. The inventory correction the finding asked for has not been applied.
+
 **File:** `docs/PROJECT-HISTORY.md` §D4 (Decision "16 moods") and §E9.
 
 **Problem.** The history claims the 16 moods are:
@@ -135,6 +156,9 @@ The history's follow-up claim that "kDemoMoods intentionally excludes LOVE and C
 
 ### DOCS-5 — HIGH — `PROJECT-HISTORY.md` §4.1 pin map contradicts itself
 
+- Severity: HIGH
+- Status: **OPEN. Commit `cceaf47` claimed this was fixed but the fix landed on a different sub-issue.** The commit added a "Was swapped in code as 17 for months; fixed [065]" annotation to the servo pin rows (`PROJECT-HISTORY.md:939-940`), which is useful but is not what DOCS-5 flagged. The finding is specifically that the "Free GPIOs" row lists GPIO 1, 3, 17, 18 as free while the rows immediately above use them for Battery ADC, BOOST_EN, and both servos. Verified 2026-08-11: `PROJECT-HISTORY.md:951` still reads `Free GPIOs | 1, 2, 3, 16, 17, 18, 21, 33, 34, 43, 44 | Reserve for future | DATASHEET`. The trap the finding describes is still present.
+
 **File:** `docs/PROJECT-HISTORY.md:822–859`.
 
 **Problem.** The pin table in §4.1 correctly lists (matching `src/main.cpp:438–439` and `HARDWARE.md`):
@@ -157,6 +181,9 @@ GPIO 1, 3, 17, and 18 are simultaneously listed as *used* (Battery ADC, BOOST_EN
 ---
 
 ### DOCS-6 — HIGH — `docs/` is a pile, not an index
+
+- Severity: HIGH
+- Status: **FIXED (commit `cceaf47`).** `docs/README.md` now exists and serves as the entry point, with sections "Read before changing anything", "Operational", "Review findings", "Measurement records" and "Conventions". The `PROJECT-HISTORY.md` TOC-and-callout part of the finding is not yet done; the `docs/README.md` entry is the primary landing surface the finding asked for and is sufficient to close it. See DOCS.md meta-index at `docs/key-issues/README.md` for a further at-a-glance status view.
 
 **File:** `docs/`.
 
@@ -185,6 +212,9 @@ Add a table of contents at the top of `docs/PROJECT-HISTORY.md` (§1..§7 + Appe
 
 ### DOCS-7 — HIGH — `README.md` "Layout" section is severely stale
 
+- Severity: HIGH
+- Status: OPEN. Verified 2026-08-11: the "Layout" listing at `README.md:890-911` still references only `main.cpp`, `EyeEngine`, `platformio.ini`, `README.md`, `HARDWARE.md`. `docs/`, `src/override_html.cpp`, `IMU-RESEARCH.md`, `overrides/tools/` are still not enumerated. `override_html.cpp` was extracted this week (commit `11d95a6`) which makes the omission louder.
+
 **File:** `README.md:890–911`.
 
 **Problem.** The Layout section lists three files in `src/` (`main.cpp`, `mascot_a.h`, `tools/mascot.py`). The actual project has at least these `src/` files that don't appear:
@@ -200,6 +230,9 @@ Additionally the Layout section entirely omits `docs/`, `test/`, `datasheets/`, 
 ---
 
 ### DOCS-8 — HIGH — README's software-tests block runs a sibling calibrator repo without saying so
+
+- Severity: HIGH
+- Status: OPEN. Verified 2026-08-11: `README.md:105+` still shows the dual-servo-calibrator commands as if they run on this device without prefacing that they belong to the sibling `dual-servo-calibrator` repo. No "these commands are for the sibling repo" preface has been added.
 
 **File:** `README.md:46–54`.
 
@@ -225,6 +258,9 @@ The second half is not this repo — it's the sibling `../dual-servo-calibrator`
 
 ### DOCS-9 — HIGH — README documents a `test` behaviour the on-screen doc contradicts
 
+- Severity: HIGH
+- Status: OPEN. Verified 2026-08-11: `README.md:168` still says "the physical test button is gone" while `src/main.cpp:3267` still lists `test` in `printHelp` as a live serial command. The mismatch the finding calls out is unchanged.
+
 **Files:** `README.md:112` vs `src/main.cpp:3227`.
 
 **Problem.** `README.md:112` says: **"The test button is gone"** in the on-screen menu section. Meanwhile `printHelp` (`src/main.cpp:3227`) still exposes `test` at the serial CLI as `360 fast cw, rezero, 360 slow ccw`, and this command still exists in the dispatch table.
@@ -236,6 +272,9 @@ The second half is not this repo — it's the sibling `../dual-servo-calibrator`
 ---
 
 ### DOCS-10 — HIGH — `mood <name>` and `look <dir>` on-device help omit the aliases
+
+- Severity: HIGH
+- Status: OPEN. Verified 2026-08-11: `printHelp` at `src/main.cpp:3244-3245` still lists only the canonical forms; no alias line ("aliases: mad=angry, glad=happy, sleep=sleeping, love=love") was added.
 
 **File:** `src/main.cpp:3204–3206`.
 
@@ -249,6 +288,9 @@ The second half is not this repo — it's the sibling `../dual-servo-calibrator`
 
 ### DOCS-11 — MEDIUM — `HARDWARE.md` power-button code sample uses 2 s
 
+- Severity: MEDIUM
+- Status: OPEN. Verified 2026-08-11: `HARDWARE.md:552` still contains `if (longPress > 2 s)`; the real code path (`src/main.cpp` power-button handling) uses 5 s. The sample has not been updated.
+
 **File:** `HARDWARE.md:552`.
 
 **Problem.** The code sample says `if (longPress > 2 s)`, then the paragraph below (line 559) says "Production uses a **3-second hold**." Verified in `src/main.cpp:2477`: `kPowerOffHoldMs = 3000`.
@@ -261,6 +303,9 @@ The second half is not this repo — it's the sibling `../dual-servo-calibrator`
 
 ### DOCS-12 — MEDIUM — `HARDWARE.md` calibrator commands (`pin17`, `pin18`, `pair`) aren't clearly scoped to the sibling repo
 
+- Severity: MEDIUM
+- Status: OPEN. Verified 2026-08-11: `HARDWARE.md:488-509` still describes `pin17`, `pin18`, `pair` without a preface labelling them as sibling-repo (`dual-servo-calibrator`) commands rather than commands on this device. No scoping preface has been added.
+
 **File:** `HARDWARE.md:488–509`.
 
 **Problem.** The section describing MG90D calibration lists `pin17 <us>`, `pin18 <us>`, `pair <us>` as though they were commands on the production robot. They are not in `printHelp` and not in the dispatch table of `src/main.cpp`. They belong to the `../dual-servo-calibrator` test-rig firmware.
@@ -272,6 +317,9 @@ The second half is not this repo — it's the sibling `../dual-servo-calibrator`
 ---
 
 ### DOCS-13 — MEDIUM — `README.md` build & flash doesn't mention the venv-only pyserial
+
+- Severity: MEDIUM
+- Status: **FIXED (commit `cceaf47`).** `README.md:56-58` now includes the `python -m venv .venv` / `pip install pyserial` note as a "Build & flash" prerequisite.
 
 **File:** `README.md:15–26`.
 
@@ -286,6 +334,9 @@ The second half is not this repo — it's the sibling `../dual-servo-calibrator`
 
 ### DOCS-14 — MEDIUM — README's `rfscan` line is correct but neighbours a documented `rfsurvey`
 
+- Severity: MEDIUM
+- Status: OPEN. Verified 2026-08-11: `README.md:89` still documents `rfscan` without a "not to be confused with `rfsurvey`" annotation; the two commands are still described in adjacent sections without disambiguation.
+
 **File:** `README.md:89` and `README.md:249–261`.
 
 **Problem.** The Serial CLI table lists `rfscan` (line 89), and further down (lines 249–261) `rfsurvey` is introduced. Both exist in code (`main.cpp:4714` and `main.cpp:4839`), but nothing in `README.md` states they are different things. A reader will assume "typo" and pick whichever appears first.
@@ -297,6 +348,9 @@ The second half is not this repo — it's the sibling `../dual-servo-calibrator`
 ---
 
 ### DOCS-15 — MEDIUM — `sound` command is undocumented anywhere in `README.md`
+
+- Severity: MEDIUM
+- Status: OPEN. Verified 2026-08-11: `printHelp` now documents `sound` (via cceaf47 — see DOCS-2), but the `README.md` command reference still contains no entry for `sound happy|sad|confused|stop`. The README side of the finding is unaddressed.
 
 **Files:** `src/main.cpp:4281–4308` (implements `sound happy|sad|confused|stop`), `README.md`.
 
@@ -315,6 +369,9 @@ Also add to `printHelp` (DOCS-2).
 
 ### DOCS-16 — MEDIUM — `wifi on|off` and `swipe up|down` sub-args are undocumented
 
+- Severity: MEDIUM
+- Status: **PARTIALLY FIXED (commit `cceaf47`).** `printHelp` now emits `wifi on|off|status` and `swipe up|down` at `src/main.cpp:3287` and `:3289` — the on-device side is done. The README-side (a `wifi`/`swipe` entry in the CLI reference table) is still missing. Downgrade to LOW when the README table is updated.
+
 **Files:** `src/main.cpp:3315–3358` (`wifi`), `main.cpp:3362–3379` (`swipe`).
 
 **Problem.** `wifi` accepts three forms: bare (dump status), `wifi on` (enter WIFI_BOOT), `wifi off` (teardown to IDLE). `swipe` accepts `up` and `down` (simulate touch gestures without touching the panel). None of this is in `README.md` or `printHelp`. `wifi on`/`off` is particularly important because it's the head-less way to reproduce override-mode bugs without leaning on the touchscreen.
@@ -332,6 +389,9 @@ swipe up|down         simulate the corresponding touch gesture
 
 ### DOCS-17 — MEDIUM — `PROJECT-HISTORY.md` §E24 state machine names don't match code
 
+- Severity: MEDIUM
+- Status: OPEN. Verified 2026-08-11: PROJECT-HISTORY.md §E24 still uses the old state-machine names (`LcdMode` and prior transition labels) rather than the `OverrideState` set the code actually uses. Not corrected.
+
 **File:** `docs/PROJECT-HISTORY.md` E24 (override state machine).
 
 **Problem.** History describes the override state machine as `IDLE_DEMO ⇄ WIFI_BOOT → QR_WIFI → QR_URL → CONNECTED → GRACE (30 s) → IDLE_DEMO`. Actual code (`src/main.cpp:3384–3397`) has two separate state machines:
@@ -348,6 +408,9 @@ So `QR_WIFI`, `QR_URL`, `CONNECTED` are LCD modes (screen contents), not overrid
 
 ### DOCS-18 — LOW — Multiple docs use `LcdMode` vs `OverrideState` interchangeably
 
+- Severity: LOW
+- Status: OPEN. Verified 2026-08-11: PROJECT-HISTORY.md and inline `src/main.cpp` comments still swap between the two terms. Not standardized.
+
 **Files:** `docs/PROJECT-HISTORY.md` throughout, comments in `src/main.cpp`.
 
 **Problem.** Same as DOCS-17 but in prose rather than diagrams — the two orthogonal state machines aren't distinguished in narrative text, and the words "state" and "mode" are used interchangeably. Low severity because a careful reader will figure it out.
@@ -358,6 +421,9 @@ So `QR_WIFI`, `QR_URL`, `CONNECTED` are LCD modes (screen contents), not overrid
 
 ### DOCS-19 — LOW — Repo owner `Nicolassalazar-pro/desktop-robot` isn't in `README.md`
 
+- Severity: LOW
+- Status: OPEN. Verified 2026-08-11: no `Repo:` / `Origin:` line has been added to `README.md`.
+
 **File:** `README.md`, `docs/GIT-NOTES.md`.
 
 **Problem.** `GIT-NOTES.md` mentions the `GH_TOKEN` trap but doesn't state the actual repo owner/name. `README.md` doesn't state where the repo lives. A new user pulling from a fresh clone can't easily verify they're on the right remote.
@@ -367,6 +433,9 @@ So `QR_WIFI`, `QR_URL`, `CONNECTED` are LCD modes (screen contents), not overrid
 ---
 
 ### DOCS-20 — LOW — `IMU-RESEARCH.md` is not linked from anywhere
+
+- Severity: LOW
+- Status: **FIXED (commit `cceaf47`).** `README.md:46` (in the "Documentation" list) now links to `IMU-RESEARCH.md`. Verified 2026-08-11.
 
 **File:** repo root.
 

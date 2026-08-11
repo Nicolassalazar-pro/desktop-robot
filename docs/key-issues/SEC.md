@@ -1,5 +1,5 @@
 ## Security [SEC]
-> Last reviewed: 2026-08-07 | Open: 2
+> Last reviewed: 2026-08-07 | **Revised 2026-08-11** | Open: 2
 
 Scope: ESP32-S3 firmware serving its own WPA2 softAP (`Hanger OVERRIDE` / `TheGarageAtl`, fixed by design per PROJECT-HISTORY.md D6; rotation explicitly rejected R8, R23, R28). Threat model = unauthorised physical actuation by anyone in WiFi range, not data exfiltration. The physical-presence trust model is: LCD screen visibility ⇒ authorised to drive. Only new findings are listed; the "fixed WPA2" itself is out of scope per the review brief.
 

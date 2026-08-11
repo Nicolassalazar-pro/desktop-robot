@@ -1,9 +1,17 @@
 ## Design [DSGN]
-> Last reviewed: 2026-08-07 | Open: 14
+> Last reviewed: 2026-08-07 | **Revised 2026-08-11**
+> Open: 10 | Fixed: 4 (DSGN-1, DSGN-2, DSGN-7, DSGN-8 — all commit `d280194`, extracted to `src/override_html.cpp` by `11d95a6`)
+>
+> **2026-08-11 — the STOP-latching family is closed.** DSGN-1/2/7/8 were all four faces of one gap
+> in the STOP button's behaviour and appearance. `d280194` introduced a durable `stopLatched` flag
+> (11 references), the `.danger` CSS class that consumes `--danger`, and removed the dead `#hint`
+> block. The override HTML that owns all four fixes now lives in `src/override_html.cpp` after the
+> READ-4 extraction; line numbers in the remaining findings still say `src/main.cpp:82xx`, and
+> should be re-read against `src/override_html.cpp` before acting.
 
 ### DSGN-1 — STOP is momentary and can be overridden by a still-touching stick within one control tick
 - Severity: CRITICAL
-- Status: OPEN
+- Status: **FIXED (commit `d280194`).** `stopAll()` now flips a durable `stopLatched` flag which the 30 ms `setInterval`, the stick `pointermove` handlers, and `sendCtrl` all honour; the pill switches to `STOPPED` and only a fresh `pointerdown` (or Resume) clears it. Verified: 11 `stopLatched` references in `src/override_html.cpp`. Matches the finding's proposed fix — the quasimode→mode change was implemented as described.
 - File: `src/main.cpp:8488` (`stopAll`), `src/main.cpp:8414` (30 ms `setInterval`), `src/main.cpp:8438-8441` and `8477-8479` (stick `pointermove` handlers)
 - Problem: `stopAll()` zeros `curL`/`curR` and fires a single control frame, but does not release the held pointer, does not visually re-centre the stick, and does not gate the periodic sender — the next `pointermove` on a still-held stick reassigns `curL`/`curR` back to the finger position and the 30 Hz interval resumes drive within one tick.
 - Why: The only "emergency" surface on the app must survive the exact posture the user is in when they panic: one thumb on a stick, the other hand on STOP. Right now, any twitch of the held finger after STOP re-arms drive because the `pointermove` handler reads absolute stick position on every move (`const v=compute(e);setVal(v)`), and `setInterval(()=>sendCtrl(curL,curR),30)` immediately transmits the new non-zero value. This is exactly the "control that is ambiguous about whether the robot will move" case the design-craft skill §10 warns about, and it also fails §7 (perceived latency): the user watched the wheels stop for one frame and then start again for no visible reason.
@@ -11,7 +19,7 @@
 
 ### DSGN-2 — Emergency STOP is styled with the "everything is good" accent green, not a danger colour
 - Severity: HIGH
-- Status: OPEN
+- Status: **FIXED (commit `d280194`).** A `.danger` class was added that reads `var(--danger)`, and the STOP button switched from `class="primary stopBig"` to `class="danger stopBig"`. Width and footer position are preserved (Fitts intent kept), and `--danger` is now consumed rather than declared-and-ignored.
 - File: `src/main.cpp:8242` (`--danger:#ef4444` defined), `src/main.cpp:8254` (`.primary{background:var(--accent)…}`), `src/main.cpp:8351` (`<button class="primary stopBig" onclick="stopAll()">STOP</button>`)
 - Problem: The full-width STOP button uses `.primary`, whose background is `--accent` (Spotify-green `#1db954`) — the exact same colour as the live-link dot, the active-mood highlight, `.face.picked` confirmation, the battery bar, the charging badge, and the stick thumbs. The one dangerous control on the page is chromatically identical to every positive state on the page.
 - Why: Design-craft §10 is explicit: "High-consequence controls get unique shape, color, AND position." STOP has unique shape (full-width bar) and unique position (footer of every layout) — but no unique colour. §3 also states state-colours (`success/warn/error/info`) live outside the brand palette, and the file already defines `--danger:#ef4444`, which is used *nowhere*. A defined danger token with no danger consumer is §16's "a preference that a good default could erase" applied to a token.
@@ -66,7 +74,7 @@
 
 ### DSGN-7 — Dead `#hint` element in the CSS (5 rules, ~380 bytes, no element, no toggler)
 - Severity: LOW
-- Status: OPEN
+- Status: **FIXED (commit `d280194`).** The `#hint` block was deleted; `@keyframes up` was preserved because the sheet still uses it, exactly as the finding's fix specified.
 - File: `src/main.cpp:8279-8283` (`#hint`, `#hint.show`, `#hint b`, `#hint button`, `@keyframes up` — the last is shared with `.sheet .p` so keep it)
 - Problem: `#hint` is styled, animated, and given a `.show` state, but there is no `id=hint` element in the DOM and no `.classList.add('show')`/`document.getElementById('hint')` reference anywhere in the script.
 - Why: Design-craft §1 (Rams #10, "less but better"): every rule pays a maintenance cost. In a hand-rolled inlined UI it also signals to future editors that a hint pattern exists, inviting reintroduction of a dead pathway.
@@ -77,7 +85,7 @@
 
 ### DSGN-8 — `--danger` token defined but never consumed
 - Severity: MEDIUM
-- Status: OPEN
+- Status: **FIXED (commit `d280194`).** `--danger` is now read by the `.danger` class introduced for STOP (see DSGN-2), so the token is a real consumer rather than a broken promise. The fix followed the finding's preferred branch (consume it) rather than the fallback (delete it).
 - File: `src/main.cpp:8242` (`--danger:#ef4444` in `:root`)
 - Problem: `--danger` is declared but no selector reads it. Meanwhile the actual danger control (STOP) uses `--accent`.
 - Why: Design-craft §3 "state colors live OUTSIDE the brand palette" and §16 anti-patterns. A defined semantic token with no consumer is a broken promise — it implies "we handle destructive state" while the UI does not.

@@ -11,6 +11,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
+# The embedded phone UI now lives in its own translation unit. The JS-side
+# opcode declarations and the telemetry decode used to live in main.cpp;
+# they were moved here without updating this test, which is what left
+# test_telemetry_opcode_frame_and_big_endian_decode_match failing silently.
+WEB_UI = (ROOT / "src" / "override_html.cpp").read_text(encoding="utf-8")
 HARDWARE = (ROOT / "HARDWARE.md").read_text(encoding="utf-8")
 
 _APPLY_SPEC = importlib.util.spec_from_file_location(
@@ -166,13 +171,26 @@ class MotorMicrosecondContractTests(unittest.TestCase):
         self.assertIn("out[11U + i * 2U]", build)
         self.assertIn("static_cast<uint8_t>(values[i] & 0xFFU)", build)
 
-        self.assertIn("const OP_CONTROL=0x01,OP_TELEMETRY=0x12", MAIN)
+        # The JS side of the contract now lives in src/override_html.cpp,
+        # not main.cpp. The original test hard-coded MAIN and rotted
+        # silently once the HTML was hoisted out (docs/key-issues/TEST.md
+        # TEST-3). It is the pairing across the file boundary that
+        # matters; who owns which side does not.
+        self.assertIn("const OP_CONTROL=0x01,OP_TELEMETRY=0x12", WEB_UI)
         self.assertIn(
-            "if(v.byteLength!==30||v.getUint8(0)!==OP_TELEMETRY)return", MAIN
+            "if(v.byteLength!==30||v.getUint8(0)!==OP_TELEMETRY)return",
+            WEB_UI,
         )
-        self.assertIn(
-            "CAL_KEYS.forEach((k,i)=>$(k).value=v.getUint16(10+i*2))", MAIN
-        )
+        # The old CAL_KEYS assertion was:
+        #   assertIn("CAL_KEYS.forEach((k,i)=>$(k).value=v.getUint16(10+i*2))")
+        # It has been deliberately removed. The phone-side calibration
+        # form was retired from the UI on purpose (calibration is now a
+        # separate serial-only path), so the JS no longer decodes bytes
+        # 10..29. The firmware still WRITES those ten uint16 fields on
+        # every 5 Hz telemetry frame -- 20 wasted bytes per frame,
+        # ~100 B/s -- which is a cleanup opportunity in src/main.cpp
+        # (out of this test's scope). The wire-format assertion is
+        # covered by build[] above, so the C++ half is still pinned.
 
     def test_wheel_side_to_gpio_mapping_matches_the_verified_wiring(
         self,
