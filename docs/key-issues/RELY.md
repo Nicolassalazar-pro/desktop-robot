@@ -1,7 +1,11 @@
 ## Reliability [RELY]
 
-> Last reviewed: 2026-08-07 | **Revised against hardware evidence: 2026-08-08**
-> Open: 4 (RELY-5, RELY-6, and the teardown half of RELY-4) | Fixed: 3 | Won't fix: 1
+> Last reviewed: 2026-08-07 | **Revised against hardware evidence: 2026-08-08, 2026-08-11**
+> Open: 3 (RELY-6, the teardown half of RELY-4, and the demo-only note) | Fixed: 4 | Won't fix: 1
+>
+> **2026-08-11 — the loop-task/AsyncTCP defect class is now CLOSED.** RELY-1, RELY-4 and RELY-5 were
+> three faces of one bug: the loop task calling into `AsyncWebSocket`. There are no such calls left
+> in the firmware. The rule below is now enforced everywhere, not aspirational.
 >
 > **2026-08-08 — read this before acting on any finding below.**
 > A hardware debugging session confirmed some findings, refuted one, and showed that two of the
@@ -194,9 +198,25 @@
 
 ### RELY-5 — `closeWsEventClient` looks up a client on the loop task via `g_orWs.client(id)` while AsyncTCP may be adding/removing that client
 - Severity: **HIGH (raised from MEDIUM)**
-- Status: **OPEN — but no longer speculative. This is the same mechanism as RELY-4, which was
-  confirmed on hardware as a heap corruptor on 2026-08-08. Treat as a live defect, not a "would be
-  hard to attribute" theoretical.**
+- Status: **FIXED (2026-08-11, commit `fe30172`). Renamed to `revokeWsEventClient`, which only logs.**
+- **Resolution.** The close was removed from all 7 loop-task call sites. Two independent reasons make
+  that safe, both confirmed by reading the code rather than assumed:
+  1. **Authority is already revoked at every call site.** `rejectWsTransportAdmission` clears the
+     owner token before calling; the other six fire only when the client is already stale, faulted or
+     a non-owner. A revoked client cannot drive, cannot be re-admitted, and its frames are dropped on
+     the non-owner path.
+  2. **The socket is still closed — from the correct task.** Both telemetry send paths in
+     `orOnWsEvent` re-check ownership and close on mismatch (`main.cpp:8982, 9192`), and those run on
+     AsyncTCP driven by the client's own next frame. A live phone is dropped within one control tick,
+     so recovery does not wait on the 4 s client-side staleness watchdog — that is only the backstop.
+- The replacement log line is rate-limited to 1 Hz and gated on `serialCanWrite()`, because a client
+  wedged in a revoked state can generate them at control-frame rate and an unbounded `Serial.printf`
+  on the loop task is itself RELY-6.
+- **There are now no calls into `AsyncWebSocket` from `loop()` anywhere in the firmware.** That closes
+  the entire defect class behind this week's crashes (RELY-1, RELY-4, RELY-5).
+- Verified: 13/13 host suites; panel `RDDPM=0x9C`; 15 min AP up with a station associating and
+  disassociating twice, 0 crashes. **Still unverified: the revocation path itself**, which needs a
+  phone to load the web app and then leave the network.
 - **2026-08-08 update.** RELY-4 was fixed and the crash it caused was captured in full:
   `close()` reaches `AsyncWebSocketClient::_queueControl`, which does an unsynchronised
   `_controlQueue.add()` (`AsyncWebSocket.cpp:561`, `StringArray.h:76`) — the same call AsyncTCP makes

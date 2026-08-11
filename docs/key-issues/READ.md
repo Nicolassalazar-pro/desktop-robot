@@ -1,9 +1,28 @@
 ## Readability [READ]
-> Last reviewed: 2026-08-07 | Open: 12
+> Last reviewed: 2026-08-07 | **Revised 2026-08-11**
+> Open: 8 | Fixed: 4 (READ-1, READ-2, READ-3, READ-4) | Deferred pending owner approval: READ-12 phases C–E
+>
+> **2026-08-11 — applied the zero-risk and mechanical items only, deliberately.**
+> READ-1 (misleading `[DEBUG-DELETE]` markers) and READ-3 (misplaced comment) are comment-only and
+> carry no functional risk. READ-4 (extract the inlined web app) is Phase A of the READ-12 split and
+> is mechanically verifiable — the payload was hash-compared byte-for-byte and the embedded JS
+> re-checked with `node --check`, since the C++ compiler cannot see inside a raw string.
+>
+> **READ-5 (table-dispatch `dispatchCommand`) and READ-12 phases C–E are NOT applied.** The firmware
+> is mid-verification after a week of concurrency fixes, and READ-12 itself requires an untethered
+> soak per phase. Doing a structural refactor now would make any future crash impossible to attribute
+> between the refactor and the concurrency work. Phase B (READ-5) is the next candidate once the
+> revocation path has been confirmed on hardware.
 
 ### READ-1 — Stale `[DEBUG-DELETE]` markers wrap shipping features
 - Severity: HIGH
-- Status: OPEN
+- Status: **FIXED (2026-08-11).** All 38 marker sites triaged by which feature they wrap. Removed from
+  the battery meter (14 sites, permanent per §4.6/D19) and the Override phone UI (6 sites, permanent
+  per D6–D8), keeping every line of code and the descriptive text. **Preserved verbatim on the 12
+  mood-name-overlay sites**, which genuinely are dev-only. Four ambiguous markers (L393 demo cycle,
+  L9949 overlay repaint, L10985 demo auto-start, L11167 expressive-eye repaint) all resolved as
+  shipping: the delete instruction was removed, the explanation kept. Build RAM/Flash bit-for-bit
+  identical to baseline, 13/13 host suites.
 - File: `src/main.cpp:1076-1110, 2115-2249, 5202-8226, 10729-10742, 10789-10800, 10828-10833`
 - Problem: Two blocks marked `[DEBUG-DELETE] BEGIN … END` are documented in `docs/PROJECT-HISTORY.md` as *shipping* code that will not be deleted — the battery meter (§4.6 / D19) and the entire Override HTTP + WebSocket phone UI (§4.2 / D6–D8). The next reader who takes the marker at face value will delete the only battery indicator and the primary user-facing control surface.
 - Why: `[DEBUG-DELETE]` is used elsewhere in the file (e.g. the demo mood-name overlay at 2067–2113) as an accurate "strip before shipping" tag. Reusing the same tag for permanent code trains the reader to ignore it, or worse, to strip it. The battery-meter marker even says "Remove this block + all matching `// [DEBUG-DELETE]` lines before ship." on line 2069 while D19 fixes the battery model as permanent behaviour. The Override marker (5202) frames "override debug WebUI" as scratch code, but the SSID `Hanger OVERRIDE` and password `TheGarageAtl` immediately below are the shipped credentials.
@@ -11,7 +30,10 @@
 
 ### READ-2 — `printHelp()` lists ~55% of the commands `dispatchCommand` actually handles
 - Severity: HIGH
-- Status: OPEN
+- Status: **FIXED (commit `cceaf47`).** Verified 2026-08-11: `lcdprobe`, `crash`, `rfscan`, `survey`,
+  `touchinfo`, `bench` and the missing `curious` mood are all present in `printHelp` now. The
+  follow-on suggestion — generate help text from a dispatch table so the two cannot drift again —
+  remains open and is folded into READ-5.
 - File: `src/main.cpp:3200-3238` (vs `dispatchCommand` at 3240-5069 and `README.md:56-105`)
 - Problem: The `help` serial command hides ~17 real commands from anyone who does not already know they exist: `wifi`, `swipe`, `state`, `crash`, `lcdpush`, `lcdbus`, `lcdprobe`, `lcdspi`, `touchinfo`, `touchlog`, `touchreset`, `touchdebug`, `lead`, `bench`, `sound`, `sense`, `scale`, `cod`, `lpf`, `straight`, `survey`, `rfsurvey`, `rfscan`. The mood list at line 3204-5 also omits `curious`, which `parseMood` accepts.
 - Why: The list is hand-maintained duplication of `dispatchCommand`'s if-chain and has drifted every time a command was added. `README.md:56-105` is now the ground truth, and `help` silently contradicts it — precisely the kind of "comment that lies" the brief calls out. Worse, the omitted commands include the load-bearing diagnostics (`lcdprobe`, `lcdpush`, `lcdbus`, `crash`) — the reader who most needs them is the one debugging a wedged panel with no help text to reach for.
@@ -19,7 +41,10 @@
 
 ### READ-3 — `sense`/`motion` naming note is attached to the wrong command block
 - Severity: HIGH
-- Status: OPEN
+- Status: **FIXED (2026-08-11).** Comment moved from above `sound` to immediately above the `sense`
+  handler and expanded to explain both the shadowing history and why the output still prints
+  `motion:` labels (external scripts grep for them). Confirmed by reading that the handler does emit
+  `motion:`-prefixed lines.
 - File: `src/main.cpp:4279-4281` (comment) vs `src/main.cpp:4310-4348` (block it describes)
 - Problem: The comment `// NOTE: named 'sense', not 'motion' — 'motion' is already the eye-engine's gaze-range command and was silently shadowing this one.` sits directly above the `sound` handler at 4281. The `sense` handler is 30 lines further down at 4310, and its output still prints `motion: …` labels (`Serial.printf("motion: tilt %.1f deg …")` at 4317).
 - Why: This is the exact class of trap Appendix B calls out — the `motion` shadow was one of the two named bugs (the other being `kServoLeftPin`). The evidence explaining why the block is not called `motion` is now decoupled from the block it justifies, so someone renaming or removing `sound` will lose the explanation entirely, and someone reading `sense` will not understand why its output labels itself `motion:` (the diagnostic label was kept for continuity with existing scripts). Moving `sound` above `sense` was the likely culprit.
@@ -27,7 +52,19 @@
 
 ### READ-4 — Extract the 275-line inlined `OVERRIDE_HTML` raw string to its own translation unit
 - Severity: MEDIUM
-- Status: OPEN
+- Status: **FIXED (2026-08-11). This is Phase A of the READ-12 split.** Now `src/override_html.h`
+  (extern declaration) + `src/override_html.cpp` (definition). Internal linkage removed so it can
+  link externally; the only reference is `beginResponse_P(..., OVERRIDE_HTML)`, and no
+  `sizeof(OVERRIDE_HTML)` use existed. PlatformIO auto-globs `src/*.cpp`, so no `platformio.ini`
+  change was needed.
+- **Verification, because a raw string is invisible to the compiler:** payload SHA256
+  `2420c34fc16b1f9f53045036b86034a5d30164afc92fe0963632425dfa2dd7fe`, 21,765 bytes — **identical
+  before and after**. Embedded `<script>` block extracted and passed through `node --check`: clean.
+  Build RAM and Flash bit-for-bit identical to baseline. 13/13 host suites.
+- Correction to the finding text: the raw string sat between `jsonFindStr()` and `moodNameSafe()`,
+  not `isValidMoodId()`, and the removed block was 349 lines rather than ~275.
+- **Side benefit that shaped the rest of the plan:** the web app now lives in its own file, so UI work
+  and firmware work no longer contend for `main.cpp` and can proceed in parallel.
 - File: `src/main.cpp:8230-8512`
 - Problem: 275 lines of unrelated HTML/CSS/JS sit in the middle of the C++ source, wedged between `jsonFindStr()` (8209) and `isValidMoodId()` (8519). It is the single largest run of "wrong-language code" in `main.cpp` and it separates the WebSocket ingress path (8623+) from the telemetry builder (8527) that both use it.
 - Why: The reader searching for the WS handler has to page across 275 lines of unrelated markup to reach it. Editor navigation (grep, "go to symbol", brace-matching) all degrade across a 4 KB raw string. The block is entirely self-contained — it is a single `PROGMEM` `const char[]` in a `R"OD(...)OD"` raw string with no macros, no `#ifdef`, no references into main.cpp — so extraction is mechanical.
