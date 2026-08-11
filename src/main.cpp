@@ -182,6 +182,25 @@ RTC_NOINIT_ATTR uint32_t g_rtcTouchMaxUs;      // worst g_orTouch.control()
 RTC_NOINIT_ATTR uint32_t g_rtcTouchSlowCount;  // calls over kStallWarnUs
 RTC_NOINIT_ATTR uint32_t g_rtcLoopMaxUs;       // worst whole loop() pass
 RTC_NOINIT_ATTR uint32_t g_rtcLoopMaxPhase;    // crumb phase during that pass
+// Power and motion context captured AT THE WORST TOUCH POLL.
+//
+// The leading hypothesis for the stall needs exactly this to be confirmed or
+// killed. Both watchdog resets happened UNTETHERED, and untethered is the only
+// state in which two things are true at once: the board is on battery, and the
+// servos actually run (a tethered robot physically cannot complete a rotation,
+// so movement is never exercised on USB). A servo current spike sagging the
+// rail could glitch the CST816T into holding SDA low, which would present
+// exactly as a hung I2C read inside the touch poll.
+//
+// Without this context the eventual single occurrence would tell us only what
+// we already know -- that it hung. With it, one event settles the question:
+// rail on + battery sagging at the moment of the stall is the hypothesis
+// confirmed; rail off and a healthy battery kills it outright.
+RTC_NOINIT_ATTR uint32_t g_rtcStallBatMv;      // battery mV at the worst poll
+RTC_NOINIT_ATTR uint32_t g_rtcStallFlags;      // bit0 rail, bit1 gesture, bit2 charging
+constexpr uint32_t kStallFlagRail    = 1U << 0;
+constexpr uint32_t kStallFlagGesture = 1U << 1;
+constexpr uint32_t kStallFlagCharge  = 1U << 2;
 constexpr uint32_t kStallMagic  = 0x5A11EDU;
 constexpr uint32_t kStallWarnUs = 20000U;      // 20 ms: well past a healthy poll
 
@@ -191,6 +210,8 @@ inline void stallStatsReset() {
   g_rtcTouchSlowCount = 0;
   g_rtcLoopMaxUs      = 0;
   g_rtcLoopMaxPhase   = 0;
+  g_rtcStallBatMv     = 0;
+  g_rtcStallFlags     = 0;
 }
 inline void stallStatsInitIfCold() {
   if (g_rtcStallMagic != kStallMagic) {
@@ -3774,6 +3795,12 @@ void cmdCrash(char* argument) {
       static_cast<unsigned long>(g_rtcTouchSlowCount),
       static_cast<unsigned long>(g_rtcLoopMaxUs),
       crumbName(g_rtcLoopMaxPhase));
+  Serial.printf(
+      "stall: at worst poll -- bat %lu mV, rail %s, gesture %s, %s\n",
+      static_cast<unsigned long>(g_rtcStallBatMv),
+      (g_rtcStallFlags & kStallFlagRail) ? "ON" : "off",
+      (g_rtcStallFlags & kStallFlagGesture) ? "RUNNING" : "idle",
+      (g_rtcStallFlags & kStallFlagCharge) ? "charging" : "on battery");
   if (nvs_open("crashlog", NVS_READONLY, &handle) != ESP_OK) {
     Serial.println(F("crash: none recorded"));
     return;
@@ -10846,6 +10873,12 @@ void setup() {
             static_cast<unsigned long>(g_rtcTouchSlowCount),
             static_cast<unsigned long>(g_rtcLoopMaxUs),
             crumbName(g_rtcLoopMaxPhase));
+        Serial.printf(
+            "boot: at that worst poll -- bat %lu mV, rail %s, gesture %s, %s\n",
+            static_cast<unsigned long>(g_rtcStallBatMv),
+            (g_rtcStallFlags & kStallFlagRail) ? "ON" : "off",
+            (g_rtcStallFlags & kStallFlagGesture) ? "RUNNING" : "idle",
+            (g_rtcStallFlags & kStallFlagCharge) ? "charging" : "on battery");
       }
       // Persist it. The RTC crumb is overwritten within milliseconds by this
       // very boot (setup writes one), so unless it is snapshotted here the
@@ -11159,6 +11192,14 @@ void loop() {
   const uint32_t touchUs = micros() - touchStartUs;
   if (touchUs > g_rtcTouchMaxUs) {
     g_rtcTouchMaxUs = touchUs;
+    // Snapshot power/motion at the worst poll, not at the crash. By the time a
+    // watchdog reset happens the rail is already down and the battery has
+    // recovered, so reading it afterwards would show a healthy board and
+    // wrongly exonerate the servos.
+    g_rtcStallBatMv = static_cast<uint32_t>(g_batVoltage * 1000.0f);
+    g_rtcStallFlags = (g_driveRailOn ? kStallFlagRail : 0U) |
+                      (g_movementSequencer.active() ? kStallFlagGesture : 0U) |
+                      (g_batCharging ? kStallFlagCharge : 0U);
   }
   if (touchUs > kStallWarnUs) {
     ++g_rtcTouchSlowCount;
