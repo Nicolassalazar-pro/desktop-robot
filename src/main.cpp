@@ -10026,9 +10026,17 @@ static void drawSheetCard(bool armed, bool committed) {
   // alone (design-craft §3).
   g_sheetCanvas->setTextColor(armed || committed ? kQrWhite : 0x8410);
   g_sheetCanvas->setTextWrap(false);
-  g_sheetCanvas->setCursor(static_cast<int16_t>((kScreenW - w1) / 2), 120);
+  // Anchored NEAR THE TOP of the card, not its middle.
+  //
+  // The card is revealed top-down, so its first rows are the only thing on
+  // screen early in a drag. With the label at the panel's vertical centre the
+  // operator pulled a blank black rectangle for the first half of the travel
+  // and only learned what it was at ~58%, which is past the point where they
+  // have decided whether to continue. Caught by tools/lcd_preview.py before it
+  // ever reached the panel.
+  g_sheetCanvas->setCursor(static_cast<int16_t>((kScreenW - w1) / 2), 34);
   g_sheetCanvas->print(line1);
-  g_sheetCanvas->setCursor(static_cast<int16_t>((kScreenW - w2) / 2), 145);
+  g_sheetCanvas->setCursor(static_cast<int16_t>((kScreenW - w2) / 2), 58);
   g_sheetCanvas->print(line2);
 }
 //

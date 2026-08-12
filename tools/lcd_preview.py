@@ -281,30 +281,53 @@ def render_face(w: int, h: int) -> Image.Image:
     return img
 
 
-def render_sheet_card(w: int, h: int) -> Image.Image:
-    """Placeholder pairing card -- the real card is not yet in firmware.
+def render_sheet_card(w: int, h: int, armed: bool = False) -> Image.Image:
+    """The pairing card as the firmware actually draws it.
 
-    Full-panel-height so the row-split composite in composite_sheet() can
-    take any prefix of it. Contents are anchored top-down (title at the top,
-    action row near the bottom) which matches how a pull-down sheet reveals
-    itself: what you see first as sheetY grows is the header. When the real
-    card lands, port its parse-from-source treatment from the QR screens
-    rather than baking pixels here.
+    Mirrors drawSheetCard() in src/main.cpp: black card, two centred lines at
+    y=34 and y=58 at GFX text size 2, and a verb that changes with distance.
+    `armed` is the "close enough to commit" state.
+
+    The lines sit near the TOP of the card because a pull-down sheet reveals
+    itself top-down -- anchoring them at the panel's centre left the operator
+    dragging a blank rectangle for the first half of the travel. This preview
+    is what caught that.
+
+    The verb is DISTANCE-based, not release-based, because releasing no longer
+    commits anything -- the card parks where you leave it and you commit by
+    pulling it to the commit line. An earlier version of this preview said
+    "Release to pair", which stopped being true the moment park semantics
+    landed.
     """
-    img = Image.new("RGB", (w, h), (250, 250, 253))
+    img = Image.new("RGB", (w, h), (0, 0, 0))
     d = ImageDraw.Draw(img)
-    # drag handle: sheets without one feel like modal dialogs, not sheets
-    hx = (w - 40) // 2
-    d.rounded_rectangle([hx, 8, hx + 40, 12], radius=2, fill=(180, 180, 190))
-    d.text((16, 28), "Pair device", fill=BLACK, font=_font(22))
-    d.text((16, 60), "enter code on phone", fill=GREY, font=_font(13))
-    d.line([16, 92, w - 16, 92], fill=(220, 220, 224))
-    d.text((16, 104), "PAIRING CODE", fill=GREY, font=_font(10))
-    d.text((16, 122), "* * * - * * *", fill=BLACK, font=_font(24))
-    d.rounded_rectangle([16, h - 56, w - 16, h - 20], radius=6, fill=BLACK)
-    d.text((w // 2 - 24, h - 46), "Cancel", fill=WHITE, font=_font(14))
-    d.text((6, h - 14), "sheet (placeholder card)", fill=GREY, font=_font(10))
+    line1 = "Let go" if armed else "Pull down"
+    line2 = "to pair"
+    colour = WHITE if armed else (132, 132, 132)
+    for text, y in ((line1, 34), (line2, 58)):
+        # Centre with the FIRMWARE's metric (6 px advance per char at size 1),
+        # not the render font's, so the preview cannot disagree with the panel.
+        x = (w - len(text) * GFX_ADVANCE * 2) // 2
+        d.text((x, y), text, fill=colour, font=_font(GFX_HEIGHT * 2))
+    d.text((6, h - 14), "sheet (card)", fill=GREY, font=_font(10))
     return img
+
+
+def draw_grabber(img: Image.Image, sheet_y: int, inset: int, bar_w: int,
+                 bar_h: int) -> None:
+    """The grabber, welded to the card's bottom edge.
+
+    Mirrors serviceGrabber(): it hangs just inside the edge the operator is
+    pulling, which is what makes it read as the handle rather than as
+    decoration that happens to sit nearby. At sheet_y == 0 (closed) it sits at
+    the top of the screen, where it appears on a nearby touch and auto-hides.
+    """
+    w, _ = img.size
+    top = (sheet_y - inset - bar_h) if sheet_y > 0 else inset
+    x = (w - bar_w) // 2
+    ImageDraw.Draw(img).rounded_rectangle(
+        [x, top, x + bar_w, top + bar_h], radius=bar_h // 2, fill=(173, 173, 173)
+    )
 
 
 def composite_sheet(face: Image.Image, card: Image.Image, sheet_y: int) -> Image.Image:
@@ -324,16 +347,20 @@ def composite_sheet(face: Image.Image, card: Image.Image, sheet_y: int) -> Image
 
 
 def render_filmstrip(
-    w: int, h: int, positions_pct: list[int], threshold_pct: int
+    w: int, h: int, positions_pct: list[int], commit_pct: int,
+    grabber: tuple[int, int, int]
 ) -> Image.Image:
-    """Sheet travel at several positions, side by side, threshold marked.
+    """Sheet travel at several positions, side by side, commit line marked.
 
-    Marking the threshold matters because release is decided by projected
-    velocity around exactly that line -- it is the interaction's decision
-    point, and a filmstrip that hides it hides the thing worth reviewing.
+    Marking the commit line matters because it is the interaction's only
+    decision point: releasing parks the card wherever it is, so the ONLY way to
+    commit is to pull past that line. A filmstrip that hides it hides the thing
+    worth reviewing.
+
+    `grabber` is (inset, width, height), parsed from the firmware.
     """
     face = render_face(w, h)
-    card = render_sheet_card(w, h)
+    inset, bar_w, bar_h = grabber
 
     margin, gutter = 24, 24
     title_h, label_h = 52, 44
@@ -345,14 +372,15 @@ def render_filmstrip(
     d = ImageDraw.Draw(strip)
     d.text(
         (margin, 14),
-        f"sheet travel  --  threshold {threshold_pct}% "
+        f"sheet travel  --  commit at {commit_pct}% "
         f"(parsed from src/sheet_transition.h)",
         fill=BLACK,
         font=_font(18),
     )
     d.text(
         (margin, 34),
-        "top rows = card, bottom rows = face; face is a placeholder",
+        "top rows = card, bottom rows = face (placeholder); "
+        "grabber rides the card edge; release PARKS, it does not settle",
         fill=GREY,
         font=_font(11),
     )
@@ -361,20 +389,23 @@ def render_filmstrip(
         x = margin + i * (w + gutter)
         y = title_h
         sheet_y = round(h * pct / 100)
-        strip.paste(composite_sheet(face, card, sheet_y), (x, y))
-        # Threshold frame gets a heavier, warm border so it is unmistakable
-        # from a thumbnail -- reviewers should not have to read the caption.
-        is_threshold = (pct == threshold_pct)
-        border_col = (204, 136, 0) if is_threshold else (60, 60, 60)
-        border_w = 3 if is_threshold else 1
+        # The verb flips at the commit line, exactly as the firmware does, so
+        # the strip shows the operator-visible change and not just geometry.
+        armed = pct >= commit_pct
+        frame = composite_sheet(face, render_sheet_card(w, h, armed), sheet_y)
+        draw_grabber(frame, sheet_y, inset, bar_w, bar_h)
+        strip.paste(frame, (x, y))
+        is_commit = armed
+        border_col = (204, 136, 0) if is_commit else (60, 60, 60)
+        border_w = 3 if is_commit else 1
         d.rectangle(
             [x - border_w, y - border_w,
              x + w + border_w - 1, y + h + border_w - 1],
             outline=border_col, width=border_w,
         )
-        label = f"{pct}%" + ("  <- commit threshold" if is_threshold else "")
+        label = f"{pct}%" + ("  <- commits" if is_commit else "")
         d.text((x, y + h + 8), label,
-               fill=border_col if is_threshold else BLACK, font=_font(14))
+               fill=border_col if is_commit else BLACK, font=_font(14))
         d.text((x, y + h + 26), f"sheetY = {sheet_y}/{h} px",
                fill=GREY, font=_font(11))
 
@@ -395,19 +426,29 @@ def main() -> int:
     w = parse_constant("kScreenW", source)
     h = parse_constant("kScreenH", source)
 
-    # Pulled from the header, not a hardcoded 40. If firmware moves the commit
-    # point the filmstrip's marked frame moves with it, and if parsing fails
-    # we exit loudly here rather than silently drawing the wrong decision.
+    # Pulled from the header, not hardcoded. If firmware moves the commit point
+    # the filmstrip's marked frames move with it, and if parsing fails we exit
+    # loudly here rather than silently drawing the wrong decision.
+    #
+    # kCommitPct, not kThresholdPct: release now PARKS the card where it is, so
+    # the old projected-velocity threshold no longer decides anything. Commit
+    # happens by pulling past kCommitPct during the drag.
     sheet_source = SHEET_HEADER.read_text(encoding="utf-8", errors="replace")
-    threshold_pct = parse_constant(
-        "kThresholdPct", sheet_source, "src/sheet_transition.h"
+    commit_pct = parse_constant(
+        "kCommitPct", sheet_source, "src/sheet_transition.h"
     )
-    if not (0 <= threshold_pct <= 100):
+    if not (0 <= commit_pct <= 100):
         raise SystemExit(
-            f"kThresholdPct={threshold_pct} is outside [0..100] -- "
+            f"kCommitPct={commit_pct} is outside [0..100] -- "
             f"src/sheet_transition.h looks wrong; refusing to render a "
             f"misleading filmstrip"
         )
+    # Grabber geometry lives in main.cpp beside the renderer that uses it.
+    grabber = (
+        parse_constant("kGrabberInset", source),
+        parse_constant("kGrabberW", source),
+        parse_constant("kGrabberH", source),
+    )
 
     screens = {}
     wifi_body = parse_function_body("drawQrScreenWifi", source)
@@ -428,7 +469,8 @@ def main() -> int:
         problems += check(name, els, h)
 
     print(f"panel {w}x{h}")
-    print(f"sheet commit threshold {threshold_pct}% (from src/sheet_transition.h)")
+    print(f"sheet commits at {commit_pct}% (from src/sheet_transition.h); "
+          f"grabber {grabber[1]}x{grabber[2]} inset {grabber[0]} (from src/main.cpp)")
     for name, els in screens.items():
         print(f"\n{name}:")
         for el in sorted(els, key=lambda e: e.y):
@@ -460,8 +502,8 @@ def main() -> int:
         # Include the threshold explicitly and pick landmark positions around
         # it. Ordered dedup so an odd threshold (25 or 60) doesn't produce a
         # duplicate frame.
-        positions_pct = sorted({0, 25, threshold_pct, 60, 100})
-        render_filmstrip(w, h, positions_pct, threshold_pct).save(
+        positions_pct = sorted({0, 20, 50, commit_pct, 100})
+        render_filmstrip(w, h, positions_pct, commit_pct, grabber).save(
             out / "sheet_filmstrip.png"
         )
         written += 1
