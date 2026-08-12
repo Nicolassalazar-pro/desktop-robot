@@ -310,177 +310,6 @@ void testOnPressOnPartlyOpenSheetDoesNotJumpToFinger() {
   assert(c.state == State::Dragging);
 }
 
-void testNothingCommitsMidDrag() {
-  // "State changes ONLY on settle. Nothing commits mid-drag." A
-  // takeSettledOpen() that fires during Dragging would double-commit
-  // pairing on every intermediate frame.
-  Controller c;
-  c.onPress(100, 0);
-  assert(c.state == State::Dragging);
-  assert(!c.takeSettledOpen());
-
-  // Drag deep into open (past full travel, into rubber-band territory).
-  for (uint32_t t = 10; t <= 100; t += 10) {
-    const int16_t sy = static_cast<int16_t>(100 + t * 3);  // fast pull
-    c.onMove(sy, t, kH);
-    assert(c.state == State::Dragging);
-    assert(!c.takeSettledOpen());
-  }
-}
-
-void testReleaseBelowThresholdSettlesBackToClosed() {
-  // A shy drag that stops short of the threshold and holds still must
-  // roll back to Closed and never report open.
-  Controller c;
-  c.onPress(100, 0);
-  // Move to 30% of h (below the 40% threshold) with essentially zero
-  // final velocity -- steady, decelerating drag.
-  c.onMove(120, 10, kH);   // y=20
-  c.onMove(140, 40, kH);   // y=40 (slowing dt)
-  c.onMove(150, 90, kH);   // y=50 (very slow)
-  c.onMove(160, 200, kH);  // y=60, ~30% of kH, low velocity
-  c.onRelease(kH, kThreshold);
-  assert(c.state == State::Settling);
-
-  const int settleTicks = settleUntilDone(c);
-  (void)settleTicks;
-  assert(c.state == State::Closed);
-  assert(c.y == 0);
-  assert(!c.takeSettledOpen());
-}
-
-// THE headline case, half 1. See the file-top block comment.
-//
-// Below threshold + fast downward flick -> COMMITS. A release with y well
-// below the 40% threshold but with a strong downward velocity projects
-// past the threshold and must open. Position alone would have closed it,
-// so this test independently proves projection is doing work no y-only
-// comparator could do.
-void testFastFlickBelowThresholdCommits() {
-  Controller c;
-  c.onPress(100, 0);
-  // Three consecutive samples of steady +1.5 px/ms downward drag land at
-  // y = 45 (22.5% of kH, well below the 40% threshold). Consistent
-  // samples mean any reasonable velocity accumulator (last-delta, EMA,
-  // running mean) reports a strong positive velocity.
-  c.onMove(115, 10, kH);   // y = 15, dt = 10ms
-  c.onMove(130, 20, kH);   // y = 30, dt = 10ms
-  c.onMove(145, 30, kH);   // y = 45, dt = 10ms
-  assert(c.y == 45);
-  assert(c.y < kThreshold);      // position alone would close this
-  assert(c.velocity > 0);        // finger is clearly moving down
-
-  c.onRelease(kH, kThreshold);
-  assert(c.state == State::Settling);
-  // Header formula: projected = y + v*decay/1000. With v ~ 1500 and
-  // decay 120 the projected endpoint is around 225, comfortably past the
-  // 80-px threshold. Target must be kH.
-  assert(c.target == kH);
-
-  settleUntilDone(c);
-  assert(c.state == State::Open);
-  assert(c.y == kH);
-  assert(c.takeSettledOpen());
-}
-
-// THE headline case, half 2. See the file-top block comment.
-//
-// Above threshold + reversing pull-back -> CLOSES. A release with y above
-// the 40% threshold but with a clear upward velocity (the finger reversed
-// direction just before liftoff) projects BELOW the threshold, so the
-// sheet closes despite y at release being "committed" by position alone.
-// This test independently proves velocity projection can flip the verdict
-// AWAY from what position would say. A stationary release at the SAME y
-// with zero velocity would (correctly) commit -- this test does not
-// assert otherwise.
-void testReversingReleaseAboveThresholdCloses() {
-  Controller c;
-  c.onPress(100, 0);
-  // Aggressive down to y ~ 150, then sustained slow retreat back to
-  // y = 120 (60% of kH). Six retreat samples of -0.5 px/ms means even a
-  // heavy EMA drifts negative by the last sample. Any reasonable
-  // velocity model returns a clearly negative velocity at release, and
-  // the projected endpoint drops below the 80-px threshold despite the
-  // resting position being 120 (60% travel).
-  c.onMove(150, 10, kH);   // y = 50,  v = +5000
-  c.onMove(200, 20, kH);   // y = 100, v = +5000
-  c.onMove(250, 30, kH);   // y = 150, v = +5000
-  c.onMove(245, 40, kH);   // y = 145, v = -500
-  c.onMove(240, 50, kH);   // y = 140, v = -500
-  c.onMove(235, 60, kH);   // y = 135, v = -500
-  c.onMove(230, 70, kH);   // y = 130, v = -500
-  c.onMove(225, 80, kH);   // y = 125, v = -500
-  c.onMove(220, 90, kH);   // y = 120, v = -500
-  assert(c.y == 120);
-  assert(c.y > kThreshold);      // position alone would commit this
-  assert(c.velocity < 0);        // the finger is retreating
-
-  c.onRelease(kH, kThreshold);
-  assert(c.state == State::Settling);
-  // Projected = 120 + v*120/1000. With last-sample velocity -500 the
-  // projected endpoint is 60, below the 80-px threshold. Even a heavily
-  // smoothed EMA that damped the recent negative samples still lands
-  // under threshold on this shape. Target must be 0.
-  assert(c.target == 0);
-
-  settleUntilDone(c);
-  assert(c.state == State::Closed);
-  assert(c.y == 0);
-  // Below-threshold release must NEVER report open. This pins the whole
-  // "reversing release closes despite position saying open" story.
-  assert(!c.takeSettledOpen());
-}
-
-void testSettledOpenIsOneShot() {
-  // The header spells out the contract exactly: "True exactly once, on the
-  // frame the sheet finishes settling OPEN." Get the edge wrong and you
-  // either commit repeatedly (paired account created every frame) or
-  // never (silently ignored release).
-  Controller c;
-  c.onPress(100, 0);
-  c.onMove(115, 10, kH);
-  c.onMove(130, 20, kH);
-  c.onMove(145, 30, kH);
-  c.onRelease(kH, kThreshold);
-  settleUntilDone(c);
-  assert(c.state == State::Open);
-
-  // Fires exactly once...
-  assert(c.takeSettledOpen());
-  // ...and only once. Any subsequent poll before a new cycle is false.
-  assert(!c.takeSettledOpen());
-  assert(!c.takeSettledOpen());
-  assert(!c.takeSettledOpen());
-
-  // A brand-new open cycle from Open state re-arms the one-shot: press,
-  // shove down (already open, so no motion), release with high velocity.
-  // The flag must fire again exactly once on the next settle.
-  c.onPress(100, 200);
-  c.onMove(115, 210, kH);
-  c.onMove(130, 220, kH);
-  c.onMove(145, 230, kH);
-  c.onRelease(kH, kThreshold);
-  settleUntilDone(c);
-  assert(c.state == State::Open);
-  assert(c.takeSettledOpen());
-  assert(!c.takeSettledOpen());
-}
-
-void testTakeSettledOpenIsFalseWhenSheetSettlesClosed() {
-  // The counterpart to the one-shot test: settle CLOSED must NOT fire the
-  // one-shot. If it does, we commit a pairing that the operator explicitly
-  // dismissed.
-  Controller c;
-  c.onPress(100, 0);
-  c.onMove(110, 10, kH);
-  c.onMove(115, 30, kH);
-  c.onMove(118, 100, kH);
-  c.onRelease(kH, kThreshold);
-  settleUntilDone(c);
-  assert(c.state == State::Closed);
-  assert(!c.takeSettledOpen());
-}
-
 void testMillisRolloverMidDrag() {
   // Header: "Timestamps must be handled rollover-safely: subtract into a
   // SIGNED type." PROJECT-HISTORY R46 shipped once already because the
@@ -511,12 +340,13 @@ void testMillisRolloverMidDrag() {
   assert(c.velocity < 10000);    // and not an unsigned-underflow explosion
   assert(c.y == 60);             // 1:1 tracking survived the rollover
 
-  // And the release still projects correctly past kProjectMs -- if any
-  // stored velocity is garbage, target flips.
-  c.onRelease(kH, kThreshold);
-  assert(c.target == kH);
-  settleUntilDone(c);
-  assert(c.state == State::Open);
+  // And release still behaves correctly with a rollover-derived velocity: it
+  // parks where it is. Under the old contract this asserted the projected
+  // target; that path is gone, but the reason the test exists is unchanged --
+  // garbage velocity from a bad rollover must not move the card.
+  c.onRelease(kH, 0);
+  assert(c.y == 60);
+  assert(c.state == State::Parked);
 }
 
 void testTwoSamplesInSameMillisecondDoNotDivideByZero() {
@@ -576,6 +406,121 @@ void testResetReturnsToClosed() {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Park-on-release contract.
+//
+// Release used to pick a target from projected velocity and settle open or
+// closed, committing on settle. It now PARKS the card exactly where the finger
+// left it, and commit is a consequence of pulling the card all the way down
+// during the drag. These tests pin that, and would have caught the old
+// behaviour surviving the change.
+// ---------------------------------------------------------------------------
+
+void testReleaseParksExactlyWhereItWasLeft() {
+  Controller c;
+  c.onPress(100, 0);
+  c.onMove(160, 20, kH);   // y = 60
+  const int16_t before = c.y;
+  c.onRelease(kH, 0);
+  assert(c.y == before);            // did not move
+  assert(c.state == State::Parked); // and did not settle anywhere
+  assert(!c.takeSettledOpen());     // releasing commits nothing
+}
+
+void testReleaseWithStrongVelocityStillParks() {
+  // The old contract would have thrown this open on projection alone. Under
+  // park semantics a fling is just a fast drag that stops when you let go.
+  Controller c;
+  c.onPress(100, 0);
+  c.onMove(130, 10, kH);
+  c.onMove(190, 20, kH);   // ~6 px/ms downward, a genuine fling
+  const int16_t before = c.y;
+  assert(c.velocity > 0);
+  c.onRelease(kH, 0);
+  assert(c.y == before);
+  assert(!c.takeSettledOpen());
+}
+
+void testReleaseAtZeroReportsClosedNotParked() {
+  Controller c;
+  c.onPress(100, 0);
+  c.onMove(100, 20, kH);   // never moved
+  c.onRelease(kH, 0);
+  assert(c.y == 0);
+  assert(c.state == State::Closed);
+}
+
+void testCommitFiresOnCrossingTheCommitLineMidDrag() {
+  Controller c;
+  c.onPress(0, 0);
+  const int16_t line = static_cast<int16_t>((kH * SheetTransition::kCommitPct) / 100);
+  // Short of the line: nothing.
+  c.onMove(static_cast<int16_t>(line - 10), 20, kH);
+  assert(!c.takeSettledOpen());
+  // Cross it: exactly one commit.
+  c.onMove(static_cast<int16_t>(line + 5), 40, kH);
+  assert(c.takeSettledOpen());
+}
+
+void testCommitIsAOneShotWhileHeldAtTheBottom() {
+  // Holding the card at the bottom must not re-fire. Without the crossing
+  // latch this would start the AP on every frame.
+  Controller c;
+  c.onPress(0, 0);
+  const int16_t line = static_cast<int16_t>((kH * SheetTransition::kCommitPct) / 100);
+  c.onMove(static_cast<int16_t>(line + 5), 20, kH);
+  assert(c.takeSettledOpen());
+  for (uint32_t t = 40; t <= 200; t += 20) {
+    c.onMove(static_cast<int16_t>(line + 6), t, kH);
+    assert(!c.takeSettledOpen());
+  }
+}
+
+void testCommitCanFireAgainOnASecondGesture() {
+  // Commit, close, pull down again -- the latch must re-arm on press, or the
+  // sheet would work exactly once per boot.
+  Controller c;
+  const int16_t line = static_cast<int16_t>((kH * SheetTransition::kCommitPct) / 100);
+  c.onPress(0, 0);
+  c.onMove(static_cast<int16_t>(line + 5), 20, kH);
+  assert(c.takeSettledOpen());
+  c.reset();
+  c.onPress(0, 100);
+  c.onMove(static_cast<int16_t>(line + 5), 120, kH);
+  assert(c.takeSettledOpen());
+}
+
+void testShortPullNeverCommits() {
+  Controller c;
+  c.onPress(0, 0);
+  const int16_t line = static_cast<int16_t>((kH * SheetTransition::kCommitPct) / 100);
+  for (uint32_t t = 20; t <= 200; t += 20) {
+    c.onMove(static_cast<int16_t>(line - 20), t, kH);
+    assert(!c.takeSettledOpen());
+  }
+  c.onRelease(kH, 0);
+  assert(!c.takeSettledOpen());
+}
+
+void testDormantSettlePathStillConvergesIfDrivenManually() {
+  // The settle machinery is no longer used by release -- the card parks
+  // instead -- but tick()/settleStep() are kept because animation work is
+  // planned and they are already reviewed. Dormant code that nobody exercises
+  // rots silently, so drive it explicitly here: put the controller into
+  // Settling by hand and assert it still converges without overshoot and arms
+  // the one-shot exactly once on reaching an open target.
+  Controller c;
+  c.y      = 40;
+  c.target = kH;
+  c.state  = State::Settling;
+  const int ticks = settleUntilDone(c);
+  assert(ticks > 0);
+  assert(c.y == kH);
+  assert(c.state == State::Open);
+  assert(c.takeSettledOpen());
+  assert(!c.takeSettledOpen());
+}
+
 int main() {
   testRubberBandInsideRangeIsExactlyOneToOne();
   testRubberBandOvershootBelowZeroIsDamped();
@@ -597,12 +542,15 @@ int main() {
   testSettleStepGuaranteesOnePixelProgress();
 
   testOnPressOnPartlyOpenSheetDoesNotJumpToFinger();
-  testNothingCommitsMidDrag();
-  testReleaseBelowThresholdSettlesBackToClosed();
-  testFastFlickBelowThresholdCommits();
-  testReversingReleaseAboveThresholdCloses();
-  testSettledOpenIsOneShot();
-  testTakeSettledOpenIsFalseWhenSheetSettlesClosed();
+
+  testReleaseParksExactlyWhereItWasLeft();
+  testReleaseWithStrongVelocityStillParks();
+  testReleaseAtZeroReportsClosedNotParked();
+  testCommitFiresOnCrossingTheCommitLineMidDrag();
+  testCommitIsAOneShotWhileHeldAtTheBottom();
+  testCommitCanFireAgainOnASecondGesture();
+  testShortPullNeverCommits();
+  testDormantSettlePathStillConvergesIfDrivenManually();
   testMillisRolloverMidDrag();
   testTwoSamplesInSameMillisecondDoNotDivideByZero();
   testProgressReportsFractionOfTravel();

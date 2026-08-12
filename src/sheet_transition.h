@@ -60,8 +60,32 @@ enum class State : uint8_t {
   Closed,     // fully retracted, face visible, not tracking
   Dragging,   // finger down, card following it
   Settling,   // finger released, animating to the chosen target
+  Parked,     // finger released, card left exactly where it was
   Open,       // fully extended, card covering the face
 };
+
+// Distance at which the card counts as pulled "all the way down", as a
+// percentage of travel.
+//
+// It is 85% and not 100% for a geometric reason that is easy to miss. Tracking
+// is 1:1, so the furthest the card can travel is (H - startY): a drag begun
+// 30 px below the top edge can never push the card past 250 of 280. At a
+// literal 100% the sheet would be uncommittable from any start point except the
+// exact top row. 85% is reachable from anywhere sensible, and in practice the
+// finger runs off the bottom of the panel first, which reads as finger-gone and
+// parks the card near maximum anyway.
+constexpr int16_t kCommitPct = 85;
+
+// ---------------------------------------------------------------------------
+// The three functions below are NOT used by the release path any more.
+//
+// Release used to choose a target from the projected endpoint and animate to
+// it. It now parks the card exactly where the finger left it, and commit
+// happens by dragging to kCommitPct. They are kept because they are tested,
+// reviewed, and correct, and because the interaction is still being developed --
+// throwing away a working velocity model to re-derive it in a week would be
+// waste. Nothing calls them today; do not assume they are live.
+// ---------------------------------------------------------------------------
 
 // Damp a raw finger offset into sheet travel.
 //   0 <= raw <= h  -> returned unchanged (true 1:1 tracking)
@@ -112,6 +136,10 @@ struct Controller {
   int16_t  lastSampleY  = 0;
   uint32_t lastSampleMs = 0;
   bool     justSettled  = false;  // one-shot, consumed by takeSettled()
+  // Latch so the commit fires on the CROSSING only. Without it, holding the
+  // card at the bottom would re-arm the one-shot on every frame and the caller
+  // would start the AP repeatedly. Cleared by onPress and reset.
+  bool     armedOpen    = false;
 
   // Finger down. Captures the origin so a drag can begin from a partly-open
   // sheet without jumping.
@@ -120,16 +148,31 @@ struct Controller {
   // Finger moved. Updates travel with rubber-banding and accumulates velocity.
   void onMove(int16_t screenY, uint32_t nowMs, int16_t h);
 
-  // Finger lifted. Picks a target from the projected endpoint and begins
-  // settling. Does NOT commit anything.
+  // Finger lifted. PARKS the card exactly where it is -- no target, no settle.
+  //
+  // The sheet is a physical shade: it goes where you push it and stays there.
+  // Committing is done by pulling it all the way down (reachedCommit), not by
+  // releasing past a threshold. `h` and `threshold` are retained so callers do
+  // not have to change, and so the projection model can be reinstated without
+  // another signature churn.
   void onRelease(int16_t h, int16_t threshold);
 
+  // True once the card has been pulled far enough to count as fully down.
+  // Evaluated DURING the drag, which is what makes commit a consequence of the
+  // gesture rather than of letting go.
+  bool reachedCommit(int16_t h) const;
+
   // Advance one settle frame. Returns true while still moving.
+  //
+  // Only meaningful if something explicitly puts the controller into Settling;
+  // the release path no longer does. Kept for the same reason as project() --
+  // see the note above.
   bool tick(uint8_t percentPerTick);
 
-  // True exactly once, on the frame the sheet finishes settling OPEN. This is
-  // the only signal the caller should act on -- it is what makes the commit
-  // happen on settle rather than mid-drag.
+  // True exactly once, on the frame the card first reaches the commit
+  // distance. This is the only commit signal, and being edge-triggered is what
+  // stops it firing every frame while the operator holds the card at the
+  // bottom.
   bool takeSettledOpen();
 
   // Progress 0..255 for anything that wants to interpolate alongside the sheet.

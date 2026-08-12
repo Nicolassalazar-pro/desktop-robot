@@ -9900,7 +9900,100 @@ void pushSheetStrip(uint16_t* framebuffer, int16_t fromRow, int16_t toRow) {
 // otherwise burn a set. The QR only exists once the AP has come up and the
 // state machine has entered RUNNING; the sheet-card content up to that point
 // is deliberately just the splash.
-// Paint the pairing card, in one of two states.
+// Grabber bar — the handle you actually pull.
+//
+// Hidden while the sheet is closed and untouched, because the idle face is the
+// robot's character and permanent chrome on it has a real cost. It appears when
+// a finger lands near it, and gives up after kGrabberRevealMs if no drag
+// follows, so a stray tap does not leave furniture behind.
+//
+// While the card is moving it is welded to the card's BOTTOM edge, which is
+// what turns it from decoration-that-happens-to-be-nearby into the thing being
+// dragged. Design-craft §8: the affordance should teach the gesture.
+constexpr int16_t  kGrabberW        = 46;
+constexpr int16_t  kGrabberH        = 5;
+constexpr int16_t  kGrabberInset    = 6;    // gap from the edge it hangs off
+constexpr int16_t  kGrabberZone     = 64;   // "near it" reveal band, px
+constexpr uint32_t kGrabberRevealMs = 1000; // auto-hide if no drag follows
+constexpr uint16_t kGrabberColour   = 0xAD55;  // mid grey, reads on face or card
+
+bool     g_grabberVisible   = false;
+uint32_t g_grabberHideAtMs  = 0;
+// Last band the grabber was painted into, so it can be erased from whichever
+// source now owns those rows. Without this the strip push leaves a stale bar
+// behind: it only repaints [old, new), which never covers where the grabber
+// used to be.
+int16_t  g_grabberDrawnTop  = -1;
+bool     g_grabberDrawnOnCard = false;
+
+static void drawGrabberToCanvas(Arduino_Canvas* target, int16_t topY,
+                                uint16_t colour) {
+  if (target == nullptr) return;
+  const int16_t x = static_cast<int16_t>((kScreenW - kGrabberW) / 2);
+  target->fillRoundRect(x, topY, kGrabberW, kGrabberH,
+                        static_cast<int16_t>(kGrabberH / 2), colour);
+}
+
+// Paint / move / erase the grabber. Called every frame from the drag service,
+// AFTER the strip push so it lands on top of whatever the compositor just laid
+// down.
+//
+// `sheetY` is the card's bottom edge; `wantVisible` is the reveal decision.
+//
+// The erase bookkeeping is the fiddly half, and the predicted bug source. The
+// strip compositor only repaints [old, new), which never covers the rows the
+// grabber previously occupied -- so a moving bar would smear copies of itself
+// down the panel. Every frame therefore restores the previously painted band
+// from whichever source owns those rows NOW: rows above the card's edge are
+// card, rows below are face. A band straddling the edge is restored from both,
+// which is why the two pushes below are not an if/else.
+static void serviceGrabber(int16_t sheetY, bool wantVisible) {
+  if (g_gfx == nullptr || g_canvas == nullptr) return;
+
+  const bool onCard = sheetY > 0;
+  const int16_t topY =
+      onCard ? static_cast<int16_t>(sheetY - kGrabberInset - kGrabberH)
+             : kGrabberInset;
+
+  const bool wasDrawn = (g_grabberDrawnTop >= 0);
+  if (wantVisible && wasDrawn && g_grabberDrawnTop == topY &&
+      g_grabberDrawnOnCard == onCard) {
+    return;  // nothing moved, nothing to do
+  }
+  if (!wantVisible && !wasDrawn) {
+    return;
+  }
+
+  if (wasDrawn) {
+    const int16_t eraseTop = g_grabberDrawnTop;
+    const int16_t eraseBot =
+        static_cast<int16_t>(g_grabberDrawnTop + kGrabberH);
+    const int16_t edge = (sheetY < 0) ? 0 : sheetY;
+    if (eraseTop < edge && g_sheetCanvas != nullptr) {
+      pushSheetStrip(g_sheetCanvas->getFramebuffer(), eraseTop,
+                     (eraseBot < edge) ? eraseBot : edge);
+    }
+    if (eraseBot > edge) {
+      pushSheetStrip(g_canvas->getFramebuffer(),
+                     (eraseTop > edge) ? eraseTop : edge, eraseBot);
+    }
+    g_grabberDrawnTop = -1;
+  }
+
+  if (!wantVisible) {
+    return;
+  }
+
+  // Painted straight to the panel rather than into a canvas. The card content
+  // is static in the sheet canvas and the face is redrawn by the eye engine, so
+  // baking a MOVING bar into either would mean re-rendering a whole layer every
+  // frame to shift a 46x5 rectangle.
+  const int16_t x = static_cast<int16_t>((kScreenW - kGrabberW) / 2);
+  g_gfx->fillRoundRect(x, topY, kGrabberW, kGrabberH,
+                       static_cast<int16_t>(kGrabberH / 2), kGrabberColour);
+  g_grabberDrawnTop    = topY;
+  g_grabberDrawnOnCard = onCard;
+}
 //
 // TWO LABELS, NOT ONE. The card used to say "Establishing Server..." from the
 // moment a finger touched the panel, which was a lie for the whole drag --
@@ -9923,7 +10016,7 @@ void pushSheetStrip(uint16_t* framebuffer, int16_t fromRow, int16_t toRow) {
 static void drawSheetCard(bool armed, bool committed) {
   if (g_sheetCanvas == nullptr) return;
   g_sheetCanvas->fillScreen(0x0000);
-  const char* line1 = committed ? "Establishing" : (armed ? "Release" : "Pull down");
+  const char* line1 = committed ? "Establishing" : (armed ? "Let go" : "Pull down");
   const char* line2 = committed ? "Server..."    : (armed ? "to pair" : "to pair");
   const uint8_t kSize = 2;
   const int16_t w1 = static_cast<int16_t>(strlen(line1) * 6 * kSize);
@@ -10409,6 +10502,10 @@ static void serviceDragTransition() {
       s_renderedY = 0;
       s_pressed   = false;
     }
+    // Leaving the face takes the grabber with it. The mode switch repaints the
+    // whole panel, so just forget the band rather than trying to erase it.
+    g_grabberVisible  = false;
+    g_grabberDrawnTop = -1;
     return;
   }
 
@@ -10477,63 +10574,79 @@ static void serviceDragTransition() {
                           (ok && !pressed);
 
   if (ok && pressed && !s_pressed) {
-    // First contact on the face screen. Paint the card content once so every
-    // strip we push already shows the pairing splash -- deferring this to
-    // the first move would flash a partial card.
+    // Contact. Two different meanings depending on where the card is.
+    const int16_t edge = (g_sheet.y > 0) ? static_cast<int16_t>(g_sheet.y)
+                                         : 0;
+    const bool nearGrabber =
+        (screenY >= edge - kGrabberZone) && (screenY <= edge + kGrabberZone);
+    // Reveal on a touch near the handle. The zone follows the CARD EDGE rather
+    // than the top of the screen, because that is where the handle actually is
+    // once the card is parked partway -- "near it" has to mean near the thing.
+    if (nearGrabber) {
+      g_grabberVisible  = true;
+      g_grabberHideAtMs = nowMs + kGrabberRevealMs;
+    }
+    // Paint the card content once so every strip pushed already shows the
+    // pairing splash -- deferring it to the first move would flash a partial
+    // card.
     s_armed = false;
     drawSheetCard(/*armed=*/false, /*committed=*/false);
     g_sheet.onPress(screenY, nowMs);
     s_pressed = true;
   } else if (ok && pressed && s_pressed) {
     g_sheet.onMove(screenY, nowMs, kScreenH);
-    // Re-evaluate the commit verb against the PROJECTED endpoint -- the same
-    // number onRelease will use -- so what the card promises is exactly what
-    // releasing now would do. Testing raw position instead would promise
-    // "Release to pair" while a decelerating finger was about to cancel.
-    //
-    // Edge-triggered: the card is only repainted when the answer flips, so a
-    // steady drag costs nothing extra. Rows already pushed keep the old verb
-    // until the strip logic repaints them, which is why the whole visible
-    // extent is re-pushed on a flip.
-    const int16_t threshold =
-        static_cast<int16_t>((static_cast<int32_t>(kScreenH) *
-                              SheetTransition::kThresholdPct) / 100);
-    const int32_t projected = SheetTransition::project(
-        g_sheet.y, g_sheet.velocity, SheetTransition::kProjectMs);
-    const bool armed = projected >= threshold;
-    if (armed != s_armed) {
-      s_armed = armed;
-      drawSheetCard(armed, /*committed=*/false);
-      s_renderedY = 0;  // force a full repaint of the visible card extent
+    // A drag in progress keeps the handle alive; the auto-hide only exists to
+    // clean up after a touch that went nowhere.
+    if (g_sheet.y > 0) {
+      g_grabberVisible  = true;
+      g_grabberHideAtMs = nowMs + kGrabberRevealMs;
+    }
+    // The verb is now DISTANCE-based, not projection-based. Releasing no longer
+    // commits anything, so "Release to pair" would be a lie -- the operator has
+    // to pull the card the rest of the way down.
+    const bool nearlyThere = g_sheet.reachedCommit(kScreenH);
+    if (nearlyThere != s_armed) {
+      s_armed = nearlyThere;
+      drawSheetCard(nearlyThere, /*committed=*/false);
+      s_renderedY = 0;  // force a repaint of the visible card extent
     }
   } else if (s_pressed && fingerGone) {
-    // Real release: either the chip reported the finger up, or reads have
-    // failed long enough that we stop assuming it is still there.
-    const int16_t threshold =
-        static_cast<int16_t>((static_cast<int32_t>(kScreenH) *
-                              SheetTransition::kThresholdPct) / 100);
-    g_sheet.onRelease(kScreenH, threshold);
+    // Release PARKS the card where it is. Nothing commits here.
+    g_sheet.onRelease(kScreenH, 0);
     s_pressed = false;
+    // Keep the handle up while the card is parked open -- the card is visibly
+    // out, so hiding its handle would strand the operator with no signal that
+    // it can be pushed back.
+    if (g_sheet.y > 0) {
+      g_grabberVisible  = true;
+      g_grabberHideAtMs = nowMs + kGrabberRevealMs;
+    }
   }
 
-  // Advance the settle animation from the loop. NO delay() here -- an animation
-  // that sleeps on a watchdog-fed task is a pending reset.
+  // Auto-hide, but only with the card fully closed. A parked card keeps its
+  // handle indefinitely.
+  if (g_grabberVisible && g_sheet.y <= 0 && !s_pressed &&
+      static_cast<int32_t>(nowMs - g_grabberHideAtMs) >= 0) {
+    g_grabberVisible = false;
+  }
+
+  // No-op unless something explicitly put the controller into Settling; the
+  // release path no longer does. Kept so a future animation pass can reinstate
+  // settling without re-wiring the loop.
   g_sheet.tick(SheetTransition::kSettlePercent);
 
-  // Consume the one-shot committed-open signal exactly once. Hand off to the
-  // existing chip-swipe path (g_orPendingSwipeDown) so drag and the chip
-  // converge on the same lifecycle rather than duplicating it. Arm the
-  // gesture-suppression window so the chip's own release-time SwipeDown
-  // arriving in the next control() tick does not fire the AP a second time.
+  // Commit fires when the card CROSSES the commit line during the drag -- a
+  // consequence of the gesture reaching the bottom, not of letting go. Hand off
+  // to the existing chip-swipe path so drag and the chip converge on one
+  // lifecycle, and arm the suppression window so the chip's own release-time
+  // SwipeDown does not start the AP a second time.
   if (g_sheet.takeSettledOpen()) {
     g_sheetGestureSuppressUntilMs = nowMs + kSheetGestureSuppressMs;
     g_orPendingSwipeDown = true;
-    // Now the label is finally true: repaint so the fully-open card reads
-    // "Establishing Server..." as the AP actually comes up.
     s_armed = false;
     drawSheetCard(/*armed=*/false, /*committed=*/true);
     s_renderedY = 0;
-    Serial.println(F("sheet: committed open -> orPendingSwipeDown"));
+    Serial.println(F("sheet: pulled to commit -> orPendingSwipeDown"));
   }
 
   // Visible sheet height in [0, H]. y may rubber-band outside the panel range
@@ -10543,6 +10656,8 @@ static void serviceDragTransition() {
   if (y > kScreenH)  y = kScreenH;
 
   if (y == s_renderedY) {
+    // Card did not move, but the grabber may still need to appear or expire.
+    serviceGrabber(y, g_grabberVisible);
     return;
   }
 
@@ -10560,6 +10675,10 @@ static void serviceDragTransition() {
     }
   }
   s_renderedY = y;
+
+  // AFTER the strip, so the handle lands on top of whatever was just composited
+  // rather than being immediately painted over.
+  serviceGrabber(y, g_grabberVisible);
 }
 
 // Consume a pending button press: highlight it, run the gesture, and clear the

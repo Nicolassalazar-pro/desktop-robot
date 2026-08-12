@@ -83,6 +83,10 @@ void Controller::onPress(int16_t screenY, uint32_t nowMs) {
   // Otherwise a forgotten poll would fire commit on the NEXT open cycle
   // and land at a state change the user did not just perform.
   justSettled = false;
+  // Re-arm the crossing latch. Without this, dragging the card down to commit,
+  // dragging it back up, and pulling it down again would never fire a second
+  // commit -- the sheet would work exactly once per boot.
+  armedOpen = false;
 }
 
 void Controller::onMove(int16_t screenY, uint32_t nowMs, int16_t h) {
@@ -112,16 +116,45 @@ void Controller::onMove(int16_t screenY, uint32_t nowMs, int16_t h) {
     lastSampleY = y;
     lastSampleMs = nowMs;
   }
+
+  // Arm the commit the moment the card crosses the line, and only on the
+  // crossing. Commit is now a consequence of the GESTURE reaching the bottom,
+  // not of letting go, so this is where it belongs -- but it has to be
+  // edge-triggered or holding the card at the bottom would re-fire it on every
+  // frame. `armedOpen` is the latch that makes it an edge.
+  if (!armedOpen && reachedCommit(h)) {
+    armedOpen = true;
+    justSettled = true;
+    state = State::Open;
+  }
 }
 
 void Controller::onRelease(int16_t h, int16_t threshold) {
-  // Projected endpoint, not current position, chooses the target. This is
-  // the entire reason the controller carries velocity at all; a picker that
-  // only reads y would either miss deliberate flicks or over-commit slow
-  // drifts. The asymmetry is the point.
-  const int32_t projected = project(y, velocity, kProjectMs);
-  target = chooseTarget(projected, h, threshold);
-  state = State::Settling;
+  // PARK. The card stays exactly where the finger left it.
+  //
+  // This deliberately does not use velocity or the projected endpoint. The
+  // sheet behaves as a physical shade -- it goes where you push it and stays
+  // there -- so releasing is not a decision point at all. Commit happens by
+  // pulling the card all the way down (reachedCommit), which the caller checks
+  // during the drag.
+  //
+  // h and threshold are unused, kept so callers and the projection model can be
+  // reinstated without another signature change.
+  (void)h;
+  (void)threshold;
+  // Zeroing velocity is what makes the park stick: a stale non-zero value would
+  // otherwise be carried into the next press and let a fling from a previous
+  // gesture influence a new one.
+  velocity = 0;
+  state = (y <= 0) ? State::Closed : State::Parked;
+}
+
+bool Controller::reachedCommit(int16_t h) const {
+  if (h <= 0) {
+    return false;
+  }
+  const int32_t line = (static_cast<int32_t>(h) * kCommitPct) / 100;
+  return static_cast<int32_t>(y) >= line;
 }
 
 bool Controller::tick(uint8_t percentPerTick) {
@@ -188,6 +221,7 @@ void Controller::reset() {
   lastSampleY = 0;
   lastSampleMs = 0;
   justSettled = false;
+  armedOpen = false;
 }
 
 }  // namespace SheetTransition
