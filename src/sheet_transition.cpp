@@ -79,6 +79,10 @@ void Controller::onPress(int16_t screenY, uint32_t nowMs) {
   velocity = 0;
   lastSampleY = y;
   lastSampleMs = nowMs;
+  // Where the finger currently is, as opposed to where the card is. Needed by
+  // reachedCommit to tell "pulled as far as the panel allows" from "stopped
+  // short" -- see the note there.
+  lastScreenY = screenY;
   // A new interaction cancels any prior one-shot the caller never took.
   // Otherwise a forgotten poll would fire commit on the NEXT open cycle
   // and land at a state change the user did not just perform.
@@ -99,6 +103,7 @@ void Controller::onMove(int16_t screenY, uint32_t nowMs, int16_t h) {
   if (raw > INT16_MAX) raw = INT16_MAX;
   if (raw < INT16_MIN) raw = INT16_MIN;
   y = rubberBand(static_cast<int16_t>(raw), h);
+  lastScreenY = screenY;
 
   // R46 rollover-safe delta: subtract as UNSIGNED (well-defined modular
   // wrap) then reinterpret the result as SIGNED. Across the 49.7-day
@@ -130,23 +135,50 @@ void Controller::onMove(int16_t screenY, uint32_t nowMs, int16_t h) {
 }
 
 void Controller::onRelease(int16_t h, int16_t threshold) {
-  // PARK. The card stays exactly where the finger left it.
+  // SNAP to whichever end the card is nearest.
   //
-  // This deliberately does not use velocity or the projected endpoint. The
-  // sheet behaves as a physical shade -- it goes where you push it and stays
-  // there -- so releasing is not a decision point at all. Commit happens by
-  // pulling the card all the way down (reachedCommit), which the caller checks
-  // during the drag.
+  // This replaces the earlier "park exactly where the finger left it" rule.
+  // Park was a reasonable model -- a physical shade goes where you push it --
+  // but it had a failure the metaphor does not: a card left half-open puts the
+  // controller in a state that is not Closed, and the caller suppresses the
+  // face renderer for exactly that condition. So a half-pull that the operator
+  // simply abandoned froze the robot's face behind a stationary card, with the
+  // only way out being to find the edge and drag it back. Snapping removes the
+  // half-open resting state altogether, which removes the trap with it.
   //
-  // h and threshold are unused, kept so callers and the projection model can be
-  // reinstated without another signature change.
-  (void)h;
+  // 51% rather than the 40% drag threshold because this is a commitment, not a
+  // hint: past half means "I meant to open it".
+  //
+  // Deliberately NOT velocity-projected. project()/chooseTarget() still exist
+  // and still work, but a flick that lands 5 px past halfway opening the AP is
+  // a surprise, and the operator asked for position to decide it.
   (void)threshold;
-  // Zeroing velocity is what makes the park stick: a stale non-zero value would
-  // otherwise be carried into the next press and let a fling from a previous
-  // gesture influence a new one.
   velocity = 0;
-  state = (y <= 0) ? State::Closed : State::Parked;
+
+  if (h <= 0) {
+    state = (y <= 0) ? State::Closed : State::Parked;
+    return;
+  }
+
+  const int32_t line = (static_cast<int32_t>(h) * kSnapOpenPct) / 100;
+  target = (static_cast<int32_t>(y) >= line) ? h : 0;
+
+  if (y == target) {
+    // Already there; no animation to run. Route through the same latch tick()
+    // uses so a commit cannot fire twice for one gesture.
+    if (target == 0) {
+      state = State::Closed;
+    } else {
+      state = State::Open;
+      if (!armedOpen) {
+        armedOpen = true;
+        justSettled = true;
+      }
+    }
+    return;
+  }
+
+  state = State::Settling;
 }
 
 bool Controller::reachedCommit(int16_t h) const {
@@ -154,7 +186,41 @@ bool Controller::reachedCommit(int16_t h) const {
     return false;
   }
   const int32_t line = (static_cast<int32_t>(h) * kCommitPct) / 100;
-  return static_cast<int32_t>(y) >= line;
+  if (static_cast<int32_t>(y) >= line) {
+    return true;
+  }
+  // "Pulled as far as the panel allows" also counts.
+  //
+  // WHY THIS SECOND RULE EXISTS
+  //
+  // Tracking is 1:1, so from a closed sheet the card can never exceed
+  // (h - pressY). Commit at 85% of a 280 px panel is 238, which means a press
+  // even 60 px down caps the card at 220 and the gesture CANNOT commit no
+  // matter how far it is pulled. That is not a tuning problem, it is an
+  // unreachable target -- and it is exactly why the operator found the sheet
+  // took two pulls to open.
+  //
+  // The tempting fixes are both wrong. Lowering kCommitPct makes the sheet
+  // trigger-happy everywhere to rescue one start position. Anchoring the card
+  // edge to the finger makes it reachable but teleports the card by however
+  // far the press landed from the edge -- which is precisely what
+  // dragBaseY/dragOriginY were split up to prevent (and a test caught it).
+  //
+  // So instead: honour the gesture the operator actually performed. Running the
+  // finger to the bottom of the panel IS pulling the shade all the way down,
+  // whatever the arithmetic ceiling happens to be. Reachable from any start
+  // point, still exactly 1:1, and no jump.
+  //
+  // The travel floor is what keeps it honest -- without it, a tap near the
+  // bottom of the screen would read as a completed pull. Requiring the card to
+  // be at least half-way means the operator has to have actually dragged it
+  // there.
+  const int32_t pullLine = (static_cast<int32_t>(h) * kPullOutCommitPct) / 100;
+  const bool fingerOutOfRoom =
+      (lastScreenY >= 0) &&
+      (static_cast<int32_t>(lastScreenY) >=
+       (static_cast<int32_t>(h) - kPullOutBandPx));
+  return fingerOutOfRoom && (static_cast<int32_t>(y) >= pullLine);
 }
 
 bool Controller::tick(uint8_t percentPerTick) {
@@ -176,7 +242,12 @@ bool Controller::tick(uint8_t percentPerTick) {
     state = State::Closed;
   } else {
     state = State::Open;
-    justSettled = true;
+    // Same latch the mid-drag commit uses, so a gesture that both crosses the
+    // commit line AND snaps open fires the one-shot exactly once.
+    if (!armedOpen) {
+      armedOpen = true;
+      justSettled = true;
+    }
   }
   velocity = 0;
   return false;
@@ -219,6 +290,7 @@ void Controller::reset() {
   target = 0;
   velocity = 0;
   lastSampleY = 0;
+  lastScreenY = -1;
   lastSampleMs = 0;
   justSettled = false;
   armedOpen = false;

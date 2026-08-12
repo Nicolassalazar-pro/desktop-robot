@@ -973,6 +973,144 @@ written.
 
 ---
 
+### R49 — Deriving the touch coordinate frame from the chip's gesture IDs
+**Tried:** `mapTouchToScreen` translated raw CST816T coordinates into screen
+space by swapping and mirroring the axes:
+
+    screenY = chipX;
+    screenX = kScreenW - chipY;
+
+**Why it was believed:** the swipe IDs on this board *were* calibrated on
+hardware (`kTouchSwipeDownId=1` is the chip's `GESTURE_RIGHT`), and the
+conclusion drawn from that was "the chip's axes sit 90° off the panel, so the
+coordinates must be swapped too". The comment even flagged the mirror as the
+one part "not pinned down by the swipe evidence" — and shipped it anyway,
+reasoning that the gesture menu's full-width buttons meant X did not matter.
+
+**Why it is wrong:** a gesture enumeration is not a coordinate frame. The
+CST816T's gesture engine has its own orientation; its coordinate registers do
+not share it. `touchaxis` on this hardware (2026-08-12):
+
+    drag top -> bottom : chipY 6 -> 264,   chipX flat (111 -> 104)
+    drag left -> right : chipX 91 -> 217,  chipY flat (176 -> 196)
+
+The mapping is the **identity**. Which the display constructor already said:
+`kLcdRotate == 0`, so screen space and panel space are the same frame and there
+was never a rotation to undo.
+
+**How it stayed hidden:** the pull-down sheet (R48's successor) *worked* — as
+long as you swiped **sideways**. The operator had adapted to it and reported it
+as "the swipe is rotated 90 degrees", which is exactly what it was. The
+full-width-buttons argument also quietly broke the gesture menu: with X mapped
+from the vertical axis, touches near the top or bottom of the panel clamped
+outside the button's X range and were rejected outright.
+
+**Also rejected, on the way to the fix:** logging raw coordinates from inside
+`serviceDragTransition`. That function is gated on `LCD_MODE_FACE && ORS_IDLE`,
+so the instant a drag committed and the AP came up, sampling stopped and the
+measurement drag was never recorded. Diagnostics must not sit behind the state
+they are diagnosing.
+
+**Resolution:** identity mapping, plus a permanent `touchaxis` serial command
+that captures raw samples over an 8 s window from `loop()` — state-independent,
+non-blocking (a tight sampling loop in the command handler would blow the 5 s
+`TASK_WDT`), and it prints the verdict rather than the raw numbers alone.
+**Lesson worth keeping:** the sibling of R48. There, an API existing was not the
+data arriving; here, a mapping inferred from an enumeration was not a measured
+mapping. Both cost weeks and both were settled by one measurement. When a
+comment admits a part is unverified, that is the bug — go and measure it.
+**Basis:** MEASURED (`touchaxis`, hardware, 2026-08-12).
+
+---
+
+### R50 — ST7789 hardware vertical scroll for the sheet, and the 80 MHz "fix"
+**Tried (a):** using the panel's hardware vertical scroll (`VSCRDEF` 0x33 /
+`VSCRSADD` 0x37) to translate the pairing card over the face for free, on the
+theory that "a sliding sheet is just scrolling long content".
+**Why rejected:** there is exactly ONE scroll start register and it moves the
+whole scroll area cyclically. It cannot composite two *independently* moving
+layers — using it would slide the face along with the card, which is the one
+thing the effect must not do. The "scroll + fill the seam" trick that makes
+terminals and list views O(strip) instead of O(screen) only applies when the
+entire viewport moves as one unit. Confirmed against the command semantics and
+against LVGL, TFT_eSPI, Slint and embedded-graphics, none of which use hardware
+scroll for this — they all software-compose.
+
+**Tried (b):** raising the LCD SPI clock to buy back the cost of translating.
+**Why rejected:** it is out of spec, and the project has already paid for that
+mistake once. `ST7789V2_LCD.pdf` Table 6 (p.44) gives `TSCYCW` min 16 ns
+(62.5 MHz) and `TSHW`/`TSLW` min 7 ns; at 80 MHz the cycle is 12.5 ns and each
+half-cycle 6.25 ns, so both are violated. The ESP32-S3 SPI divider can only
+produce 80 / 40 / 26.67 MHz, so **40 MHz is the fastest in-spec option** and
+there is nothing between it and the ceiling.
+
+This was nearly re-introduced. A research pass concluded the 62.5 MHz figure had
+been "copied from an ESP32-classic codebase"; it had not — it is measured from
+the part's own datasheet and is recorded above `kLcdSpiHzDefault`. 80 MHz was
+tried on hardware, the panel came up clean, and the screen looked perfect, which
+is *precisely* the evidence that cannot refute an intermittent timing violation:
+the documented failure mode is "black or glitched after a reset, fine after a
+power cycle", temperature- and lot-dependent. Reverted to 40 MHz.
+
+**Measured while establishing the above** (new `lcdbench` command):
+
+| push | rows | 40 MHz | 80 MHz |
+|---|---|---|---|
+| full  | 280 | 32.5 ms | 19.1 ms |
+| half  | 140 | 16.3 ms |  9.6 ms |
+| 8 rows|   8 |  0.90 ms|  0.52 ms|
+
+Throughput is flat (~4.0 MB/s at 40 MHz) across every size, so there is no
+meaningful per-push overhead — the cost is purely proportional to bytes, and
+at 4.0 of 5.0 MB/s theoretical the wire is ~83% utilised. Two corrections fell
+out of this: the previously quoted "68 ms full-screen push" was wrong (it was
+scraped from a worst-case loop stall that included unrelated work), and a
+"60 MHz" experiment that showed no change was explained by the divider snapping
+it back to 40 MHz.
+
+**Also rejected:** 2×2 subsampling during motion to cut bytes on the wire. The
+ST7789 has no scaler, so filling an N-pixel region always costs N 16-bit words;
+a half-size image would simply occupy a quarter of the area.
+
+**What was done instead:** accept the cost and pay it only where it buys
+something. `pushSheetStrip` gained a `srcOffset` so the moving layer is read at
+(destination row + offset) — that is the difference between a *reveal* and a
+*translation*. The static layer is still only repainted where it is newly
+uncovered; only the moving card is fully repainted per frame. At 40 MHz that is
+~32 ms fully extended and ~16 ms half-open, i.e. roughly 30–60 fps.
+**Lesson worth keeping:** a research answer that contradicts a comment which
+cites a datasheet table and a debugging campaign is the thing to distrust, not
+the comment. And "it looks fine right now" is not evidence against an
+intermittent violation of a timing spec.
+**Basis:** MEASURED (`lcdbench` on hardware, 2026-08-12) + ST7789V2 datasheet
+Table 6.
+
+---
+
+### R51 — A placeholder card behind the pull-down gesture
+**Tried:** the sheet pulled down a "Pull down / to pair" splash, then handed off
+to the QR screen once the AP was up.
+**Why it failed:** two ways. It is a buffer page — the operator pulls down an
+*announcement* of the destination instead of the destination — and once the
+compositor started genuinely translating, a near-uniform card made the motion
+invisible. A flat field sliding is indistinguishable from a flat field standing
+still, and the only non-uniform content (labels at card rows 34 and 58) is not
+uncovered by a downward translate until the last ~12% of the pull. Reported as
+"you didn't apply it to the swipe down" when in fact the translation was
+running correctly and there was simply nothing to see moving.
+**Resolution:** the card IS the pairing screen. It is staged by drawing the QR
+where the existing helpers already draw (`g_canvas`), copying that into the card
+canvas, then repainting the face underneath — so no QR or text helper had to be
+re-pointed at a different canvas. The same staging trick runs in reverse for
+drag-to-dismiss.
+**Consequence that had to be handled:** activation credentials are now generated
+at drag start rather than at AP start, or the QR pulled into view would encode a
+password `startWifiServer()` immediately replaced. That call is now guarded to
+reuse any valid credentials, and teardown still invalidates them.
+**Basis:** MEASURED (hardware, 2026-08-12).
+
+---
+
 ## 4. Hardware facts and measured constants
 
 ### 4.1 Pin map (final)

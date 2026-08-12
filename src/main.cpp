@@ -143,6 +143,21 @@ enum CrumbPhase : uint32_t {
   kCrumbQuarantineSpin,
   kCrumbWsCleanup,
   kCrumbWsCloseAll,
+  // Teardown/fault path, broken out.
+  //
+  // Crash #5 landed on kCrumbQuarantineSpin, which was misleading: the spin is
+  // bounded at kIngressDrainTimeoutMs (750 ms) and cannot itself blow a 5 s
+  // watchdog. The crumb was simply the last one written, and everything the
+  // teardown and AP-fault paths do afterwards -- stopping WiFi, ending the HTTP
+  // server, resetting the drive session, a 1.6 s blocking failure notice --
+  // inherited it. Exactly the ambiguity that made the touch-poll crash take
+  // four occurrences to place, so these name each step instead.
+  kCrumbQuarantineDrained,
+  kCrumbWifiStop,
+  kCrumbServerEnd,
+  kCrumbDriveReset,
+  kCrumbIdleDemo,
+  kCrumbPairFailNotice,
 };
 
 struct CrashRecord {
@@ -255,6 +270,12 @@ const char* crumbName(uint32_t phase) {  switch (phase) {
     case kCrumbQuarantineSpin: return "ws ingress quarantine SPIN";
     case kCrumbWsCleanup:      return "ws cleanupClients";
     case kCrumbWsCloseAll:     return "ws closeAll";
+    case kCrumbQuarantineDrained: return "ws ingress drained (spin over)";
+    case kCrumbWifiStop:       return "teardown: stopWifiServer";
+    case kCrumbServerEnd:      return "teardown: server.end";
+    case kCrumbDriveReset:     return "teardown: drive session reset";
+    case kCrumbIdleDemo:       return "teardown: enterIdleDemo";
+    case kCrumbPairFailNotice: return "pairing-failed notice (1.6s delay)";
     default:                   return "unknown";
   }
 }
@@ -502,6 +523,11 @@ uint32_t g_sheetGestureSuppressUntilMs = 0;
 // immediately tried again; anything shorter leaves a window where the chip
 // wins the race and starts the AP twice.
 constexpr uint32_t kSheetGestureSuppressMs = 800;
+// True while a drag-to-dismiss is staged or running on a QR screen. It gates
+// three things that would otherwise fight it: serviceDragTransition's reset of
+// the shared controller when it sees a non-face mode, the loop's 50 ms idle nap
+// (which would cap tracking at 20 Hz), and the chip's own SwipeUp.
+bool g_dismissActive = false;
 EyeEngine g_eyes;
 
 int8_t g_headShiftX = 0;
@@ -1539,8 +1565,9 @@ volatile bool          g_orPendingSwipeUp   = false;
 volatile uint32_t      g_orTouchEventCount  = 0;
 // Streams raw gesture IDs and touch coordinates so the panel-to-screen axis
 // mapping can be established by measurement rather than assumption. The chip
-// reports in the panel's native orientation, which is 90 degrees off from the
-// screen on this board — the swipe IDs had to be found the same way.
+// reports coordinates in the SAME frame as the screen (measured — see
+// mapTouchToScreen); its gesture engine does not, which is what misled the
+// original mapping. Use `touchaxis` to re-measure rather than reasoning it out.
 // Default ON while the touch panel is being diagnosed, so the beep works
 // straight from boot with no serial session attached. Turn off with
 // `touchdebug off` once the panel is trusted.
@@ -1582,6 +1609,53 @@ static void recordTouch(int gestureId, int x, int y, bool pressed) {
   g_touchLogNext = static_cast<uint8_t>((slot + 1) % kTouchLogSize);
   g_touchLogTotal++;
 }
+
+// =========================================================================
+// Touch axis capture (`touchaxis`).
+//
+// WHY THIS IS PERMANENT INFRASTRUCTURE AND NOT A THROWAWAY PRINTF
+//
+// mapTouchToScreen's axis mapping was INFERRED from the chip's gesture
+// enumeration -- "screen swipe-DOWN arrives as the chip's GESTURE_RIGHT, so
+// the axes must be swapped". That reasoning was wrong, and it stayed wrong for
+// weeks because nothing ever measured a coordinate. The operator compensated
+// by swiping sideways to work the pull-down sheet (PROJECT-HISTORY R49).
+//
+// This is the same failure mode as R48: an API existing is not the data
+// arriving, and a mapping inferred from an enumeration is not a measured
+// mapping. So the fix ships with the measuring device attached.
+//
+// Two design constraints, both learned the hard way:
+//
+//  1. STATE-INDEPENDENT. The first attempt logged from inside
+//     serviceDragTransition, which only samples on the idle face
+//     (LCD_MODE_FACE && ORS_IDLE). The moment a drag committed and the AP came
+//     up, sampling stopped -- so the measurement drag was never recorded at
+//     all. Capture here runs from loop() regardless of screen or state.
+//
+//  2. NEVER BLOCKS. The obvious shape -- "sample in a tight loop for 8 s
+//     inside the command handler" -- blows the 5 s TASK_WDT, on a board with
+//     an unexplained watchdog stall already under investigation. Capture is a
+//     window serviced by the loop instead, so the cadence is the loop's and
+//     nothing sleeps (design-craft 6b).
+//
+// Fills once and stops rather than wrapping: the START of a drag is what
+// carries the direction, so losing the head to a ring wrap would discard the
+// answer.
+constexpr uint8_t kTouchAxisCapMax = 64;
+struct TouchAxisSample {
+  int16_t  x;
+  int16_t  y;
+  uint16_t ms;   // relative to capture start
+};
+TouchAxisSample g_touchAxisCap[kTouchAxisCapMax];
+uint8_t  g_touchAxisCount   = 0;
+bool     g_touchAxisActive  = false;
+uint32_t g_touchAxisStartMs = 0;
+uint32_t g_touchAxisUntilMs = 0;
+constexpr uint32_t kTouchAxisWindowMs = 8000;
+// Movement below this is finger tremor, not travel.
+constexpr int16_t  kTouchAxisMinDelta = 3;
 
 // =========================================================================
 // On-screen gesture buttons.
@@ -1681,23 +1755,43 @@ volatile uint32_t g_gestureFlashUntilMs = 0;
 volatile int16_t g_lastTouchX = -1;
 volatile int16_t g_lastTouchY = -1;
 
-// The CST816T reports in the panel's native orientation, which is rotated 90
-// degrees from the screen. This is not a guess: the swipe IDs above were
-// confirmed on this exact hardware, and screen swipe-DOWN arrives as the
-// chip's GESTURE_RIGHT — so increasing screen Y is increasing chip X, and the
-// two axes are swapped.
+// Panel-to-screen mapping. MEASURED, not inferred -- see `touchaxis`.
 //
-//   screenY = chipX          (confirmed by the swipe mapping)
-//   screenX = 240 - chipY    (the perpendicular axis)
+// This function was wrong for weeks, and the way it was wrong is worth keeping
+// on the record. It used to read:
 //
-// The X mirror is the one part not pinned down by the swipe evidence, and it
-// deliberately does not matter for the button menu: the buttons span the full
-// width, so only Y selects between them. If a future UI needs precise X, that
-// is the thing to verify first.
+//     screenY = chipX;
+//     screenX = kScreenW - chipY;
+//
+// justified by the argument that "screen swipe-DOWN arrives as the chip's
+// GESTURE_RIGHT, so the axes must be swapped", with the mirror admitted in the
+// comment as the one part "not pinned down by the swipe evidence". Every part
+// of that was assumption: a gesture enumeration is not a coordinate frame, and
+// the CST816T's gesture engine simply does not share an axis convention with
+// its coordinate registers. The operator compensated by swiping SIDEWAYS to
+// work a pull-down sheet, which is how the error stayed invisible.
+//
+// Measured on this hardware with `touchaxis` (2026-08-12):
+//
+//   drag top -> bottom : chipY 6 -> 264, chipX flat (111 -> 104)
+//   drag left -> right : chipX 91 -> 217, chipY flat (176 -> 196)
+//
+// So the mapping is the IDENTITY. Which is also what the display constructor
+// says: kLcdRotate == 0, so screen space and panel space are the same frame and
+// there was never a rotation to undo.
+//
+//   screenX = chipX
+//   screenY = chipY
+//
+// The swipe gesture IDs (kTouchSwipeDownId / kTouchSwipeUpId) are NOT touched
+// by this. Those were confirmed empirically against this hardware and work; the
+// chip's gesture engine having its own orientation is a quirk of the part, not
+// evidence about the coordinate registers. Do not "reconcile" the two by
+// reasoning -- if either is ever in doubt again, run `touchaxis` and measure.
 static void mapTouchToScreen(int rawX, int rawY, int16_t& screenX,
                              int16_t& screenY) {
-  screenY = static_cast<int16_t>(rawX);
-  screenX = static_cast<int16_t>(kScreenW - rawY);
+  screenX = static_cast<int16_t>(rawX);
+  screenY = static_cast<int16_t>(rawY);
   if (screenX < 0) screenX = 0;
   if (screenX >= kScreenW) screenX = kScreenW - 1;
   if (screenY < 0) screenY = 0;
@@ -4115,6 +4209,82 @@ void cmdTouchlog(char* argument) {
   return;
 }
 
+void cmdTouchaxis(char* argument) {
+  if ((argument != nullptr) && (strcmp(argument, "abort") == 0)) {
+    g_touchAxisActive = false;
+    Serial.println(F("touchaxis: aborted"));
+    return;
+  }
+  g_touchAxisCount   = 0;
+  g_touchAxisStartMs = millis();
+  g_touchAxisUntilMs = g_touchAxisStartMs + kTouchAxisWindowMs;
+  g_touchAxisActive  = true;
+  Serial.printf("touchaxis: capturing %lus -- do ONE slow drag now\n",
+                static_cast<unsigned long>(kTouchAxisWindowMs / 1000U));
+}
+
+// Defined with the LCD compositor much further down; declared here so the
+// benchmark command below can drive it.
+void pushSheetStrip(uint16_t* framebuffer, int16_t fromRow, int16_t toRow,
+                    int16_t srcOffset);
+
+// Measure real panel throughput instead of inferring it.
+//
+// The sheet's translation cost is bounded by how fast a framebuffer can be
+// pushed, and the only number we had was "68 ms for a full screen" scraped from
+// a worst-case loop stall -- which includes whatever else that pass did. That
+// works out to ~2 MB/s, well under what 40 MHz SPI should manage, so the real
+// limit is probably per-transfer overhead or PSRAM read bandwidth rather than
+// the wire. Guessing which would repeat this session's mistakes; this measures.
+//
+// Also times a half-screen push, because comparing the two separates FIXED
+// per-push overhead from PER-PIXEL cost: if half costs half, it is bandwidth;
+// if half costs nearly the same, it is overhead.
+void cmdLcdbench(char* argument) {
+  (void)argument;
+  if (g_canvas == nullptr) {
+    Serial.println(F("ERR no canvas"));
+    return;
+  }
+  uint16_t* fb = g_canvas->getFramebuffer();
+  if (fb == nullptr) {
+    Serial.println(F("ERR no framebuffer"));
+    return;
+  }
+  constexpr uint8_t kRuns = 5;
+  struct Case { const char* name; int16_t from; int16_t to; };
+  const Case cases[] = {
+      {"full", 0, kScreenH},
+      {"half", 0, static_cast<int16_t>(kScreenH / 2)},
+      {"strip8", 0, 8},
+  };
+  Serial.printf("lcdbench: spi=%lu Hz, fb=%s\n",
+                static_cast<unsigned long>(g_lcdSpiHz),
+                esp_ptr_external_ram(fb) ? "PSRAM" : "internal");
+  for (const Case& c : cases) {
+    uint32_t best = 0xFFFFFFFFUL;
+    for (uint8_t i = 0; i < kRuns; ++i) {
+      const uint32_t t0 = micros();
+      pushSheetStrip(fb, c.from, c.to, 0);
+      const uint32_t dt = micros() - t0;
+      if (dt < best) best = dt;
+      delay(2);
+    }
+    const uint32_t rows  = static_cast<uint32_t>(c.to - c.from);
+    const uint32_t bytes = rows * static_cast<uint32_t>(kScreenW) * 2UL;
+    const uint32_t kbps  = (best > 0U)
+        ? static_cast<uint32_t>((static_cast<uint64_t>(bytes) * 1000000ULL) /
+                                (static_cast<uint64_t>(best) * 1024ULL))
+        : 0U;
+    Serial.printf("  %-7s %3lu rows %6lu B  best %6lu us  %5lu KB/s\n", c.name,
+                  static_cast<unsigned long>(rows),
+                  static_cast<unsigned long>(bytes),
+                  static_cast<unsigned long>(best),
+                  static_cast<unsigned long>(kbps));
+  }
+  g_forceFullPush = true;   // undo whatever the benchmark left on screen
+}
+
 void cmdTouchreset(char* argument) {
   // Recovery path: re-applies our configuration if the chip ever stops
   // reporting. Deliberately does NOT touch auto-sleep — see the note in
@@ -5314,6 +5484,7 @@ const SerialCommand kSerialCommands[] = {
   { "lcdprobe", cmdLcdprobe, "lcdprobe                 read panel RDDPM: is it awake and on?", nullptr, nullptr },
   { "lcdpush", cmdLcdpush, "lcdpush                  full canvas->panel push only", nullptr, nullptr },
   { "lcdbus", cmdLcdbus, "lcdbus                   re-init the SPI peripheral only", nullptr, nullptr },
+  { "lcdbench", cmdLcdbench, "lcdbench                 measure panel push throughput", nullptr, nullptr },
   { "crash", cmdCrash, "crash [clear]            last fault: reason + phase + heap", nullptr, nullptr },
   { "straight", cmdStraight, "straight <cm> [speed]    gyro-corrected straight run", nullptr, "-- motion / IMU --" },
   { "sense", cmdSense, "sense                    bump/shake/lifted detector state", nullptr, nullptr },
@@ -5326,6 +5497,7 @@ const SerialCommand kSerialCommands[] = {
   { "rfscan", cmdRfscan, "rfscan / rfsurvey        RSSI scan + per-position store", nullptr, nullptr },
   { "rfsurvey", cmdRfsurvey, nullptr, nullptr, nullptr },
   { "touchinfo", cmdTouchinfo, "touchinfo / touchlog / touchdebug / touchreset", nullptr, "-- touch --" },
+  { "touchaxis", cmdTouchaxis, "touchaxis                measure raw panel axes by drag", nullptr, nullptr },
   { "touchlog", cmdTouchlog, nullptr, nullptr, nullptr },
   { "touchdebug", cmdTouchdebug, nullptr, nullptr, nullptr },
   { "touchreset", cmdTouchreset, nullptr, nullptr, nullptr },
@@ -5661,6 +5833,161 @@ bool readTouchPointDirect(int16_t& rawX, int16_t& rawY, bool& pressed) {
   rawX = static_cast<int16_t>((static_cast<uint16_t>(xh & 0x0FU) << 8) | xl);
   rawY = static_cast<int16_t>((static_cast<uint16_t>(yh & 0x0FU) << 8) | yl);
   return true;
+}
+
+// =========================================================================
+// I2C bus recovery.
+//
+// STATUS: HARDENING, NOT A PROVEN FIX. Read this before citing it.
+//
+// The honest history matters here, because the first version of this comment
+// asserted a diagnosis that turned out to be wrong.
+//
+// What is true: four TASK_WDT resets all landed on the breadcrumb "loop: touch
+// poll", i.e. inside g_orTouch.control(), and the timing instrumentation added
+// to catch them showed nothing -- touch max ~700 us, slow-poll count zero. That
+// part is structural: the timer is `micros() after - micros() before`, so a
+// poll that never RETURNS never updates the maximum. A hang is invisible to it
+// by construction, which is why four crashes produced no timing evidence.
+//
+// What was WRONG: the degraded-looking state was "read" from the loop running
+// at exactly 20 Hz, i.e. 50 ms per pass, which matches the Arduino Wire default
+// timeout of 50 ms that this firmware never overrode. That looked conclusive.
+// It was a coincidence. The loop deliberately sleeps delay(50) on every
+// non-FACE screen to idle while a static QR is displayed -- it is documented at
+// that delay(50) and caps the loop at 20 Hz by design. Two unrelated things
+// that are both 50 ms. `pushes/s=0` and a climbing lastPushAge are likewise
+// normal for a screen that is painted once and held.
+//
+// So this file does NOT have a measured I2C lockup behind it. What it has is:
+//   - an unexplained hang inside an I2C-using call, four times over;
+//   - a bus shared by the CST816T and the QMI8658, both read every loop pass;
+//   - no bound on how long a transaction may take.
+//
+// Bounding the transaction and being able to clear a stuck slave are worth
+// having on those grounds alone. But if this ever gets cited as "the fix for
+// the watchdog crash", that is not established -- the crash may simply not have
+// recurred yet. Treat a `i2c: bus recovery` line in the log as the first actual
+// evidence that the bus wedges at all.
+//
+// THE MECHANISM, IF IT IS THE BUS
+//
+// A slave interrupted mid-byte holds SDA low waiting for the clock that
+// finishes it, and the master, seeing a busy bus, can only time out. The remedy
+// is for the master to bit-bang up to 9 clock pulses with SDA released -- nine
+// because a stuck slave needs at most 8 data bits plus an ACK to finish. A
+// manual STOP then returns the bus to idle.
+//
+// NOTHING HERE SLEEPS. Total cost is ~100 us of delayMicroseconds, on a board
+// whose whole problem is a 5 s task watchdog -- a recovery routine that blocked
+// would be a worse bug than the one it fixes (design-craft 6b).
+constexpr uint16_t kI2cTimeoutMs = 10;
+
+static bool i2cRecoverBus() {
+  Wire.end();
+
+  pinMode(I2C_SCL, OUTPUT);
+  pinMode(I2C_SDA, INPUT_PULLUP);
+
+  // Clock until the slave lets go of SDA, up to the 9 it can possibly need.
+  for (uint8_t i = 0; (i < 9) && (digitalRead(I2C_SDA) == LOW); ++i) {
+    digitalWrite(I2C_SCL, LOW);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SCL, HIGH);
+    delayMicroseconds(5);
+  }
+
+  const bool released = (digitalRead(I2C_SDA) == HIGH);
+
+  // Manual STOP: SDA rising while SCL is high.
+  pinMode(I2C_SDA, OUTPUT);
+  digitalWrite(I2C_SDA, LOW);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SCL, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SDA, HIGH);
+  delayMicroseconds(5);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(I2C_FREQ_HZ);
+  Wire.setTimeOut(kI2cTimeoutMs);
+
+  Serial.printf("i2c: bus recovery %s\n", released ? "OK" : "FAILED (SDA still low)");
+  return released;
+}
+
+// Service the `touchaxis` capture window. Called unconditionally from loop(),
+// so it works on any screen and in any operator state -- see the note at the
+// declarations for why that matters.
+static void serviceTouchAxisCapture() {
+  if (!g_touchAxisActive) return;
+
+  const uint32_t nowMs = millis();
+
+  int16_t rawX = 0;
+  int16_t rawY = 0;
+  bool pressed = false;
+  if (readTouchPointDirect(rawX, rawY, pressed) && pressed &&
+      (g_touchAxisCount < kTouchAxisCapMax)) {
+    bool take = true;
+    if (g_touchAxisCount > 0) {
+      const TouchAxisSample& last = g_touchAxisCap[g_touchAxisCount - 1];
+      const int16_t dx = static_cast<int16_t>(rawX - last.x);
+      const int16_t dy = static_cast<int16_t>(rawY - last.y);
+      take = (dx > kTouchAxisMinDelta) || (dx < -kTouchAxisMinDelta) ||
+             (dy > kTouchAxisMinDelta) || (dy < -kTouchAxisMinDelta);
+    }
+    if (take) {
+      g_touchAxisCap[g_touchAxisCount].x = rawX;
+      g_touchAxisCap[g_touchAxisCount].y = rawY;
+      g_touchAxisCap[g_touchAxisCount].ms =
+          static_cast<uint16_t>(nowMs - g_touchAxisStartMs);
+      ++g_touchAxisCount;
+    }
+  }
+
+  // Signed compare so the window is rollover-safe (PROJECT-HISTORY R46).
+  const bool full    = (g_touchAxisCount >= kTouchAxisCapMax);
+  const bool expired = (static_cast<int32_t>(nowMs - g_touchAxisUntilMs) >= 0);
+  if (!full && !expired) return;
+
+  g_touchAxisActive = false;
+
+  Serial.printf("touchaxis: %u samples (%s)\n",
+                static_cast<unsigned>(g_touchAxisCount),
+                full ? "buffer full" : "window closed");
+  if (g_touchAxisCount < 2) {
+    Serial.println(F("touchaxis: not enough movement -- drag further"));
+    return;
+  }
+
+  for (uint8_t i = 0; i < g_touchAxisCount; ++i) {
+    Serial.printf("  %u ms=%u raw=(%d,%d)\n", static_cast<unsigned>(i),
+                  static_cast<unsigned>(g_touchAxisCap[i].ms),
+                  static_cast<int>(g_touchAxisCap[i].x),
+                  static_cast<int>(g_touchAxisCap[i].y));
+  }
+
+  const int16_t dx = static_cast<int16_t>(
+      g_touchAxisCap[g_touchAxisCount - 1].x - g_touchAxisCap[0].x);
+  const int16_t dy = static_cast<int16_t>(
+      g_touchAxisCap[g_touchAxisCount - 1].y - g_touchAxisCap[0].y);
+  const int16_t adx = (dx < 0) ? static_cast<int16_t>(-dx) : dx;
+  const int16_t ady = (dy < 0) ? static_cast<int16_t>(-dy) : dy;
+
+  Serial.printf("touchaxis: travel dx=%d dy=%d\n", static_cast<int>(dx),
+                static_cast<int>(dy));
+  // State the conclusion outright. The whole reason this bug survived is that
+  // raw numbers were read and then reasoned about incorrectly.
+  if (adx == ady) {
+    Serial.println(F("touchaxis: ambiguous -- drag along ONE axis only"));
+  } else if (adx > ady) {
+    Serial.printf("touchaxis: chip X is the dragged axis, %s\n",
+                  (dx > 0) ? "increasing" : "DECREASING (mirrored)");
+  } else {
+    Serial.printf("touchaxis: chip Y is the dragged axis, %s\n",
+                  (dy > 0) ? "increasing" : "DECREASING (mirrored)");
+  }
 }
 // g_orTouchEventCount declared earlier with other §16 state vars.
 
@@ -6247,6 +6574,10 @@ void beginWsIngressQuarantine() {
   }
   requestWsTransportReset();
   purgeWsEventQueueBlocked();
+  // Spin is over. Anything slow from here belongs to the CALLER, not to this
+  // wait -- crash #5 was misattributed precisely because this crumb stayed
+  // current through the whole teardown that follows.
+  breadcrumb(kCrumbQuarantineDrained);
 }
 
 void endWsIngressQuarantine() {
@@ -9857,11 +10188,35 @@ void pushCanvasBanded(bool downward) {
 // kCrumbLcdPush 1..5 step markers stay -- a TASK_WDT was once captured inside
 // a canvas push and those detail codes name the stage that hung; deleting them
 // here would blind the same investigation on the sheet path.
-void pushSheetStrip(uint16_t* framebuffer, int16_t fromRow, int16_t toRow) {
+// Push panel rows [fromRow, toRow) from `framebuffer`, reading the source at
+// (destination row + srcOffset).
+//
+// srcOffset is what turns a REVEAL into a TRANSLATION. With srcOffset == 0 the
+// source and destination rows coincide, so a growing window uncovers a
+// stationary image -- a wipe. The sheet needs the card to MOVE with the finger,
+// which means panel row r must show card row (H - y + r): as y grows the card
+// slides down into view. That is srcOffset = H - y.
+//
+// The cost difference is the whole design tension. A wipe only ever has to push
+// the newly uncovered rows; a translation has to repush every visible row of
+// the moving layer every frame, because they all show different content than
+// they did last frame. Measured on this panel with `lcdbench`: 4.0 MB/s, dead
+// linear in row count (no meaningful per-push overhead), so a full-screen
+// translate costs 32.5 ms and a half-open card 16 ms. That is the budget; there
+// is no trick to dodge it, because the controller has no scaler and every
+// destination pixel needs its own 16-bit word on the wire.
+void pushSheetStrip(uint16_t* framebuffer, int16_t fromRow, int16_t toRow,
+                    int16_t srcOffset) {
   if ((framebuffer == nullptr) || (g_gfx == nullptr)) return;
   if (fromRow < 0)         fromRow = 0;
   if (toRow > kScreenH)    toRow   = kScreenH;
   if (toRow <= fromRow)    return;
+
+  // Refuse to read outside the source framebuffer rather than clamping into it,
+  // which would silently show the wrong rows.
+  const int32_t srcFrom = static_cast<int32_t>(fromRow) + srcOffset;
+  const int32_t srcTo   = static_cast<int32_t>(toRow) + srcOffset;
+  if ((srcFrom < 0) || (srcTo > kScreenH)) return;
 
   ++g_lcdPushCount;
   g_lcdLastPushMs = millis();
@@ -9876,7 +10231,7 @@ void pushSheetStrip(uint16_t* framebuffer, int16_t fromRow, int16_t toRow) {
                        static_cast<uint16_t>(kScreenW),
                        static_cast<uint16_t>(h));
   breadcrumb(kCrumbLcdPush, 3);
-  tft->writePixels(&framebuffer[static_cast<int32_t>(fromRow) * kScreenW],
+  tft->writePixels(&framebuffer[srcFrom * kScreenW],
                    static_cast<uint32_t>(kScreenW) *
                        static_cast<uint32_t>(h));
   breadcrumb(kCrumbLcdPush, 4);
@@ -9970,12 +10325,17 @@ static void serviceGrabber(int16_t sheetY, bool wantVisible) {
         static_cast<int16_t>(g_grabberDrawnTop + kGrabberH);
     const int16_t edge = (sheetY < 0) ? 0 : sheetY;
     if (eraseTop < edge && g_sheetCanvas != nullptr) {
+      // Card rows are translated, so restore them through the same mapping the
+      // compositor used -- otherwise the erased band shows the wrong slice of
+      // the card and the grabber leaves a smear behind it.
       pushSheetStrip(g_sheetCanvas->getFramebuffer(), eraseTop,
-                     (eraseBot < edge) ? eraseBot : edge);
+                     (eraseBot < edge) ? eraseBot : edge,
+                     static_cast<int16_t>(kScreenH - edge));
     }
     if (eraseBot > edge) {
       pushSheetStrip(g_canvas->getFramebuffer(),
-                     (eraseTop > edge) ? eraseTop : edge, eraseBot);
+                     (eraseTop > edge) ? eraseTop : edge, eraseBot,
+                     /*srcOffset=*/0);
     }
     g_grabberDrawnTop = -1;
   }
@@ -10015,7 +10375,18 @@ static void serviceGrabber(int16_t sheetY, bool wantVisible) {
 // flips, not once per frame.
 static void drawSheetCard(bool armed, bool committed) {
   if (g_sheetCanvas == nullptr) return;
-  g_sheetCanvas->fillScreen(0x0000);
+  // The card is a SURFACE, not a hole.
+  //
+  // It used to fillScreen(0x0000). Pulled fully down that is a black panel with
+  // two small words near the top -- which is visually identical to a dead
+  // screen, and was in fact reported as one. Design-craft 3 asks for a 3-step
+  // surface scale rather than pure black precisely so that "a surface is
+  // present" and "the display is off" cannot be confused.
+  //
+  // So: a dark slate card so the surface is legible as a surface. Its moving
+  // leading edge is already marked by the grabber, which is welded to it.
+  constexpr uint16_t kCardSurface = 0x18E3;   // dark slate, clearly not black
+  g_sheetCanvas->fillScreen(kCardSurface);
   const char* line1 = committed ? "Establishing" : (armed ? "Let go" : "Pull down");
   const char* line2 = committed ? "Server..."    : (armed ? "to pair" : "to pair");
   const uint8_t kSize = 2;
@@ -10429,6 +10800,21 @@ void OverrideTouchObserver::gestureNotification(int iGestureId, int x, int y, bo
     }
     g_orPendingSwipeDown = true;
   } else if (iGestureId == kTouchSwipeUpId) {
+    // Same suppression the SwipeDown path needs, for the same reason: the chip
+    // runs its own gesture detector alongside our finger sampler and reports a
+    // completed SwipeUp at release time. Without this, dragging the QR card up
+    // and then changing your mind (letting it spring back) would still tear the
+    // AP down, because the chip reported the swipe regardless.
+    const bool dismissEngaged =
+        (g_sheetCanvas != nullptr) &&
+        (g_dismissActive ||
+         (static_cast<int32_t>(millis() - g_sheetGestureSuppressUntilMs) < 0));
+    if (dismissEngaged) {
+      if (g_touchDebug) {
+        Serial.println(F("touch: SwipeUp suppressed (sheet owns transition)"));
+      }
+      return;
+    }
     g_orPendingSwipeUp = true;
   }
 }
@@ -10493,6 +10879,8 @@ void OverrideTouchObserver::touchNotification(int x, int y, bool bCurrentlyPress
 // Fail-soft: g_sheetCanvas == nullptr means the second framebuffer could not
 // be allocated. Return immediately; the chip's own SwipeDown gesture then
 // drives the pairing flow as it did before this feature existed.
+static void stageOpenCardWithQr();
+
 static void serviceDragTransition() {
   static int16_t s_renderedY = 0;
   static bool    s_pressed   = false;
@@ -10505,6 +10893,11 @@ static void serviceDragTransition() {
   // flips g_lcdMode to LCD_MODE_ESTABLISHING and repaints the panel), park the
   // controller and forget the last render.
   if (!onFace) {
+    // A drag-to-dismiss owns the same controller while a QR screen is up. Bail
+    // out before the reset below or this would wipe its state every pass.
+    if (g_dismissActive) {
+      return;
+    }
     if (g_sheet.state != SheetTransition::State::Closed || s_pressed) {
       g_sheet.reset();
       s_renderedY = 0;
@@ -10520,6 +10913,30 @@ static void serviceDragTransition() {
   if (g_sheetCanvas == nullptr) {
     // No compositor available -- chip gesture path handles everything.
     return;
+  }
+
+  // Rate-limit the sampler.
+  //
+  // This used to run at the raw loop rate, ~900 Hz, which put ~900 extra I2C
+  // transactions per second onto a bus shared with the IMU. It was buying
+  // nothing: a finger does not move meaningfully in 1.1 ms, and the panel
+  // cannot show it either. (This stands on its own merits -- it is not
+  // contingent on the unproven I2C-lockup theory in i2cRecoverBus.)
+  //
+  // 100 Hz keeps the added latency at <=10 ms, an order of magnitude inside the
+  // 100 ms first-response budget (design-craft 7), while cutting the traffic
+  // this path contributes by ~9x.
+  {
+    constexpr uint32_t kDragSampleIntervalMs = 10;
+    static uint32_t s_lastSampleMs = 0;
+    const uint32_t gateMs = millis();
+    // Signed delta so the gate cannot latch shut across the millis() wrap
+    // (PROJECT-HISTORY R46).
+    if (static_cast<int32_t>(gateMs - s_lastSampleMs) <
+        static_cast<int32_t>(kDragSampleIntervalMs)) {
+      return;
+    }
+    s_lastSampleMs = gateMs;
   }
 
   // Sample the finger directly. Only here, only in drag-capable modes, so no
@@ -10594,11 +11011,10 @@ static void serviceDragTransition() {
       g_grabberVisible  = true;
       g_grabberHideAtMs = nowMs + kGrabberRevealMs;
     }
-    // Paint the card content once so every strip pushed already shows the
-    // pairing splash -- deferring it to the first move would flash a partial
-    // card.
+    // Stage the card as the actual pairing screen before the first strip is
+    // pushed, so nothing partial or placeholder is ever composited.
     s_armed = false;
-    drawSheetCard(/*armed=*/false, /*committed=*/false);
+    stageOpenCardWithQr();
     g_sheet.onPress(screenY, nowMs);
     s_pressed = true;
   } else if (ok && pressed && s_pressed) {
@@ -10614,9 +11030,10 @@ static void serviceDragTransition() {
     // to pull the card the rest of the way down.
     const bool nearlyThere = g_sheet.reachedCommit(kScreenH);
     if (nearlyThere != s_armed) {
+      // Tracked for the commit logic only. The card is the real pairing screen
+      // now, so there is no label to swap -- repainting here would clobber the
+      // QR the operator is in the middle of pulling into view.
       s_armed = nearlyThere;
-      drawSheetCard(nearlyThere, /*committed=*/false);
-      s_renderedY = 0;  // force a repaint of the visible card extent
     }
   } else if (s_pressed && fingerGone) {
     // Release PARKS the card where it is. Nothing commits here.
@@ -10652,8 +11069,6 @@ static void serviceDragTransition() {
     g_sheetGestureSuppressUntilMs = nowMs + kSheetGestureSuppressMs;
     g_orPendingSwipeDown = true;
     s_armed = false;
-    drawSheetCard(/*armed=*/false, /*committed=*/true);
-    s_renderedY = 0;
     Serial.println(F("sheet: pulled to commit -> orPendingSwipeDown"));
   }
 
@@ -10673,20 +11088,231 @@ static void serviceDragTransition() {
   uint16_t* faceFb  = (g_canvas != nullptr) ? g_canvas->getFramebuffer()
                                             : nullptr;
 
-  if (y > s_renderedY) {
-    // Opening: rows [s_renderedY, y) go from face -> sheet.
-    pushSheetStrip(sheetFb, s_renderedY, y);
-  } else {
-    // Closing: rows [y, s_renderedY) go from sheet -> face.
-    if (faceFb != nullptr) {
-      pushSheetStrip(faceFb, y, s_renderedY);
-    }
+  // Closing: rows the card has vacated show the face again. Push those FIRST so
+  // the card lands on top of a correct backdrop rather than the other way round.
+  if ((y < s_renderedY) && (faceFb != nullptr)) {
+    pushSheetStrip(faceFb, y, s_renderedY, /*srcOffset=*/0);
+  }
+  // The card TRANSLATES, so its whole visible extent is repainted every frame,
+  // not just the delta. See pushSheetStrip for why this is unavoidable.
+  if (y > 0) {
+    pushSheetStrip(sheetFb, 0, y, static_cast<int16_t>(kScreenH - y));
   }
   s_renderedY = y;
 
   // AFTER the strip, so the handle lands on top of whatever was just composited
   // rather than being immediately painted over.
   serviceGrabber(y, g_grabberVisible);
+}
+
+// =========================================================================
+// Drag-to-dismiss: the same sheet, run backwards.
+//
+// Swiping up to leave pairing was an instant, all-or-nothing chip gesture --
+// the exact thing the pull-down replaced on the way in. Making it symmetric is
+// not decoration: the card is supposed to read as one physical object, and an
+// object you can push but not pull is not one.
+//
+// THE TRICK, AND WHY THERE IS NO QR REFACTOR
+//
+// The compositor already works in both directions (rows [0,y) from the sheet
+// canvas, [y,H) from the face canvas), so the only thing missing is having the
+// QR in the TOP layer and the face underneath -- and the QR is drawn into
+// g_canvas, the same canvas the face uses.
+//
+// Rather than parameterise every QR/​text helper to take a target canvas, the
+// layers are staged once at press time: copy what is on screen into the sheet
+// canvas, then repaint the face beneath it. One 134 KB PSRAM memcpy (~3 ms,
+// once per drag) buys the whole feature with no change to the QR renderer.
+//
+// Release reuses Controller::onRelease untouched. Its snap already means "go to
+// the nearer end"; here Closed simply means dismissed and Open means the
+// operator changed their mind.
+// Stage the pull-down card as the REAL pairing screen.
+//
+// The card used to be a placeholder ("Pull down / to pair") and two things were
+// wrong with that. It was a buffer page -- you pulled down an announcement of
+// the destination rather than the destination itself -- and once the compositor
+// started genuinely translating, a near-uniform card made the motion invisible:
+// a flat field sliding looks exactly like a flat field standing still. The
+// labels sat at card rows 34/58, which a downward translate only reveals in the
+// last ~12% of the pull.
+//
+// Same staging trick as the dismiss direction, so no QR/text helper has to be
+// re-pointed at another canvas: draw the QR where those helpers already draw
+// (g_canvas), copy it into the card, then put the face back underneath.
+//
+// CREDENTIALS ARE GENERATED HERE, not at AP start. Otherwise the QR pulled into
+// view would encode a password that enterWifiBoot() then replaces, and the code
+// the operator just scanned would be stale. The AP start is guarded to reuse
+// whatever is already valid.
+static void stageOpenCardWithQr() {
+  if ((g_sheetCanvas == nullptr) || (g_canvas == nullptr)) return;
+  uint16_t* sheetFb = g_sheetCanvas->getFramebuffer();
+  uint16_t* faceFb  = g_canvas->getFramebuffer();
+  if ((sheetFb == nullptr) || (faceFb == nullptr)) return;
+
+  ActivationCredentials probe = {};
+  if (!copyActivationCredentials(probe)) {
+    generateActivationCredentials();
+  }
+  secureZero(&probe, sizeof(probe));
+
+  drawQrScreenWifi();
+  constexpr size_t kBytes =
+      static_cast<size_t>(kScreenW) * static_cast<size_t>(kScreenH) *
+      sizeof(uint16_t);
+  memcpy(sheetFb, faceFb, kBytes);
+  g_canvas->fillScreen(MASCOT_A_BG);
+  drawMascotToCanvas(static_cast<int16_t>(kOriginX + g_lastShiftX),
+                     static_cast<int16_t>(kOriginY + g_lastShiftY));
+}
+
+static void stageDismissLayers() {
+  if ((g_sheetCanvas == nullptr) || (g_canvas == nullptr)) return;
+  uint16_t* sheetFb = g_sheetCanvas->getFramebuffer();
+  uint16_t* faceFb  = g_canvas->getFramebuffer();
+  if ((sheetFb == nullptr) || (faceFb == nullptr)) return;
+  constexpr size_t kBytes =
+      static_cast<size_t>(kScreenW) * static_cast<size_t>(kScreenH) *
+      sizeof(uint16_t);
+  memcpy(sheetFb, faceFb, kBytes);          // what's on screen becomes the card
+  g_canvas->fillScreen(MASCOT_A_BG);        // ...and the face goes underneath
+  drawMascotToCanvas(static_cast<int16_t>(kOriginX + g_lastShiftX),
+                     static_cast<int16_t>(kOriginY + g_lastShiftY));
+}
+
+// Put the QR back in g_canvas so the ordinary QR-mode logic keeps working, and
+// repaint. Used when a dismiss drag springs back instead of completing.
+static void restoreQrCanvas() {
+  if ((g_sheetCanvas == nullptr) || (g_canvas == nullptr)) return;
+  uint16_t* sheetFb = g_sheetCanvas->getFramebuffer();
+  uint16_t* faceFb  = g_canvas->getFramebuffer();
+  if ((sheetFb == nullptr) || (faceFb == nullptr)) return;
+  constexpr size_t kBytes =
+      static_cast<size_t>(kScreenW) * static_cast<size_t>(kScreenH) *
+      sizeof(uint16_t);
+  memcpy(faceFb, sheetFb, kBytes);
+  pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
+}
+
+static void serviceDismissDrag() {
+  static int16_t s_renderedY = kScreenH;
+  static bool    s_pressed   = false;
+
+  const bool onQr = (g_lcdMode == LCD_MODE_QR_WIFI) ||
+                    (g_lcdMode == LCD_MODE_QR_URL);
+  if (!onQr || (g_sheetCanvas == nullptr)) {
+    if (g_dismissActive) {
+      g_dismissActive = false;
+      g_sheet.reset();
+      s_pressed   = false;
+      s_renderedY = kScreenH;
+    }
+    return;
+  }
+
+  // Same 100 Hz gate as the open direction; see the note there.
+  {
+    constexpr uint32_t kDragSampleIntervalMs = 10;
+    static uint32_t s_lastSampleMs = 0;
+    const uint32_t gateMs = millis();
+    if (static_cast<int32_t>(gateMs - s_lastSampleMs) <
+        static_cast<int32_t>(kDragSampleIntervalMs)) {
+      return;
+    }
+    s_lastSampleMs = gateMs;
+  }
+
+  int16_t rawX = 0;
+  int16_t rawY = 0;
+  bool pressed = false;
+  const bool ok = readTouchPointDirect(rawX, rawY, pressed);
+  const uint32_t nowMs = millis();
+
+  int16_t screenX = 0;
+  int16_t screenY = 0;
+  if (ok) {
+    mapTouchToScreen(rawX, rawY, screenX, screenY);
+  }
+
+  // A failed read is NOT a release -- identical reasoning to the open path.
+  static uint8_t s_readFails = 0;
+  constexpr uint8_t kTouchReadFailTolerance = 3;
+  if (!ok) {
+    ++s_readFails;
+    if (s_readFails < kTouchReadFailTolerance) return;
+  } else {
+    s_readFails = 0;
+  }
+  const bool fingerGone = (!ok && s_readFails >= kTouchReadFailTolerance) ||
+                          (ok && !pressed);
+
+  if (ok && pressed && !s_pressed) {
+    stageDismissLayers();
+    g_sheet.reset();
+    g_sheet.y = kScreenH;              // the card starts fully down
+    g_sheet.onPress(screenY, nowMs);
+    s_pressed       = true;
+    s_renderedY     = kScreenH;
+    g_dismissActive = true;
+  } else if (ok && pressed && s_pressed) {
+    g_sheet.onMove(screenY, nowMs, kScreenH);
+  } else if (s_pressed && fingerGone) {
+    g_sheet.onRelease(kScreenH, 0);
+    s_pressed = false;
+  }
+
+  if (!g_dismissActive) return;
+
+  g_sheet.tick(SheetTransition::kSettlePercent);
+
+  // Discard the commit one-shot unconditionally. Starting at y = H the card is
+  // already past the commit line, so the controller arms it on the first move
+  // -- but on this screen pairing is already up and re-firing it would be
+  // meaningless at best.
+  (void)g_sheet.takeSettledOpen();
+
+  int16_t y = static_cast<int16_t>(g_sheet.y);
+  if (y < 0)        y = 0;
+  if (y > kScreenH) y = kScreenH;
+
+  if (y != s_renderedY) {
+    uint16_t* sheetFb = g_sheetCanvas->getFramebuffer();
+    uint16_t* faceFb  = (g_canvas != nullptr) ? g_canvas->getFramebuffer()
+                                              : nullptr;
+    // Same two-step as the open direction: uncover the face, then repaint the
+    // translating card over it.
+    if ((y < s_renderedY) && (faceFb != nullptr)) {
+      pushSheetStrip(faceFb, y, s_renderedY, /*srcOffset=*/0);
+    }
+    if (y > 0) {
+      pushSheetStrip(sheetFb, 0, y, static_cast<int16_t>(kScreenH - y));
+    }
+    s_renderedY = y;
+  }
+
+  if (s_pressed) return;
+
+  // Settled. Closed means the card left the screen: dismiss for real, routing
+  // through the same pending-gesture the chip would have raised so there is one
+  // teardown path rather than two.
+  if (g_sheet.state == SheetTransition::State::Closed) {
+    g_dismissActive = false;
+    g_sheetGestureSuppressUntilMs = nowMs + kSheetGestureSuppressMs;
+    g_orPendingSwipeUp = true;
+    s_renderedY = kScreenH;
+    Serial.println(F("sheet: pushed up to dismiss -> orPendingSwipeUp"));
+  } else if (g_sheet.state == SheetTransition::State::Open) {
+    // Changed their mind. Put the QR back where the rest of the code expects
+    // it and suppress the chip's release-time SwipeUp so it cannot tear down
+    // the AP we just decided to keep.
+    g_dismissActive = false;
+    g_sheetGestureSuppressUntilMs = nowMs + kSheetGestureSuppressMs;
+    g_sheet.reset();
+    restoreQrCanvas();
+    s_renderedY = kScreenH;
+  }
 }
 
 // Consume a pending button press: highlight it, run the gesture, and clear the
@@ -10836,7 +11462,18 @@ static void startWifiServer() {
     Serial.println(F("override: startWifiServer() ignored (already up)"));
     return;
   }
-  generateActivationCredentials();
+  // Reuse whatever the pull-down already generated. The sheet renders the real
+  // Wi-Fi QR into the card as it is dragged, so regenerating here would swap
+  // the password out from under a code the operator may already have scanned.
+  // Credentials are invalidated on every teardown, so a cycle that did not come
+  // through the sheet still gets fresh ones.
+  {
+    ActivationCredentials probe = {};
+    if (!copyActivationCredentials(probe)) {
+      generateActivationCredentials();
+    }
+    secureZero(&probe, sizeof(probe));
+  }
   ActivationCredentials credentials = {};
   if (!copyActivationCredentials(credentials)) {
     Serial.println(F("override: credential generation failed"));
@@ -10994,14 +11631,40 @@ static void enterGrace() {
                 static_cast<unsigned>(kOrGraceTimeoutMs / 1000));
 }
 
+// Report how long a teardown actually took.
+//
+// The value of this is that it does not need a crash. A teardown that takes
+// 4.9 s survives the watchdog and looks completely fine from the outside, but
+// it is the same defect as one that takes 5.1 s -- the difference is luck. This
+// makes the near-miss visible, which is what "a crash is not required" has to
+// mean if we are ever going to close this out.
+static void reportTeardownDuration(const char* what, uint32_t startMs) {
+  const uint32_t tookMs = millis() - startMs;
+  // 1.5 s is far above the ~50 ms a healthy teardown costs, and far below the
+  // 5 s watchdog, so it flags a genuine outlier without becoming noise.
+  constexpr uint32_t kTeardownWarnMs = 1500;
+  if (tookMs >= kTeardownWarnMs) {
+    Serial.printf("SLOW teardown: %s took %lu ms (watchdog is 5000 ms)\n", what,
+                  static_cast<unsigned long>(tookMs));
+  } else {
+    Serial.printf("teardown: %s took %lu ms\n", what,
+                  static_cast<unsigned long>(tookMs));
+  }
+}
+
 static void teardownToIdle() {
   g_orState        = ORS_IDLE;
   g_orStateEnterMs = millis();
+  const uint32_t tearStartMs = millis();
   beginWsIngressQuarantine();
+  breadcrumb(kCrumbWifiStop);
   stopWifiServer();
+  breadcrumb(kCrumbDriveReset);
   resetDriveSessionAndPower("teardown");
   endWsIngressQuarantine();
+  breadcrumb(kCrumbIdleDemo);
   enterIdleDemo();
+  reportTeardownDuration("teardownToIdle", tearStartMs);
 }
 
 // Show a failure for long enough to be read, then return to the face.
@@ -11046,6 +11709,7 @@ static void showPairingFailed(const char* reason) {
       static_cast<int16_t>((kScreenW - static_cast<int16_t>(strlen(kL3) * 6)) / 2), 172);
   g_canvas->print(kL3);
   pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
+  breadcrumb(kCrumbPairFailNotice);
   delay(kPairFailNoticeMs);
 }
 
@@ -11060,13 +11724,19 @@ static void handleApLifecycleFault(const char* reason) {
   g_orStateEnterMs = millis();
   invalidateActivationCredentials();
 
+  const uint32_t faultStartMs = millis();
   beginWsIngressQuarantine();
+  breadcrumb(kCrumbWsCloseAll);
   g_orWs.closeAll(1012, "Unavailable");
+  breadcrumb(kCrumbServerEnd);
   g_orServer.end();
+  breadcrumb(kCrumbDriveReset);
   resetDriveSessionAndPower(reason);
   endWsIngressQuarantine();
 
+  breadcrumb(kCrumbIdleDemo);
   enterIdleDemo();
+  reportTeardownDuration("handleApLifecycleFault", faultStartMs);
   Serial.printf("override: AP lifecycle fault handled (%s)\n",
                 reason == nullptr ? "unknown" : reason);
 }
@@ -11649,6 +12319,10 @@ void setup() {
   // §16: bring up CST816T touch (I2C). Gestures arrive via observer.
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(I2C_FREQ_HZ);
+  // Bound EVERY I2C transaction. The Arduino default is 50 ms and was never
+  // overridden here. This is hardening, not a proven fix -- see i2cRecoverBus()
+  // for what is and is not established about the watchdog crashes.
+  Wire.setTimeOut(kI2cTimeoutMs);
   // Same bus as touch and the RTC. The IMU is a 6-axis part (accel + gyro,
   // no magnetometer) and is used to MEASURE turns rather than guess them.
   if (ImuQmi8658::begin()) {
@@ -11849,11 +12523,51 @@ void loop() {
                   static_cast<unsigned long>(g_rtcTouchMaxUs),
                   static_cast<unsigned long>(g_rtcTouchSlowCount));
   }
+  // Wedge detector. If the bus does wedge, a BOUNDED transaction turns an
+  // invisible hang into a countable drip of timeouts. Whether that ever
+  // actually happens is still unproven -- this firing at all would be the first
+  // real evidence (see i2cRecoverBus).
+  //
+  // The threshold is consecutive, not cumulative: an isolated slow poll is a
+  // glitch and recovering from it would be churn, but several in a row is a
+  // slave holding the line, which never clears itself.
+  {
+    static uint8_t s_i2cStuckStreak = 0;
+    constexpr uint8_t kI2cStuckStreakMax = 4;
+    if (touchUs > (static_cast<uint32_t>(kI2cTimeoutMs) * 900U)) {
+      if (++s_i2cStuckStreak >= kI2cStuckStreakMax) {
+        s_i2cStuckStreak = 0;
+        Serial.println(F("i2c: touch poll wedged -- recovering bus"));
+        if (i2cRecoverBus()) {
+          // The chip lost its configuration along with the bus; without this it
+          // comes back present but silent, which looks exactly like broken
+          // hardware. resetChip() is the same path `touchreset` uses -- NOT
+          // begin(), which would re-register the observer a second time.
+          //
+          // This one blocks ~120 ms inside the driver's reset sequence. That is
+          // a real stall and it is accepted deliberately: it runs only after
+          // four consecutive wedged polls, and the alternative is a bus that
+          // stays stuck until the watchdog reboots the robot.
+          const bool reset = g_orTouch.resetChip(true);
+          Serial.printf("i2c: touch controller re-init %s\n",
+                        reset ? "OK" : "FAILED");
+        }
+      }
+    } else {
+      s_i2cStuckStreak = 0;
+    }
+  }
   serviceTouchBeep(millis());
+  // Raw-axis capture window, if one is open. Unconditional and state-free by
+  // design -- the previous attempt lived inside serviceDragTransition and was
+  // silently skipped on every screen except the idle face.
+  serviceTouchAxisCapture();
   // Render any drag in progress. Immediately after the poll so the screen
   // tracks the finger with the shortest possible lag -- perceived latency is
   // the master variable (design-craft 7).
   serviceDragTransition();
+  // ...and the same thing backwards, on the QR screens.
+  serviceDismissDrag();
   // Pump override HTTP server + drive-watchdog
   breadcrumb(kCrumbLoopOverride);
   overrideLoop();
@@ -11906,7 +12620,7 @@ void loop() {
     // was innocent; a reconnect resets the board into FACE mode, so every
     // tethered test accidentally ran on the fast path.)
     if (g_turnAutoPhase == TurnAutoPhase::Idle &&
-        !g_movementSequencer.active() && !g_turnCmdActive) {
+        !g_movementSequencer.active() && !g_turnCmdActive && !g_dismissActive) {
       delay(50);
     } else {
       // Yield rather than free-run: a tight loop with no delay can starve the

@@ -310,6 +310,55 @@ void testOnPressOnPartlyOpenSheetDoesNotJumpToFinger() {
   assert(c.state == State::Dragging);
 }
 
+void testPullToBottomEdgeCommitsFromAnyStartPoint() {
+  // The two-swipe-to-open bug, pinned as arithmetic rather than feel.
+  //
+  // Tracking is 1:1, so travel is y = dragBaseY + (screenY - dragOriginY) and
+  // from a closed sheet the card can never exceed (kH - pressY). Commit at 85%
+  // of 280 is 238, so a press even 60 px down caps the card at 220 and the
+  // gesture CANNOT commit however far it is pulled -- which is exactly the
+  // "it took 2 swipes" report.
+  //
+  // Running the finger to the bottom of the panel is the operator pulling the
+  // shade as far as it goes, so that counts as a completed pull.
+  Controller c;
+  const int16_t pressY = 60;
+
+  c.onPress(pressY, 1000);
+  c.onMove(static_cast<int16_t>(kH - 1), 1100, kH);
+
+  // Still short of the positional line -- that is the whole point.
+  assert(c.y < (kH * SheetTransition::kCommitPct) / 100);
+  // ...but the finger ran out of panel, so it commits anyway.
+  assert(c.reachedCommit(kH));
+  assert(c.takeSettledOpen());
+}
+
+void testTapNearBottomEdgeIsNotAPull() {
+  // The pulled-to-the-bottom route must not turn a tap into a commit. Touching
+  // low on the panel puts the finger inside the bottom band immediately, so
+  // without the travel floor this would start pairing on a stray touch.
+  Controller c;
+  c.onPress(static_cast<int16_t>(kH - 3), 1000);
+  c.onMove(static_cast<int16_t>(kH - 2), 1050, kH);
+
+  assert(c.y < (kH * SheetTransition::kPullOutCommitPct) / 100);
+  assert(!c.reachedCommit(kH));
+  assert(!c.takeSettledOpen());
+}
+
+void testShortDragEndingAtBottomBandStillNeedsRealTravel() {
+  // Starting low and dragging a little still ends inside the bottom band, but
+  // the card is nowhere near half-way, so it must not commit.
+  Controller c;
+  c.onPress(static_cast<int16_t>((kH * 3) / 4), 1000);
+  c.onMove(static_cast<int16_t>(kH - 1), 1100, kH);
+
+  assert(c.y > 0);                                   // it did move
+  assert(c.y < (kH * SheetTransition::kPullOutCommitPct) / 100);
+  assert(!c.reachedCommit(kH));
+}
+
 void testMillisRolloverMidDrag() {
   // Header: "Timestamps must be handled rollover-safely: subtract into a
   // SIGNED type." PROJECT-HISTORY R46 shipped once already because the
@@ -340,13 +389,17 @@ void testMillisRolloverMidDrag() {
   assert(c.velocity < 10000);    // and not an unsigned-underflow explosion
   assert(c.y == 60);             // 1:1 tracking survived the rollover
 
-  // And release still behaves correctly with a rollover-derived velocity: it
-  // parks where it is. Under the old contract this asserted the projected
-  // target; that path is gone, but the reason the test exists is unchanged --
-  // garbage velocity from a bad rollover must not move the card.
+  // And release still behaves correctly with a rollover-derived velocity. Under
+  // the old contract this asserted the projected target, then the parked
+  // position; both are gone, but the reason the test exists is unchanged --
+  // a garbage velocity from a bad rollover must not decide the outcome. Snap
+  // resolves on POSITION, so at 60 of 200 (30%) it must settle closed no
+  // matter what the velocity says.
   c.onRelease(kH, 0);
   assert(c.y == 60);
-  assert(c.state == State::Parked);
+  assert(c.state == State::Settling);
+  assert(c.target == 0);
+  assert(!c.takeSettledOpen());
 }
 
 void testTwoSamplesInSameMillisecondDoNotDivideByZero() {
@@ -416,29 +469,69 @@ void testResetReturnsToClosed() {
 // behaviour surviving the change.
 // ---------------------------------------------------------------------------
 
-void testReleaseParksExactlyWhereItWasLeft() {
+void testReleaseBelowSnapLineSettlesClosed() {
+  // Release semantics changed from "park where you left it" to "snap to the
+  // nearer end". Below kSnapOpenPct the card must return home -- and crucially
+  // it must not come to rest half-open, because a non-Closed resting state
+  // freezes the face renderer behind a stationary card.
   Controller c;
   c.onPress(100, 0);
-  c.onMove(160, 20, kH);   // y = 60
-  const int16_t before = c.y;
+  c.onMove(160, 20, kH);   // y = 60, which is 30% of kH=200
   c.onRelease(kH, 0);
-  assert(c.y == before);            // did not move
-  assert(c.state == State::Parked); // and did not settle anywhere
-  assert(!c.takeSettledOpen());     // releasing commits nothing
+
+  assert(c.state == State::Settling);
+  assert(c.target == 0);
+
+  int steps = 0;
+  while (c.tick(kSettlePercent)) {
+    assert(++steps <= 512);
+  }
+  assert(c.y == 0);
+  assert(c.state == State::Closed);
+  assert(!c.takeSettledOpen());   // settling closed commits nothing
 }
 
-void testReleaseWithStrongVelocityStillParks() {
-  // The old contract would have thrown this open on projection alone. Under
-  // park semantics a fling is just a fast drag that stops when you let go.
+void testReleasePastSnapLineSettlesOpenAndCommitsOnce() {
+  // Past 51% the card completes the journey by itself and fires the commit
+  // one-shot exactly once when it arrives -- not on release, and not on every
+  // subsequent tick.
   Controller c;
-  c.onPress(100, 0);
-  c.onMove(130, 10, kH);
-  c.onMove(190, 20, kH);   // ~6 px/ms downward, a genuine fling
-  const int16_t before = c.y;
-  assert(c.velocity > 0);
+  c.onPress(10, 0);
+  c.onMove(125, 20, kH);   // y = 115, which is 57% of kH=200
+  assert(c.y > (kH * SheetTransition::kSnapOpenPct) / 100);
   c.onRelease(kH, 0);
-  assert(c.y == before);
-  assert(!c.takeSettledOpen());
+
+  assert(c.state == State::Settling);
+  assert(c.target == kH);
+  assert(!c.takeSettledOpen());   // nothing commits at release time
+
+  int steps = 0;
+  while (c.tick(kSettlePercent)) {
+    assert(++steps <= 512);
+  }
+  assert(c.y == kH);
+  assert(c.state == State::Open);
+  assert(c.takeSettledOpen());    // fires exactly once...
+  assert(!c.takeSettledOpen());   // ...and only once
+}
+
+void testMidDragCommitDoesNotDoubleFireWhenTheSnapAlsoCompletes() {
+  // A gesture can both cross the commit line mid-drag AND snap open on
+  // release. Those are two paths to the same one-shot, so the armedOpen latch
+  // has to be shared or pairing would be started twice for one pull.
+  Controller c;
+  c.onPress(10, 0);
+  c.onMove(static_cast<int16_t>(kH - 1), 20, kH);   // runs the finger out
+  assert(c.takeSettledOpen());                      // committed mid-drag
+
+  c.onRelease(kH, 0);
+  int steps = 0;
+  while (c.tick(kSettlePercent)) {
+    assert(++steps <= 512);
+  }
+  assert(c.y == kH);
+  assert(c.state == State::Open);
+  assert(!c.takeSettledOpen());   // must NOT fire a second time
 }
 
 void testReleaseAtZeroReportsClosedNotParked() {
@@ -542,9 +635,13 @@ int main() {
   testSettleStepGuaranteesOnePixelProgress();
 
   testOnPressOnPartlyOpenSheetDoesNotJumpToFinger();
+  testPullToBottomEdgeCommitsFromAnyStartPoint();
+  testTapNearBottomEdgeIsNotAPull();
+  testShortDragEndingAtBottomBandStillNeedsRealTravel();
 
-  testReleaseParksExactlyWhereItWasLeft();
-  testReleaseWithStrongVelocityStillParks();
+  testReleaseBelowSnapLineSettlesClosed();
+  testReleasePastSnapLineSettlesOpenAndCommitsOnce();
+  testMidDragCommitDoesNotDoubleFireWhenTheSnapAlsoCompletes();
   testReleaseAtZeroReportsClosedNotParked();
   testCommitFiresOnCrossingTheCommitLineMidDrag();
   testCommitIsAOneShotWhileHeldAtTheBottom();

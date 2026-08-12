@@ -60,7 +60,10 @@ enum class State : uint8_t {
   Closed,     // fully retracted, face visible, not tracking
   Dragging,   // finger down, card following it
   Settling,   // finger released, animating to the chosen target
-  Parked,     // finger released, card left exactly where it was
+  // Finger released with the card left exactly where it was. No longer reached
+  // by the normal release path (which snaps); retained only for the degenerate
+  // h <= 0 case, where there is no travel to snap along.
+  Parked,
   Open,       // fully extended, card covering the face
 };
 
@@ -76,15 +79,28 @@ enum class State : uint8_t {
 // parks the card near maximum anyway.
 constexpr int16_t kCommitPct = 85;
 
-// ---------------------------------------------------------------------------
-// The three functions below are NOT used by the release path any more.
+// Second commit route: the finger ran out of panel.
 //
-// Release used to choose a target from the projected endpoint and animate to
-// it. It now parks the card exactly where the finger left it, and commit
-// happens by dragging to kCommitPct. They are kept because they are tested,
-// reviewed, and correct, and because the interaction is still being developed --
-// throwing away a working velocity model to re-derive it in a week would be
-// waste. Nothing calls them today; do not assume they are live.
+// kCommitPct alone is unreachable from most start points because tracking is
+// 1:1 (see the long note in reachedCommit). These let "pulled to the bottom
+// edge" count as a completed pull, with a travel floor so a tap near the
+// bottom cannot masquerade as one.
+constexpr int16_t kPullOutCommitPct = 50;   // card must be at least half out
+constexpr int32_t kPullOutBandPx    = 10;   // how close to the bottom counts
+
+// Release snaps to whichever end the card is nearest. Past this, it opens.
+constexpr int16_t kSnapOpenPct = 51;
+
+// ---------------------------------------------------------------------------
+// project() and chooseTarget() are NOT used by the release path.
+//
+// Release chooses its target from POSITION alone (kSnapOpenPct), not from the
+// projected endpoint -- a flick that lands just past halfway starting the AP is
+// a surprise, and position is what was asked for. These two are kept because
+// they are tested, reviewed and correct, and the velocity model is the obvious
+// next refinement if the snap ever feels too literal. Nothing calls them today.
+//
+// settleStep() IS live again: it drives the snap animation via tick().
 // ---------------------------------------------------------------------------
 
 // Damp a raw finger offset into sheet travel.
@@ -134,6 +150,10 @@ struct Controller {
   int16_t  target       = 0;   // settle destination
   int32_t  velocity     = 0;   // milli-px per ms, signed
   int16_t  lastSampleY  = 0;
+  // Last finger position in screen space, distinct from `y` (the card edge).
+  // -1 means "no sample yet", so a fresh controller cannot satisfy the
+  // pulled-to-the-bottom commit route by accident.
+  int16_t  lastScreenY  = -1;
   uint32_t lastSampleMs = 0;
   bool     justSettled  = false;  // one-shot, consumed by takeSettled()
   // Latch so the commit fires on the CROSSING only. Without it, holding the
@@ -148,13 +168,10 @@ struct Controller {
   // Finger moved. Updates travel with rubber-banding and accumulates velocity.
   void onMove(int16_t screenY, uint32_t nowMs, int16_t h);
 
-  // Finger lifted. PARKS the card exactly where it is -- no target, no settle.
-  //
-  // The sheet is a physical shade: it goes where you push it and stays there.
-  // Committing is done by pulling it all the way down (reachedCommit), not by
-  // releasing past a threshold. `h` and `threshold` are retained so callers do
-  // not have to change, and so the projection model can be reinstated without
-  // another signature churn.
+  // Finger lifted. SNAPS to whichever end the card is nearest: past
+  // kSnapOpenPct it settles fully open (and commits), otherwise it settles
+  // closed. Nothing rests half-open any more -- see the note in the definition
+  // for why parking there was a trap.
   void onRelease(int16_t h, int16_t threshold);
 
   // True once the card has been pulled far enough to count as fully down.
