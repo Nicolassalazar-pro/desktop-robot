@@ -42,6 +42,7 @@
 #include "motion_events.h"
 #include "melody.h"
 #include "melody_gen.h"
+#include "sheet_transition.h"
 #include "nvs.h"
 #include <esp_random.h>
 
@@ -480,6 +481,27 @@ constexpr uint8_t kDemoTotalSteps = kDemoMoodCount;
 Arduino_DataBus* g_bus = nullptr;
 Arduino_GFX* g_gfx = nullptr;
 Arduino_Canvas* g_canvas = nullptr;
+// Second offscreen canvas: the pairing card that slides down over the face.
+// Allocation is fail-soft; when null, the drag preview is disabled and the
+// chip's own SwipeDown gesture drives the transition unchanged (the fallback
+// path that shipped before this compositor existed).
+Arduino_Canvas* g_sheetCanvas = nullptr;
+// Sheet drag controller. Owns no hardware and holds no framebuffer; fed screen-
+// space Y and a millisecond clock by serviceDragTransition() below.
+SheetTransition::Controller g_sheet;
+// Deadline after which chip-detected SwipeDown gestures are allowed through
+// again. Set every time the sheet is engaged (or has just committed), so the
+// chip's own release-time gesture cannot fire the AP a second time on top of
+// the drag-driven commit. Zero = not suppressing.
+uint32_t g_sheetGestureSuppressUntilMs = 0;
+// Cool-down after the sheet finishes an interaction. Sized to bridge two
+// things: the ~150-400 ms settle animation (25% remaining per tick at the
+// FACE-mode loop cadence) and the CST816T's own release-gesture reporting
+// which lands in the following g_orTouch.control() drain. Anything longer
+// would swallow a deliberate second swipe by an operator who cancelled and
+// immediately tried again; anything shorter leaves a window where the chip
+// wins the race and starts the AP twice.
+constexpr uint32_t kSheetGestureSuppressMs = 800;
 EyeEngine g_eyes;
 
 int8_t g_headShiftX = 0;
@@ -1247,6 +1269,33 @@ bool initDisplay() {
     return false;
   }
 
+  // Second offscreen canvas for the pairing card. Same 240x280x2 = 134,400 B
+  // framebuffer, allocated in PSRAM (8 MB free at boot). Constructed WITHOUT
+  // an output pointer so begin() only allocates the framebuffer and does not
+  // re-run g_gfx->begin() -- the panel has already been initialised above and
+  // running init a second time on a working panel invites transient corruption
+  // on this ST7789V2 (see kLcdSpiHzDefault).
+  //
+  // Allocation is fail-soft. Null g_sheetCanvas means the drag-preview
+  // compositor is disabled everywhere it is used (serviceDragTransition
+  // returns immediately; the observer's chip-suppression is skipped so the
+  // chip's own SwipeDown continues to drive the pairing flow instantly as it
+  // did before this feature existed). This board's LCD path has a documented
+  // history of mystery blackouts under a 5 s task watchdog, and a null
+  // dereference inside the strip pusher is exactly the shape of failure that
+  // presents as a spontaneous reset.
+  g_sheetCanvas = new Arduino_Canvas(kScreenW, kScreenH, nullptr);
+  if (g_sheetCanvas == nullptr) {
+    Serial.println(F("lcd: sheet canvas alloc FAILED -- drag preview disabled"));
+  } else if (!g_sheetCanvas->begin(0)) {
+    Serial.println(F("lcd: sheet canvas begin FAILED -- drag preview disabled"));
+    delete g_sheetCanvas;
+    g_sheetCanvas = nullptr;
+  } else {
+    Serial.printf("lcd: sheet canvas ready (%u B in PSRAM)\n",
+                  static_cast<unsigned>(kScreenPixelCount * 2U));
+  }
+
   Serial.printf("lcd: SPI %lu Hz (%lu MHz)\n",
                 static_cast<unsigned long>(g_lcdSpiHz),
                 static_cast<unsigned long>(g_lcdSpiHz / 1000000UL));
@@ -1482,18 +1531,11 @@ volatile bool          g_orPendingSwipeUp   = false;
 // gesture had happened and the screen changed. There was no way to start the
 // motion, see what it was going to do, and change your mind.
 //
-// These track a finger continuously so the screen can follow it 1:1 and only
-// commit on release (design-craft 1 direct manipulation, 8 "confirm on
-// touch-up, drag-off cancels"). Written from the touch callback, read by the
-// loop, hence volatile; each is a single aligned word so a torn read is not
-// possible on this MCU.
-volatile bool          g_dragActive         = false;
-volatile bool          g_dragReleased       = false;
-volatile int16_t       g_dragStartY         = 0;
-volatile int16_t       g_dragCurrentY       = 0;
-// Commit distance. ~29% of the panel: far enough that a tap or a stray graze
-// cannot reach it, short enough to complete comfortably with one thumb.
-constexpr int16_t      kDragCommitPx        = 80;
+// The current-position ledger has moved into SheetTransition::Controller
+// (g_sheet, declared above). Finger samples are pulled by serviceDragTransition
+// via readTouchPointDirect on the loop task, and the controller owns the
+// press-origin / velocity / settle target -- there is no longer any drag state
+// written from inside the touch callback.
 volatile uint32_t      g_orTouchEventCount  = 0;
 // Streams raw gesture IDs and touch coordinates so the panel-to-screen axis
 // mapping can be established by measurement rather than assumption. The chip
@@ -5567,6 +5609,59 @@ public:
 };
 OverrideTouchObserver  g_orTouchObs;
 MDO::CST816Touch_HWMode g_orTouch;
+
+// ---------------------------------------------------------------------------
+// Direct finger position, read straight off the CST816T.
+//
+// The library in hardware-gesture mode only ever reports a COMPLETED gesture --
+// verified on hardware, where dragging a finger produced three touchlog entries
+// (all gesture IDs, pressed=0) and zero touch points. Its coordinate accessors
+// (parseTouchControllerEvent, read, readRegister) are all private, so there is
+// no way to ask it politely.
+//
+// But the chip itself knows exactly where the finger is, and says so in plain
+// registers. This reads them directly:
+//
+//   0x01 gesture     0x02 finger count (0 none / 1 touching)
+//   0x03 X[11:8]     0x04 X[7:0]        (bits 7:6 of XH are the event code)
+//   0x05 Y[11:8]     0x06 Y[7:0]
+//
+// Six bytes, ~150 us at 400 kHz. Deliberately NOT a driver-mode change: the
+// library keeps doing gesture detection exactly as before, with its swipe IDs
+// still calibrated for this panel's 90-degree axis offset. This only adds a
+// read alongside it.
+//
+// Called AFTER g_orTouch.control() so the library always sees the registers
+// first and its own event handling is unaffected. Reads on this chip are
+// non-destructive -- the values persist until the next touch event -- so both
+// can read the same registers in the same pass.
+//
+// Gated to drag-capable modes by the caller, because this bus has an
+// unexplained stall under investigation and there is no reason to add traffic
+// on screens that cannot use the result.
+constexpr uint8_t kCstRegGesture = 0x01;
+
+bool readTouchPointDirect(int16_t& rawX, int16_t& rawY, bool& pressed) {
+  Wire.beginTransmission(TP_ADDR);
+  Wire.write(kCstRegGesture);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+  if (Wire.requestFrom(static_cast<uint8_t>(TP_ADDR), static_cast<uint8_t>(6)) != 6) {
+    return false;
+  }
+  const uint8_t gesture = static_cast<uint8_t>(Wire.read());  // 0x01
+  const uint8_t fingers = static_cast<uint8_t>(Wire.read());  // 0x02
+  const uint8_t xh      = static_cast<uint8_t>(Wire.read());  // 0x03
+  const uint8_t xl      = static_cast<uint8_t>(Wire.read());  // 0x04
+  const uint8_t yh      = static_cast<uint8_t>(Wire.read());  // 0x05
+  const uint8_t yl      = static_cast<uint8_t>(Wire.read());  // 0x06
+  (void)gesture;
+  pressed = (fingers != 0U);
+  rawX = static_cast<int16_t>((static_cast<uint16_t>(xh & 0x0FU) << 8) | xl);
+  rawY = static_cast<int16_t>((static_cast<uint16_t>(yh & 0x0FU) << 8) | yl);
+  return true;
+}
 // g_orTouchEventCount declared earlier with other §16 state vars.
 
 // =========================================================================
@@ -9743,78 +9838,105 @@ void pushCanvasBanded(bool downward) {
   }
 }
 
-// Push the canvas offset vertically, with the vacated strip painted as a
-// commit hint. This is what makes the pairing screens track a finger.
+// Delta compositor for the sheet transition.
 //
-// dy > 0 slides the content DOWN (finger dragging down), exposing a band at the
-// top; dy < 0 slides it UP, exposing a band at the bottom.
+// Pushes a horizontal strip of framebuffer rows [fromRow, toRow) straight onto
+// the LCD, one canvas row per LCD row, at full width. The sheet grows or
+// shrinks by a handful of pixels per frame, and the ONLY rows that need
+// repainting are the ones that just changed sides:
 //
-// Cost is the same order as a normal full push: one address window, one
-// contiguous blast of framebuffer rows, plus a small solid band. No second
-// framebuffer, no memmove of 134 KB, no per-frame re-render -- the canvas is
-// never touched, only the destination window moves. That matters on a board
-// with a 5 s task watchdog (design-craft 6b).
+//   Growing by d px  -> push sheet[old..new)  (d rows from the sheet canvas)
+//   Shrinking by d   -> push face[new..old)   (d rows from the face canvas)
 //
-// `armed` means the drag has passed the commit threshold. It is signalled by
-// the band's TEXT as well as its shade, because state must never be carried by
-// colour alone (design-craft 3).
-void pushCanvasShiftedToLcd(int16_t dy, bool armed) {
-  if ((g_canvas == nullptr) || (g_gfx == nullptr)) return;
-  uint16_t* framebuffer = g_canvas->getFramebuffer();
-  if (framebuffer == nullptr) return;
-  if (dy == 0) {
-    pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
-    return;
-  }
-  if (dy > kScreenH) dy = kScreenH;
-  if (dy < -kScreenH) dy = -kScreenH;
+// The face canvas is not repainted -- the face is already sitting on the LCD
+// from the previous FACE-mode push and stays there under everything the sheet
+// does not currently cover. This is what makes the drag CHEAPER than the
+// full-frame push it replaced (tens of rows per frame instead of 280).
+//
+// Modelled on pushCanvasRectToLcd's single-transaction pattern. The
+// kCrumbLcdPush 1..5 step markers stay -- a TASK_WDT was once captured inside
+// a canvas push and those detail codes name the stage that hung; deleting them
+// here would blind the same investigation on the sheet path.
+void pushSheetStrip(uint16_t* framebuffer, int16_t fromRow, int16_t toRow) {
+  if ((framebuffer == nullptr) || (g_gfx == nullptr)) return;
+  if (fromRow < 0)         fromRow = 0;
+  if (toRow > kScreenH)    toRow   = kScreenH;
+  if (toRow <= fromRow)    return;
 
   ++g_lcdPushCount;
   g_lcdLastPushMs = millis();
-  Arduino_TFT* tft = static_cast<Arduino_TFT*>(g_gfx);
-  const int16_t visible = static_cast<int16_t>(kScreenH - (dy > 0 ? dy : -dy));
-  if (visible > 0) {
-    breadcrumb(kCrumbLcdPush, 1);
-    tft->startWrite();
-    if (dy > 0) {
-      // Content down: LCD rows [dy..H) show canvas rows [0..visible).
-      tft->writeAddrWindow(0, static_cast<uint16_t>(dy),
-                           static_cast<uint16_t>(kScreenW),
-                           static_cast<uint16_t>(visible));
-      tft->writePixels(&framebuffer[0],
-                       static_cast<uint32_t>(kScreenW) *
-                           static_cast<uint32_t>(visible));
-    } else {
-      // Content up: LCD rows [0..visible) show canvas rows [-dy..H).
-      tft->writeAddrWindow(0, 0, static_cast<uint16_t>(kScreenW),
-                           static_cast<uint16_t>(visible));
-      tft->writePixels(&framebuffer[static_cast<int32_t>(-dy) * kScreenW],
-                       static_cast<uint32_t>(kScreenW) *
-                           static_cast<uint32_t>(visible));
-    }
-    tft->endWrite();
-    breadcrumb(kCrumbLcdPush, 5);
-  }
 
-  // The vacated band. Filled directly on the panel rather than through the
-  // canvas, so the canvas still holds the untouched screen and releasing the
-  // drag can restore it with a single ordinary push.
-  const int16_t bandH = static_cast<int16_t>(dy > 0 ? dy : -dy);
-  const int16_t bandY = static_cast<int16_t>(dy > 0 ? 0 : kScreenH - bandH);
-  const uint16_t bandColour = armed ? kQrBlack : 0x2104;  // near-black vs dim
-  g_gfx->fillRect(0, bandY, kScreenW, bandH, bandColour);
-  if (bandH >= 22) {
-    const char* label = armed ? "RELEASE" : "keep going";
-    const uint8_t size = armed ? 2 : 1;
-    const int16_t textW =
-        static_cast<int16_t>(strlen(label) * 6 * size);
-    g_gfx->setTextSize(size);
-    g_gfx->setTextColor(armed ? kQrWhite : 0x8410);
-    g_gfx->setTextWrap(false);
-    g_gfx->setCursor(static_cast<int16_t>((kScreenW - textW) / 2),
-                     static_cast<int16_t>(bandY + (bandH / 2) - (4 * size)));
-    g_gfx->print(label);
-  }
+  Arduino_TFT* tft = static_cast<Arduino_TFT*>(g_gfx);
+  const int16_t h = static_cast<int16_t>(toRow - fromRow);
+  breadcrumb(kCrumbLcdPush, 1);
+  tft->startWrite();
+  breadcrumb(kCrumbLcdPush, 2);
+  tft->writeAddrWindow(0,
+                       static_cast<uint16_t>(fromRow),
+                       static_cast<uint16_t>(kScreenW),
+                       static_cast<uint16_t>(h));
+  breadcrumb(kCrumbLcdPush, 3);
+  tft->writePixels(&framebuffer[static_cast<int32_t>(fromRow) * kScreenW],
+                   static_cast<uint32_t>(kScreenW) *
+                       static_cast<uint32_t>(h));
+  breadcrumb(kCrumbLcdPush, 4);
+  tft->endWrite();
+  breadcrumb(kCrumbLcdPush, 5);
+}
+
+// Paint the pairing-card content into the sheet canvas.
+//
+// Mirrors drawEstablishingScreen() (that one targets g_canvas which still
+// holds the FACE while a drag is in progress), so the card the operator drags
+// down is the exact splash they will see after the AP comes up -- there is no
+// content swap on commit, just a single full-canvas push that arrives with
+// pixels already matching what the sheet was showing.
+//
+// Called once at press, not per frame. The card content does NOT animate
+// during the drag; the "dots + elapsed" progress ticker is a WIFI_BOOT thing
+// and only fires once ORS_WIFI_BOOT has actually been entered.
+//
+// Crucially: credentials are NOT generated here. A cancelled pull would
+// otherwise burn a set. The QR only exists once the AP has come up and the
+// state machine has entered RUNNING; the sheet-card content up to that point
+// is deliberately just the splash.
+// Paint the pairing card, in one of two states.
+//
+// TWO LABELS, NOT ONE. The card used to say "Establishing Server..." from the
+// moment a finger touched the panel, which was a lie for the whole drag --
+// nothing is being established until the operator commits -- and worse, it
+// never told them what the card WAS. A first-time user pulling down learned
+// nothing about what releasing would do, which defeats the entire point of a
+// sheet: start it, see what it would do, change your mind.
+//
+// `armed` is the second half of that fix, and it addresses a real trap. Release
+// is decided by PROJECTED position, so a peek to 30% released with even 500
+// px/s of residual downward motion -- unremarkable, because a thumb rarely
+// stops dead before it lifts -- projects to 51% and commits. From the finger
+// that gesture was "look at it and let go". iOS has identical physics and gets
+// away with it because its sheets change as they approach the threshold; ours
+// did not. Now the verb changes the moment the projected endpoint crosses over,
+// so the operator can see the commit coming and pull back.
+//
+// Edge-triggered by the caller: repainted only when the armed state actually
+// flips, not once per frame.
+static void drawSheetCard(bool armed, bool committed) {
+  if (g_sheetCanvas == nullptr) return;
+  g_sheetCanvas->fillScreen(0x0000);
+  const char* line1 = committed ? "Establishing" : (armed ? "Release" : "Pull down");
+  const char* line2 = committed ? "Server..."    : (armed ? "to pair" : "to pair");
+  const uint8_t kSize = 2;
+  const int16_t w1 = static_cast<int16_t>(strlen(line1) * 6 * kSize);
+  const int16_t w2 = static_cast<int16_t>(strlen(line2) * 6 * kSize);
+  g_sheetCanvas->setTextSize(kSize);
+  // Armed is brighter, but the VERB is what carries the state -- never colour
+  // alone (design-craft §3).
+  g_sheetCanvas->setTextColor(armed || committed ? kQrWhite : 0x8410);
+  g_sheetCanvas->setTextWrap(false);
+  g_sheetCanvas->setCursor(static_cast<int16_t>((kScreenW - w1) / 2), 120);
+  g_sheetCanvas->print(line1);
+  g_sheetCanvas->setCursor(static_cast<int16_t>((kScreenW - w2) / 2), 145);
+  g_sheetCanvas->print(line2);
 }
 //
 // The flow is Wi-Fi QR -> URL QR, and nothing used to say so. Scanning the
@@ -10174,6 +10296,36 @@ void OverrideTouchObserver::gestureNotification(int iGestureId, int x, int y, bo
                   iGestureId, x, y, bCurrentlyPressed ? 1 : 0);
   }
   if (iGestureId == kTouchSwipeDownId) {
+    // Suppress the chip's SwipeDown when the sheet controller is (or was very
+    // recently) driving the transition. The CST816T runs its own gesture
+    // detector in parallel with our finger sampler; it reports a completed
+    // SwipeDown at release-time regardless of whether we already committed the
+    // sheet on the same finger up. Without this guard the sheet's commit +
+    // the chip's gesture BOTH set g_orPendingSwipeDown, and enterWifiBoot()
+    // fires the AP twice: once when the sheet lands, once again 1-2 control()
+    // ticks later, producing a spurious NVS wipe / re-provision.
+    //
+    // Fail-soft: if the sheet canvas didn't allocate, this feature is disabled
+    // and the chip's gesture must go through unchanged -- that IS the fallback
+    // path in that configuration.
+    const bool sheetEngaged =
+        (g_sheetCanvas != nullptr) &&
+        ((g_sheet.state != SheetTransition::State::Closed) ||
+         // SIGNED delta, per the rule in sheet_transition.h and R46. A naive
+         // `millis() < deadline` collapses the window to nothing if a commit
+         // lands within 800 ms of the 49.7-day millis() wrap, because the
+         // deadline is then a small value while millis() is near UINT32_MAX.
+         // Today a leaked SwipeDown in that window is caught downstream
+         // ("already past IDLE") and costs only a log line -- but relying on a
+         // second-line defence in another file is exactly how the underflow
+         // that cut drive power mid-run survived review once already.
+         (static_cast<int32_t>(millis() - g_sheetGestureSuppressUntilMs) < 0));
+    if (sheetEngaged) {
+      if (g_touchDebug) {
+        Serial.println(F("touch: SwipeDown suppressed (sheet owns transition)"));
+      }
+      return;
+    }
     g_orPendingSwipeDown = true;
   } else if (iGestureId == kTouchSwipeUpId) {
     g_orPendingSwipeUp = true;
@@ -10190,20 +10342,9 @@ void OverrideTouchObserver::touchNotification(int x, int y, bool bCurrentlyPress
   g_lastTouchX = screenX;
   g_lastTouchY = screenY;
 
-  // Track the finger for drag-to-commit. Stamp only -- all rendering and every
-  // state change happens on the loop task, because this runs inside the I2C
-  // callback and must return immediately.
-  if (bCurrentlyPressed) {
-    if (!g_dragActive) {
-      g_dragActive = true;
-      g_dragStartY = screenY;
-    }
-    g_dragCurrentY = screenY;
-  } else if (g_dragActive) {
-    g_dragCurrentY = screenY;
-    g_dragActive   = false;
-    g_dragReleased = true;
-  }
+  // Drag-to-commit sampling moved to serviceDragTransition() on the loop task
+  // (it reads the CST816T's XY registers directly -- see PROJECT-HISTORY R48).
+  // Nothing to stamp here.
 
   // Only stamp intent here. Starting a gesture takes the drive mutex and
   // paints the LCD, neither of which belongs in a touch callback.
@@ -10229,94 +10370,196 @@ void OverrideTouchObserver::touchNotification(int x, int y, bool bCurrentlyPress
 
 // Render a drag in progress and act on its release. Loop task only.
 //
-// !! CURRENTLY INERT ON THIS HARDWARE -- see PROJECT-HISTORY R48. !!
-// CST816Touch_HWMode reports only completed gestures, never intermediate touch
-// points, so touchNotification does not fire mid-drag and g_dragActive is never
-// set. Confirmed by dragging a finger and reading `touchlog`: three entries,
-// all gesture IDs with pressed=0, zero touch points. This code is correct and
-// starts working the moment those points arrive; unlocking them means either
-// switching to CST816Touch_SWMode (which replaces the calibrated hardware
-// gesture detection) or reading the coordinate registers directly (which adds
-// traffic to an I2C bus with an unexplained stall). Left in place deliberately
-// rather than deleted, because the decision is open and the work is done.
+// Finger position is read DIRECTLY off the CST816T (readTouchPointDirect), not
+// obtained from the library. In hardware-gesture mode the library reports only
+// completed gestures -- confirmed on hardware, three touchlog entries and zero
+// touch points for a full drag -- and its coordinate accessors are private. The
+// chip publishes position in plain registers regardless, so the library keeps
+// doing gesture detection untouched and this reads alongside it. See
+// PROJECT-HISTORY R48.
 //
-// It costs one mode comparison per loop pass while dormant.
+// The only supported interaction is: on the FACE screen, pull DOWN from the top
+// to reveal a pairing CARD that tracks the finger 1:1. Nothing commits until
+// the gesture completes. The face itself never moves -- the card is a second
+// canvas overlayed row-strip by row-strip over the LCD, and the face canvas
+// stays exactly as it was rendered by the eye engine.
 //
-// Direction is decided by what the current screen can actually do, so the
-// motion always follows the finger toward a real outcome (design-craft 6a):
-//   QR screens  -> drag UP to exit    (upward only)
-//   idle face   -> drag DOWN to pair  (downward only)
-// Dragging the other way does nothing and shows nothing, which is the honest
-// answer: there is no action there to preview.
+// Cost model: only the rows that just changed sides are pushed each frame,
+// which is tens of rows per tick instead of the whole 240x280 panel. That is
+// what makes this CHEAPER than the full-screen shift it replaced (design-craft
+// 6b).
 //
-// Nothing commits until release, and releasing short of the threshold snaps
-// back. That is the whole point -- a swipe used to be an irreversible instant
-// event, and this makes it inspectable and cancellable.
+// Fail-soft: g_sheetCanvas == nullptr means the second framebuffer could not
+// be allocated. Return immediately; the chip's own SwipeDown gesture then
+// drives the pairing flow as it did before this feature existed.
 static void serviceDragTransition() {
-  static int16_t s_renderedDy = 0;
+  static int16_t s_renderedY = 0;
+  static bool    s_pressed   = false;
 
-  const bool onQr   = (g_lcdMode == LCD_MODE_QR_WIFI) ||
-                      (g_lcdMode == LCD_MODE_QR_URL);
   const bool onFace = (g_lcdMode == LCD_MODE_FACE) &&
                       (g_orState == ORS_IDLE);
-  if (!onQr && !onFace) {
-    // Mode changed mid-drag (the AP came up, a phone connected). Abandon
-    // quietly; the mode switch has already repainted the panel.
-    s_renderedDy   = 0;
-    g_dragReleased = false;
-    return;
-  }
 
-  if (g_dragActive) {
-    int16_t dy = static_cast<int16_t>(g_dragCurrentY - g_dragStartY);
-    if (onQr  && dy > 0) dy = 0;   // QR: only upward means anything
-    if (onFace && dy < 0) dy = 0;  // face: only downward means anything
-    // Rubber band past the commit point: the finger keeps moving but the
-    // screen gives, so the control feels physical instead of hitting a wall
-    // (design-craft 6a).
-    const int16_t mag = static_cast<int16_t>(dy < 0 ? -dy : dy);
-    if (mag > kDragCommitPx) {
-      const int16_t over = static_cast<int16_t>(mag - kDragCommitPx);
-      const int16_t eased =
-          static_cast<int16_t>(kDragCommitPx + (over / 3));
-      dy = static_cast<int16_t>(dy < 0 ? -eased : eased);
-    }
-    if (dy != s_renderedDy) {
-      pushCanvasShiftedToLcd(dy, mag >= kDragCommitPx);
-      s_renderedDy = dy;
+  // Sheet only lives on the idle face screen. If the mode changed while it was
+  // open (which is what a successful commit looks like: enterLcdEstablishingMode
+  // flips g_lcdMode to LCD_MODE_ESTABLISHING and repaints the panel), park the
+  // controller and forget the last render.
+  if (!onFace) {
+    if (g_sheet.state != SheetTransition::State::Closed || s_pressed) {
+      g_sheet.reset();
+      s_renderedY = 0;
+      s_pressed   = false;
     }
     return;
   }
 
-  if (!g_dragReleased) {
+  if (g_sheetCanvas == nullptr) {
+    // No compositor available -- chip gesture path handles everything.
     return;
   }
-  g_dragReleased = false;
-  const int16_t dy  = static_cast<int16_t>(g_dragCurrentY - g_dragStartY);
-  const int16_t mag = static_cast<int16_t>(dy < 0 ? -dy : dy);
-  const bool commit = (mag >= kDragCommitPx) &&
-                      ((onQr && dy < 0) || (onFace && dy > 0));
-  if (commit) {
-    // Hand off to the existing swipe path rather than duplicating it, so drag
-    // and the chip's own gesture detection converge on identical behaviour.
-    if (onQr) {
-      g_orPendingSwipeUp = true;
-    } else {
-      g_orPendingSwipeDown = true;
+
+  // Sample the finger directly. Only here, only in drag-capable modes, so no
+  // extra I2C traffic is added on any screen that cannot use it.
+  int16_t rawX = 0;
+  int16_t rawY = 0;
+  bool pressed = false;
+  const uint32_t sampleStartUs = micros();
+  const bool ok = readTouchPointDirect(rawX, rawY, pressed);
+  const uint32_t sampleUs = micros() - sampleStartUs;
+  if (sampleUs > g_rtcTouchMaxUs) {
+    // Folded into the SAME worst-case counter as the library's poll. This read
+    // is on the identical bus, so if the bus is what stalls, it must be able to
+    // show up here too -- keeping a separate counter would hide half the
+    // evidence in the investigation this instrumentation exists for.
+    g_rtcTouchMaxUs = sampleUs;
+    g_rtcStallBatMv = static_cast<uint32_t>(g_batVoltage * 1000.0f);
+    g_rtcStallFlags = (g_driveRailOn ? kStallFlagRail : 0U) |
+                      (g_movementSequencer.active() ? kStallFlagGesture : 0U) |
+                      (g_batCharging ? kStallFlagCharge : 0U);
+  }
+
+  const uint32_t nowMs = millis();
+
+  int16_t screenX = 0;
+  int16_t screenY = 0;
+  if (ok) {
+    mapTouchToScreen(rawX, rawY, screenX, screenY);
+  }
+
+  static bool s_armed = false;
+  // Consecutive failed touch reads. A transport failure is NOT a release.
+  //
+  // The read fails when Wire.endTransmission or requestFrom does -- a bus
+  // glitch, a stretched NACK, a chip that missed a beat. Treating that as a
+  // finger lift means a single dropped transaction mid-drag runs onRelease
+  // with whatever downward velocity was accumulated, projects past the
+  // threshold, and starts the AP without the operator ever letting go.
+  //
+  // That is not hypothetical here: this is the same I2C bus carrying the
+  // unexplained TASK_WDT stall still under investigation, so any pathology
+  // that produces intermittent single-transaction failures lands exactly on
+  // this path.
+  //
+  // So a failure skips the frame and retries. The counter exists so a
+  // genuinely wedged chip cannot strand the sheet half-open forever: after
+  // kTouchReadFailTolerance consecutive failures we accept that the finger is
+  // gone and settle normally.
+  static uint8_t s_readFails = 0;
+  constexpr uint8_t kTouchReadFailTolerance = 3;   // ~3 loop passes
+  if (!ok) {
+    ++s_readFails;
+    if (s_readFails < kTouchReadFailTolerance) {
+      return;  // keep s_pressed; retry next tick
     }
-    Serial.printf("drag: committed %s (%d px)\n", onQr ? "up" : "down",
-                  static_cast<int>(mag));
-  } else if (s_renderedDy != 0) {
-    Serial.printf("drag: cancelled (%d px, needed %d)\n",
-                  static_cast<int>(mag), static_cast<int>(kDragCommitPx));
+  } else {
+    s_readFails = 0;
   }
-  // Restore in both cases. On commit the mode switch repaints anyway, but the
-  // panel must not be left holding a half-shifted image if that switch is
-  // delayed or refused.
-  if (s_renderedDy != 0) {
-    pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
-    s_renderedDy = 0;
+  const bool fingerGone = (!ok && s_readFails >= kTouchReadFailTolerance) ||
+                          (ok && !pressed);
+
+  if (ok && pressed && !s_pressed) {
+    // First contact on the face screen. Paint the card content once so every
+    // strip we push already shows the pairing splash -- deferring this to
+    // the first move would flash a partial card.
+    s_armed = false;
+    drawSheetCard(/*armed=*/false, /*committed=*/false);
+    g_sheet.onPress(screenY, nowMs);
+    s_pressed = true;
+  } else if (ok && pressed && s_pressed) {
+    g_sheet.onMove(screenY, nowMs, kScreenH);
+    // Re-evaluate the commit verb against the PROJECTED endpoint -- the same
+    // number onRelease will use -- so what the card promises is exactly what
+    // releasing now would do. Testing raw position instead would promise
+    // "Release to pair" while a decelerating finger was about to cancel.
+    //
+    // Edge-triggered: the card is only repainted when the answer flips, so a
+    // steady drag costs nothing extra. Rows already pushed keep the old verb
+    // until the strip logic repaints them, which is why the whole visible
+    // extent is re-pushed on a flip.
+    const int16_t threshold =
+        static_cast<int16_t>((static_cast<int32_t>(kScreenH) *
+                              SheetTransition::kThresholdPct) / 100);
+    const int32_t projected = SheetTransition::project(
+        g_sheet.y, g_sheet.velocity, SheetTransition::kProjectMs);
+    const bool armed = projected >= threshold;
+    if (armed != s_armed) {
+      s_armed = armed;
+      drawSheetCard(armed, /*committed=*/false);
+      s_renderedY = 0;  // force a full repaint of the visible card extent
+    }
+  } else if (s_pressed && fingerGone) {
+    // Real release: either the chip reported the finger up, or reads have
+    // failed long enough that we stop assuming it is still there.
+    const int16_t threshold =
+        static_cast<int16_t>((static_cast<int32_t>(kScreenH) *
+                              SheetTransition::kThresholdPct) / 100);
+    g_sheet.onRelease(kScreenH, threshold);
+    s_pressed = false;
   }
+
+  // Advance the settle animation from the loop. NO delay() here -- an animation
+  // that sleeps on a watchdog-fed task is a pending reset.
+  g_sheet.tick(SheetTransition::kSettlePercent);
+
+  // Consume the one-shot committed-open signal exactly once. Hand off to the
+  // existing chip-swipe path (g_orPendingSwipeDown) so drag and the chip
+  // converge on the same lifecycle rather than duplicating it. Arm the
+  // gesture-suppression window so the chip's own release-time SwipeDown
+  // arriving in the next control() tick does not fire the AP a second time.
+  if (g_sheet.takeSettledOpen()) {
+    g_sheetGestureSuppressUntilMs = nowMs + kSheetGestureSuppressMs;
+    g_orPendingSwipeDown = true;
+    // Now the label is finally true: repaint so the fully-open card reads
+    // "Establishing Server..." as the AP actually comes up.
+    s_armed = false;
+    drawSheetCard(/*armed=*/false, /*committed=*/true);
+    s_renderedY = 0;
+    Serial.println(F("sheet: committed open -> orPendingSwipeDown"));
+  }
+
+  // Visible sheet height in [0, H]. y may rubber-band outside the panel range
+  // (kRubberDivisor lets it go slightly negative or slightly past H).
+  int16_t y = static_cast<int16_t>(g_sheet.y);
+  if (y < 0)         y = 0;
+  if (y > kScreenH)  y = kScreenH;
+
+  if (y == s_renderedY) {
+    return;
+  }
+
+  uint16_t* sheetFb = g_sheetCanvas->getFramebuffer();
+  uint16_t* faceFb  = (g_canvas != nullptr) ? g_canvas->getFramebuffer()
+                                            : nullptr;
+
+  if (y > s_renderedY) {
+    // Opening: rows [s_renderedY, y) go from face -> sheet.
+    pushSheetStrip(sheetFb, s_renderedY, y);
+  } else {
+    // Closing: rows [y, s_renderedY) go from sheet -> face.
+    if (faceFb != nullptr) {
+      pushSheetStrip(faceFb, y, s_renderedY);
+    }
+  }
+  s_renderedY = y;
 }
 
 // Consume a pending button press: highlight it, run the gesture, and clear the
@@ -10634,6 +10877,51 @@ static void teardownToIdle() {
   enterIdleDemo();
 }
 
+// Show a failure for long enough to be read, then return to the face.
+//
+// Pairing used to fail SILENTLY: on timeout or an AP fault the machine called
+// teardownToIdle() and the face simply came back. From the operator's side that
+// is indistinguishable from "the AP came up and something went wrong later",
+// "the AP never came up", and "I imagined the whole thing" -- so the learned
+// response becomes re-swiping reflexively, which usually works, and a folk
+// remedy replaces an explanation.
+//
+// Design-craft §7 says a wait over 10 s needs an exit; there was one (the
+// timeout) but it was not legible. This makes the outcome visible without
+// requiring a dismissal -- the auto-return makes it a toast in disguise.
+//
+// Blocking here is safe and deliberate: this runs on the loop task at a moment
+// when the AP is already down, no drive session exists, and no gesture is in
+// flight. It is well inside the 5 s task watchdog, and it is a one-shot, not
+// an animation frame.
+constexpr uint32_t kPairFailNoticeMs = 1600;
+
+static void showPairingFailed(const char* reason) {
+  Serial.printf("pairing failed: %s\n", reason);
+  if (g_canvas == nullptr) return;
+  g_canvas->fillScreen(0x0000);
+  const uint8_t kSize = 2;
+  const char* kL1 = "Pairing";
+  const char* kL2 = "failed";
+  const char* kL3 = "swipe down to retry";
+  g_canvas->setTextWrap(false);
+  g_canvas->setTextSize(kSize);
+  g_canvas->setTextColor(kQrWhite);
+  g_canvas->setCursor(
+      static_cast<int16_t>((kScreenW - static_cast<int16_t>(strlen(kL1) * 6 * kSize)) / 2), 110);
+  g_canvas->print(kL1);
+  g_canvas->setCursor(
+      static_cast<int16_t>((kScreenW - static_cast<int16_t>(strlen(kL2) * 6 * kSize)) / 2), 136);
+  g_canvas->print(kL2);
+  g_canvas->setTextSize(1);
+  g_canvas->setTextColor(0x8410);
+  g_canvas->setCursor(
+      static_cast<int16_t>((kScreenW - static_cast<int16_t>(strlen(kL3) * 6)) / 2), 172);
+  g_canvas->print(kL3);
+  pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
+  delay(kPairFailNoticeMs);
+}
+
 static void handleApLifecycleFault(const char* reason) {
   g_apStartupInProgress.store(false, std::memory_order_release);
   g_apStartupStopSeen.store(false, std::memory_order_release);
@@ -10770,6 +11058,8 @@ void overrideLoop() {
       } else if ((now - g_orStateEnterMs) > kOrWifiBootMaxMs) {
         Serial.println(F("override: WIFI_BOOT timeout — aborting"));
         teardownToIdle();
+        showPairingFailed("AP did not come up within the boot window");
+        enterIdleDemo();
       }
       break;
     }
@@ -11442,6 +11732,20 @@ void loop() {
   overrideLoop();
   breadcrumb(kCrumbLoopPower);
   checkPowerButton();
+  // If the sheet is engaged (open, dragging or settling) the face canvas must
+  // NOT push to the LCD -- updateBatteryMeter() and the eye-engine renderer
+  // below both call pushCanvasRectToLcd against the top of the panel, which
+  // would tear the sheet strip we just composited. Yield 1 ms and come back;
+  // the sheet controller owns the LCD until it returns to Closed. Power
+  // button + web server pump still ran above so no supervisory work is lost.
+  //
+  // Fail-soft: guarded on g_sheetCanvas != nullptr so the null-alloc path
+  // behaves exactly like it did before this feature existed.
+  if ((g_sheetCanvas != nullptr) &&
+      (g_sheet.state != SheetTransition::State::Closed)) {
+    delay(1);
+    return;
+  }
   // Refresh battery meter at most once per second
   // Round 4: only paint the meter when the face is up — in QR mode the
   // bar would clobber the QR codes.

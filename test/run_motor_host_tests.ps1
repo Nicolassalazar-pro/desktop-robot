@@ -132,6 +132,13 @@ try {
         'src\drive_session.cpp'
     )
 
+    Invoke-NativeTest -Name 'sheet-transition' -IncludeArgs @(
+        '-Isrc'
+    ) -Sources @(
+        'test\sheet_transition_test.cpp',
+        'src\sheet_transition.cpp'
+    )
+
     # The gesture-menu test mirrors constants that live in main.cpp. Verify the
     # copies still match, so the geometry cannot silently drift out of sync.
     $mainSrc = Get-Content 'src\main.cpp' -Raw
