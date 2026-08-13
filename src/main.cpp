@@ -214,7 +214,29 @@ RTC_NOINIT_ATTR uint32_t g_rtcLoopMaxPhase;    // crumb phase during that pass
 // confirmed; rail off and a healthy battery kills it outright.
 RTC_NOINIT_ATTR uint32_t g_rtcStallBatMv;      // battery mV at the worst poll
 RTC_NOINIT_ATTR uint32_t g_rtcStallFlags;      // bit0 rail, bit1 gesture, bit2 charging
+// Was the I2C bus idle (both lines high) immediately before the LAST touch poll
+// we attempted? Written every pass, so after a reset it describes the poll the
+// board died in -- the one fact the timing counters structurally cannot give
+// us, because a hang never returns to update them.
+RTC_NOINIT_ATTR uint32_t g_rtcBusIdleAtPoll;
+RTC_NOINIT_ATTR uint32_t g_rtcBusStuckCount;   // polls entered with a stuck line
 constexpr uint32_t kStallFlagRail    = 1U << 0;
+// Longest gap BETWEEN two breadcrumbs, and which pair it fell between.
+//
+// The whole-pass timer said ~500 ms in "loop: power button", which sent me
+// looking at checkPowerButton() -- a digitalRead and three comparisons that
+// cannot take 500 ms. The crumb was simply the last one written before the pass
+// ended, so it named a bystander. Same misattribution that made crash #5 look
+// like the quarantine spin.
+//
+// Measuring the interval between consecutive crumbs names the SEGMENT instead,
+// and a segment that spans the end of one pass and the start of the next also
+// catches time the loop task spent preempted (by WiFi/AsyncTCP, which is the
+// current suspicion, since the stalls appear while streaming control frames).
+RTC_NOINIT_ATTR uint32_t g_rtcSegMaxUs;
+RTC_NOINIT_ATTR uint32_t g_rtcSegFrom;
+RTC_NOINIT_ATTR uint32_t g_rtcSegTo;
+
 constexpr uint32_t kStallFlagGesture = 1U << 1;
 constexpr uint32_t kStallFlagCharge  = 1U << 2;
 constexpr uint32_t kStallMagic  = 0x5A11EDU;
@@ -228,6 +250,11 @@ inline void stallStatsReset() {
   g_rtcLoopMaxPhase   = 0;
   g_rtcStallBatMv     = 0;
   g_rtcStallFlags     = 0;
+  g_rtcBusIdleAtPoll  = 1U;   // assume healthy until a poll says otherwise
+  g_rtcBusStuckCount  = 0;
+  g_rtcSegMaxUs       = 0;
+  g_rtcSegFrom        = 0;
+  g_rtcSegTo          = 0;
 }
 inline void stallStatsInitIfCold() {
   if (g_rtcStallMagic != kStallMagic) {
@@ -235,7 +262,50 @@ inline void stallStatsInitIfCold() {
   }
 }
 
+// A segment longer than this is reported live, with both endpoints named.
+constexpr uint32_t kSegWarnUs = 250000U;   // 250 ms: well past any healthy step
+
+// Defined below, next to the crumb table.
+const char* crumbName(uint32_t phase);
+
+// Set on the first loop() pass. Segment timing is restricted to this task.
+TaskHandle_t g_loopTaskHandle = nullptr;
+
 inline void breadcrumb(uint32_t phase, uint32_t detail = 0) {
+  static uint32_t s_lastCrumbUs = 0;
+  static bool     s_haveLast    = false;
+  // Segment timing is LOOP-TASK ONLY.
+  //
+  // Breadcrumbs are also written from the AsyncTCP task (the websocket crumbs),
+  // and a static shared between tasks produced nonsense the moment the two
+  // interleaved: a reported 4,294,967,120 us, which is -176 us reinterpreted as
+  // unsigned. A cross-task interval is not a stall measurement anyway -- the
+  // two tasks run independently -- so only measure when the crumb comes from
+  // the task whose stalls we are actually chasing.
+  const bool onLoopTask =
+      (g_loopTaskHandle != nullptr) &&
+      (xTaskGetCurrentTaskHandle() == g_loopTaskHandle);
+  if (onLoopTask) {
+    const uint32_t nowUs = micros();
+    if (s_haveLast) {
+      const uint32_t seg = nowUs - s_lastCrumbUs;
+      if (seg > g_rtcSegMaxUs) {
+        g_rtcSegMaxUs = seg;
+        g_rtcSegFrom  = g_crumbPhase;   // still the PREVIOUS phase at this point
+        g_rtcSegTo    = phase;
+      }
+      if (seg > kSegWarnUs) {
+        // Rare by construction, and the capture is timestamped, so this can be
+        // lined up against a joystick dropout to the second.
+        Serial.printf("STALL seg %lu us  %s -> %s\n",
+                      static_cast<unsigned long>(seg), crumbName(g_crumbPhase),
+                      crumbName(phase));
+      }
+    }
+    s_lastCrumbUs = nowUs;
+    s_haveLast    = true;
+  }
+
   g_crumbMagic = kCrumbMagic;
   g_crumbPhase = phase;
   g_crumbDetail = detail;
@@ -3956,6 +4026,12 @@ void cmdCrash(char* argument) {
       (g_rtcStallFlags & kStallFlagRail) ? "ON" : "off",
       (g_rtcStallFlags & kStallFlagGesture) ? "RUNNING" : "idle",
       (g_rtcStallFlags & kStallFlagCharge) ? "charging" : "on battery");
+  Serial.printf("stall: I2C before last poll -- %s (stuck seen: %lu)\n",
+                (g_rtcBusIdleAtPoll != 0U) ? "idle" : "STUCK",
+                static_cast<unsigned long>(g_rtcBusStuckCount));
+  Serial.printf("stall: worst SEGMENT %lu us  %s -> %s\n",
+                static_cast<unsigned long>(g_rtcSegMaxUs),
+                crumbName(g_rtcSegFrom), crumbName(g_rtcSegTo));
   if (nvs_open("crashlog", NVS_READONLY, &handle) != ESP_OK) {
     Serial.println(F("crash: none recorded"));
     return;
@@ -6526,6 +6602,12 @@ void rejectWsTransportAdmission(const WsEvent& event, const char* reason) {
 }
 
 static void resetDriveSessionAndPower(const char* reason) {
+  // Timed because a 410 ms loop stall was measured across this call (segment
+  // "ws ingress drained -> loop: power button"), and a stall here is not
+  // cosmetic: it starves the control-frame drain for longer than
+  // kControlTimeoutMs (300 ms), which trips the very timeout that called us.
+  // That is a feedback loop -- the recovery from a dropout causes the next one.
+  const uint32_t resetStartUs = micros();
   const DriveSession::Decision decision = g_driveSession.reset();
   g_driveSessionTransportToken.store(0, std::memory_order_release);
   g_driveSessionTransportGeneration.store(0, std::memory_order_release);
@@ -6535,6 +6617,14 @@ static void resetDriveSessionAndPower(const char* reason) {
                 driveSessionStateName(decision.state),
                 reason == nullptr ? "reset" : reason,
                 static_cast<unsigned long>(g_driveSession.generation()));
+  const uint32_t resetUs = micros() - resetStartUs;
+  if (resetUs > 50000U) {
+    Serial.printf("SLOW driveReset %lu us (rail discharge %lu ms + pwm commit "
+                  "%lu ms are blocking)\n",
+                  static_cast<unsigned long>(resetUs),
+                  static_cast<unsigned long>(kServoRailDischargeMs),
+                  static_cast<unsigned long>(kServoPwmCommitMs));
+  }
 }
 
 bool beginWsIngress() {
@@ -12197,6 +12287,13 @@ void setup() {
             (g_rtcStallFlags & kStallFlagRail) ? "ON" : "off",
             (g_rtcStallFlags & kStallFlagGesture) ? "RUNNING" : "idle",
             (g_rtcStallFlags & kStallFlagCharge) ? "charging" : "on battery");
+        // THE decisive line for the touch-poll watchdog resets. It describes
+        // the poll the board actually died in, not the worst one it survived.
+        Serial.printf(
+            "boot: I2C bus before the LAST poll -- %s (stuck entries seen: %lu)\n",
+            (g_rtcBusIdleAtPoll != 0U) ? "IDLE (both lines high)"
+                                       : "STUCK (a line was held low)",
+            static_cast<unsigned long>(g_rtcBusStuckCount));
       }
       // Persist it. The RTC crumb is overwritten within milliseconds by this
       // very boot (setup writes one), so unless it is snapshotted here the
@@ -12451,6 +12548,9 @@ void setup() {
 
 void loop() {
   ++g_loopIterations;
+  if (g_loopTaskHandle == nullptr) {
+    g_loopTaskHandle = xTaskGetCurrentTaskHandle();
+  }
   // Whole-pass timer, paired with the touch-poll timer.
   //
   // A watchdog reset proves only that the loop went 5 s unfed; it does not say
@@ -12525,6 +12625,36 @@ void loop() {
   // stall, and it is written to RTC memory so it survives the reset we are
   // trying to catch.
   breadcrumb(kCrumbLoopTouch);
+  // Is the bus even idle before we go in?
+  //
+  // Nine TASK_WDT resets have now landed inside g_orTouch.control(), and the
+  // instrumentation says the poll is never merely slow: worst 905 us, and the
+  // >20 ms counter is still zero after adding Wire.setTimeOut(10). A bounded
+  // transaction cannot produce that, so either the hang is not a Wire transfer
+  // at all, or the bus is already stuck before we start and the driver spins
+  // somewhere the timeout does not cover.
+  //
+  // Two digitalReads settle it. On an idle I2C bus both lines are pulled high;
+  // SDA low with no transfer in progress is the classic stuck-slave signature.
+  // Reading the pins is safe while they are routed to the peripheral -- the
+  // GPIO input register still reflects the pad.
+  //
+  // Recording it in RTC matters more than the log line: if the board dies on
+  // the very next instruction, the boot banner still gets to say whether the
+  // bus was healthy going in. That is the one fact we have never had.
+  {
+    const bool sdaHigh = (digitalRead(I2C_SDA) != LOW);
+    const bool sclHigh = (digitalRead(I2C_SCL) != LOW);
+    g_rtcBusIdleAtPoll = (sdaHigh && sclHigh) ? 1U : 0U;
+    if (!sdaHigh || !sclHigh) {
+      ++g_rtcBusStuckCount;
+      Serial.printf("i2c: bus NOT idle before poll (SDA=%d SCL=%d) -- recovering\n",
+                    sdaHigh ? 1 : 0, sclHigh ? 1 : 0);
+      if (i2cRecoverBus()) {
+        (void)g_orTouch.resetChip(true);
+      }
+    }
+  }
   const uint32_t touchStartUs = micros();
   g_orTouch.control();
   const uint32_t touchUs = micros() - touchStartUs;
