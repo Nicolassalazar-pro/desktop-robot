@@ -43,6 +43,7 @@
 #include "melody.h"
 #include "melody_gen.h"
 #include "sheet_transition.h"
+#include "screens.h"
 #include "nvs.h"
 #include <esp_random.h>
 
@@ -2147,11 +2148,7 @@ void drawMascotToCanvas(int16_t originX, int16_t originY) {
   // content has not moved since the last render.
   g_batStripCanvasFresh = false;
 
-  g_canvas->draw16bitRGBBitmap(originX,
-                               originY,
-                               const_cast<uint16_t*>(MASCOT_A_RGB565),
-                               MASCOT_A_W,
-                               MASCOT_A_H);
+  Screens::drawMascotToCanvas(g_canvas, originX, originY);
 }
 
 void pushCanvasRectToLcd(int16_t x, int16_t y, int16_t w, int16_t h);
@@ -10185,35 +10182,14 @@ void orHandleCaptive(AsyncWebServerRequest* req) {
 // All functions in this block MUST be called from the main Arduino task
 // (loop / setup / overrideLoop). They touch g_canvas + LCD SPI.
 
-// Draw a single QR module at the given pixel scale (scale × scale on the LCD).
-static inline void qrDrawModule(int16_t x, int16_t y, uint8_t scale) {
-  g_canvas->fillRect(x, y, scale, scale, kQrBlack);
-}
+// The actual QR / centered-text drawing lives in src/screens.cpp so that the
+// host-preview harness compiles the SAME code. These thin wrappers keep the
+// legacy call sites (drawEstablishingScreen, drawQrScreenWifi, etc.) unchanged
+// and re-target them at g_canvas.
 
-// Render a QR matrix into the canvas at the given pixel scale.
-// originX/Y = top-left of the QR core (the white background of the canvas
-// serves as the quiet zone).
-static void drawQrToCanvas(QRCode* qr, int16_t originX, int16_t originY, uint8_t scale) {
-  for (uint8_t my = 0; my < qr->size; ++my) {
-    for (uint8_t mx = 0; mx < qr->size; ++mx) {
-      if (qrcode_getModule(qr, mx, my)) {
-        qrDrawModule(static_cast<int16_t>(originX + mx * scale),
-                     static_cast<int16_t>(originY + my * scale),
-                     scale);
-      }
-    }
-  }
-}
-
-// Centered text helper — uses the built-in 6×8 GFX font (so width = 6 × size × len).
+// Centered text helper -- uses the built-in 6x8 GFX font (so width = 6 x size x len).
 static void qrCenterText(int16_t y, uint8_t textSize, const char* s) {
-  g_canvas->setTextSize(textSize);
-  g_canvas->setTextColor(kQrBlack);
-  g_canvas->setTextWrap(false);
-  const int16_t textW = static_cast<int16_t>(strlen(s) * 6 * textSize);
-  const int16_t x     = static_cast<int16_t>((kScreenW - textW) / 2);
-  g_canvas->setCursor(x, y);
-  g_canvas->print(s);
+  Screens::qrCenterText(g_canvas, y, textSize, s);
 }
 
 // DSGN-6: prefer size 2 for legibility; drop to size 1 only when the
@@ -10222,22 +10198,13 @@ static void qrCenterText(int16_t y, uint8_t textSize, const char* s) {
 // off-screen when a longer credential lands. Text color follows qrCenterText
 // (black on the Wi-Fi QR white background).
 static void qrCenterTextFit(int16_t y, const char* s) {
-  const size_t len = strlen(s);
-  const uint8_t textSize =
-      (static_cast<int16_t>(len * 6 * 2) <= kScreenW) ? 2 : 1;
-  qrCenterText(y, textSize, s);
+  Screens::qrCenterTextFit(g_canvas, y, s);
 }
 
 // Like qrCenterText, but for the "Establishing Server..." dark splash:
 // white text on black background.
 static void qrCenterTextDark(int16_t y, uint8_t textSize, const char* s) {
-  g_canvas->setTextSize(textSize);
-  g_canvas->setTextColor(kQrWhite);
-  g_canvas->setTextWrap(false);
-  const int16_t textW = static_cast<int16_t>(strlen(s) * 6 * textSize);
-  const int16_t x     = static_cast<int16_t>((kScreenW - textW) / 2);
-  g_canvas->setCursor(x, y);
-  g_canvas->print(s);
+  Screens::qrCenterTextDark(g_canvas, y, textSize, s);
 }
 
 // Paint the "scan to join Wi-Fi" screen.
@@ -10505,92 +10472,41 @@ static void handOffSheetQrToPanel() {
 // reporting, not a fabricated head start. Shape carries the state (filled vs
 // hollow), never colour alone (§3, DSGN-5).
 static void drawPairingStepDots(int16_t y, uint8_t step) {
-  if (g_canvas == nullptr) return;
-  constexpr int16_t kR    = 4;
-  constexpr int16_t kGap  = 18;
-  const int16_t cx = kScreenW / 2;
-  for (uint8_t i = 0; i < 2U; ++i) {
-    const int16_t x =
-        static_cast<int16_t>(cx - (kGap / 2) + (i * kGap));
-    if (i < step) {
-      g_canvas->fillCircle(x, y, kR, kQrBlack);
-    } else {
-      g_canvas->drawCircle(x, y, kR, kQrBlack);
-    }
-  }
+  Screens::drawPairingStepDots(g_canvas, y, step);
 }
 
 static void drawQrScreenWifi() {
   if (g_canvas == nullptr) return;
-  g_canvas->fillScreen(kQrWhite);
-
+  // Credentials never leave main.cpp -- retrieve, hand the plaintext to the
+  // shared drawing code, then secureZero on the way back. screens.cpp only
+  // zeroes its own QR encode buffer and the passwordLabel scratch, so the
+  // envelope around them is still owned here.
   ActivationCredentials credentials = {};
   if (!copyActivationCredentials(credentials)) {
-    qrCenterText(/*y=*/132, /*size=*/1, "Wi-Fi unavailable");
+    Screens::qrCenterText(g_canvas, /*y=*/132, /*size=*/1, "Wi-Fi unavailable");
     return;
   }
-  char wifiPayload[96];
-  snprintf(wifiPayload, sizeof(wifiPayload), "WIFI:T:WPA;S:%s;P:%s;;",
-           credentials.ssid, credentials.password);
-  char passwordLabel[sizeof("pw:") + kApPasswordMaxLength];
-  snprintf(passwordLabel, sizeof(passwordLabel), "pw:%s",
-           credentials.password);
-
-  uint8_t wifiBuf[200];
-  QRCode wifiQr;
-  qrcode_initText(&wifiQr, wifiBuf, kQrWifiVersion, ECC_MEDIUM, wifiPayload);
-  const int16_t px = static_cast<int16_t>(wifiQr.size * kQrWifiPixelScale);
-  const int16_t x  = static_cast<int16_t>((kScreenW - px) / 2);
-  const int16_t y  = 6;
-  drawQrToCanvas(&wifiQr, x, y, kQrWifiPixelScale);
-
-  qrCenterText(/*y=*/206, /*size=*/1, "Scan to join Wi-Fi");
-  qrCenterTextFit(/*y=*/220, credentials.ssid);
-  qrCenterTextFit(/*y=*/240, passwordLabel);
-  // Step 1 of 2. Without this the operator scans, watches the screen change,
-  // and has no way to know whether that was the end of it (design-craft §6a
-  // multi-step indicators, §18 goal-gradient). Filled/hollow is a SHAPE
-  // difference, so it survives the screen being photographed or read by
-  // someone who cannot separate the hues (§3).
-  drawPairingStepDots(/*y=*/264, /*step=*/1U);
-  // The swipe is otherwise invisible: an unsignalled gesture does not exist
-  // (design-craft §1, §8).
-  qrCenterText(/*y=*/272, /*size=*/1, "swipe up to exit");
-  secureZero(wifiBuf, sizeof(wifiBuf));
-  secureZero(passwordLabel, sizeof(passwordLabel));
-  secureZero(wifiPayload, sizeof(wifiPayload));
+  Screens::drawQrScreenWifi(g_canvas, credentials.ssid, credentials.password);
   secureZero(&credentials, sizeof(credentials));
 }
 
 // Paint the "scan to open browser" screen.
-// Layout (240×280): QR with proper quiet zone, URL text below.//
+// Layout (240×280): QR with proper quiet zone, URL text below.
 //   y=20  URL QR scale 7 (203×203) centered
-//   y=252 "Scan to open control" size 1 centered
+//   y=240 "Scan to open control" size 1 centered
 //
 // Quiet zones around QR:
 //   - left/right/top: 20 px (2.5 modules)
 //   - bottom:         32 px before label (4.0 modules) — spec-compliant
 static void drawQrScreenUrl() {
   if (g_canvas == nullptr) return;
-  g_canvas->fillScreen(kQrWhite);
-
   char accessUrl[64];
   if (!buildAccessUrl(accessUrl, sizeof(accessUrl))) {
-    qrCenterText(/*y=*/132, /*size=*/1, "Access unavailable");
+    g_canvas->fillScreen(kQrWhite);
+    Screens::qrCenterText(g_canvas, /*y=*/132, /*size=*/1, "Access unavailable");
     return;
   }
-  uint8_t urlBuf[200];
-  QRCode urlQr;
-  qrcode_initText(&urlQr, urlBuf, kQrUrlVersion, ECC_MEDIUM, accessUrl);
-  const int16_t px = static_cast<int16_t>(urlQr.size * kQrUrlPixelScale);
-  const int16_t x  = static_cast<int16_t>((kScreenW - px) / 2);
-  const int16_t y  = 20;
-  drawQrToCanvas(&urlQr, x, y, kQrUrlPixelScale);
-
-  qrCenterText(/*y=*/240, /*size=*/1, "Scan to open control");
-  drawPairingStepDots(/*y=*/264, /*step=*/2U);
-  qrCenterText(/*y=*/272, /*size=*/1, "swipe up to exit");
-  secureZero(urlBuf, sizeof(urlBuf));
+  Screens::drawQrScreenUrl(g_canvas, accessUrl);
   secureZero(accessUrl, sizeof(accessUrl));
 }
 
@@ -11806,25 +11722,7 @@ constexpr uint32_t kPairFailNoticeMs = 1600;
 static void showPairingFailed(const char* reason) {
   Serial.printf("pairing failed: %s\n", reason);
   if (g_canvas == nullptr) return;
-  g_canvas->fillScreen(0x0000);
-  const uint8_t kSize = 2;
-  const char* kL1 = "Pairing";
-  const char* kL2 = "failed";
-  const char* kL3 = "swipe down to retry";
-  g_canvas->setTextWrap(false);
-  g_canvas->setTextSize(kSize);
-  g_canvas->setTextColor(kQrWhite);
-  g_canvas->setCursor(
-      static_cast<int16_t>((kScreenW - static_cast<int16_t>(strlen(kL1) * 6 * kSize)) / 2), 110);
-  g_canvas->print(kL1);
-  g_canvas->setCursor(
-      static_cast<int16_t>((kScreenW - static_cast<int16_t>(strlen(kL2) * 6 * kSize)) / 2), 136);
-  g_canvas->print(kL2);
-  g_canvas->setTextSize(1);
-  g_canvas->setTextColor(0x8410);
-  g_canvas->setCursor(
-      static_cast<int16_t>((kScreenW - static_cast<int16_t>(strlen(kL3) * 6)) / 2), 172);
-  g_canvas->print(kL3);
+  Screens::drawPairingFailed(g_canvas);
   pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
   breadcrumb(kCrumbPairFailNotice);
   delay(kPairFailNoticeMs);

@@ -38,3 +38,8 @@ desktop.ini
 .DS_Store
 
 build/
+
+# Native LCD preview output (regenerate with tools/host_preview/build.ps1)
+build/preview/
+tools/host_preview/.host-build/
+tools/host_preview/*.exe
