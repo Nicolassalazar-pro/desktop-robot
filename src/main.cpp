@@ -4285,6 +4285,27 @@ void cmdLcdbench(char* argument) {
   g_forceFullPush = true;   // undo whatever the benchmark left on screen
 }
 
+// On-die temperature, so "it feels hotter" becomes a number.
+//
+// Worth stating what this can and cannot tell you: it is the SoC junction
+// sensor, not the battery, the charger or the regulator. If the board is warm
+// but this reads normal, the heat is coming from something else on it -- the
+// charge circuit while topping up, or the servo rail -- and no amount of clock
+// fiddling will touch it.
+void cmdTemp(char* argument) {
+  (void)argument;
+  Serial.printf("temp: soc %.1f C | cpu %lu MHz | loops %lu | lcd spi %lu Hz\n",
+                temperatureRead(),
+                static_cast<unsigned long>(getCpuFrequencyMhz()),
+                static_cast<unsigned long>(g_loopIterations),
+                static_cast<unsigned long>(g_lcdSpiHz));
+  Serial.printf("temp: bat %.3f V %s | rail %s | mode %d\n",
+                static_cast<double>(g_batVoltage),
+                g_batCharging ? "CHARGING" : "not charging",
+                g_driveRailOn ? "ON" : "off",
+                static_cast<int>(g_lcdMode));
+}
+
 void cmdTouchreset(char* argument) {
   // Recovery path: re-applies our configuration if the chip ever stops
   // reporting. Deliberately does NOT touch auto-sleep — see the note in
@@ -5485,6 +5506,7 @@ const SerialCommand kSerialCommands[] = {
   { "lcdpush", cmdLcdpush, "lcdpush                  full canvas->panel push only", nullptr, nullptr },
   { "lcdbus", cmdLcdbus, "lcdbus                   re-init the SPI peripheral only", nullptr, nullptr },
   { "lcdbench", cmdLcdbench, "lcdbench                 measure panel push throughput", nullptr, nullptr },
+  { "temp", cmdTemp, "temp                     SoC temperature + clocks + power", nullptr, nullptr },
   { "crash", cmdCrash, "crash [clear]            last fault: reason + phase + heap", nullptr, nullptr },
   { "straight", cmdStraight, "straight <cm> [speed]    gyro-corrected straight run", nullptr, "-- motion / IMU --" },
   { "sense", cmdSense, "sense                    bump/shake/lifted detector state", nullptr, nullptr },
