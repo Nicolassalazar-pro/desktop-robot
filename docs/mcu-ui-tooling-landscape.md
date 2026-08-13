@@ -84,10 +84,26 @@ The study kept surfacing a distinction that no single tool spans:
   **LovyanGFX** does this for its own users. Nothing does it for Arduino_GFX,
   Adafruit_GFX or TFT_eSPI.
 
-Our problem was the second. That is also the harder half, because the moment a
-generator's output is hand-edited, the design tool is dead to that screen —
-**no tool in the entire landscape round-trips.** SquareLine explicitly cannot
-re-import edited C.
+Our problem was the second. That is also the harder half — though the "nothing
+round-trips" claim needs correcting:
+
+> **Correction (verified by reading Lopaka's source).** Lopaka ships
+> `src/platforms/parsers/` containing **`arduinogfx.parser.ts` (10.3 KB)** plus
+> parsers for Adafruit, TFT_eSPI, U8g2, ESPHome, LVGL, MicroPython and more. It
+> **does import existing drawcalls** — the Arduino_GFX parser recognises
+> `setCursor`, `print`, `fillRect`, `fillRoundRect`, `drawCircle`,
+> `draw16bitRGBBitmap`, `drawTriangle`, `drawBitmap` and others. So Lopaka
+> round-trips *static drawcalls*, contrary to §3's original blanket statement.
+>
+> It still cannot represent runtime-generated content (a QR built from live
+> credentials), multi-canvas compositing, or animation — so it does not solve
+> the code→preview problem for a dynamic UI. But "no tool round-trips" was
+> wrong, and the correct statement is "no tool round-trips anything beyond
+> static drawcalls".
+>
+> Also note Lopaka's README does **not** list Arduino_GFX under "Supported
+> platforms" despite `src/platforms/arduinogfx.ts` existing — the README is
+> behind the source.
 
 ---
 
@@ -122,11 +138,20 @@ the problem entirely by **choosing LVGL because it has a simulator**.
    visual GUI designer** — their own guidance points at LVGL raw or SquareLine,
    an external company. Espressif sells chips, not displays, so nobody owns
    "ESP32 + arbitrary TFT". This is a business-model gap, not a technical one.
-2. **Willingness to pay is too low (STRONG).** The population is hobbyists on $12
-   boards. SquareLine went from ~$19/mo to $790/yr and took community flak.
-   **GUIslice-Builder — a working, free, OSS, cross-vendor drag-drop builder for
-   exactly this stack, maintained since 2019 — has 239 stars.** If the pain were
-   acute *and* the population large, it would have thousands.
+2. **Willingness to pay is too low (MODERATE — see correction).** The
+   population is hobbyists on $12 boards. SquareLine went from ~$19/mo to
+   $790/yr and took community flak.
+
+   > **Correction (verified after the threads reported).** T6 built its
+   > "market failure by absence of demand" case on GUIslice-Builder having
+   > *239 stars*. Direct check of the GitHub API: **GUIslice has 1,360 stars /
+   > 224 forks, last push 2026-07-14**, and **Lopaka has 1,705 stars / 114
+   > forks, last push 2026-06-28**. Neither is archived; both are actively
+   > maintained. The 239 figure appears to refer to a separate builder repo.
+   > These are respectable numbers for developer tooling in a niche, so the
+   > "nobody cares" reading is materially weaker than T6 argued. What survives
+   > is the narrower claim: no one has built a *business* here, and the free
+   > tools have not become defaults.
 3. **Fragmentation (MEDIUM).** TFT_eSPI alone ships ~70 `User_Setup` combos.
    Every ecosystem that shipped a great simulator (Pebble 3 variants, Playdate 1,
    PineTime 1, PICO-8 a fixed spec) collapsed the hardware axes to a constant.
@@ -175,11 +200,22 @@ and drop timing fidelity.
 
 - **code → preview for the Adafruit_GFX / Arduino_GFX / TFT_eSPI branch.** No
   maintained tool does this. ~15 people built their own and abandoned them.
-- **Round-tripping.** Nothing in the entire landscape supports it.
+- **Round-tripping.** Nothing round-trips beyond *static drawcalls* (Lopaka does
+  that much — see the correction in §3). Nothing round-trips dynamic or
+  composited UI.
 - **Figma → direct-draw.** Does not exist anywhere — not even TouchGFX imports
   Figma, a perennial request at a $10B silicon vendor.
 - **Live-reload of drawcalls** for direct-draw. openHASP does it for LVGL via
   JSONL; nothing equivalent below that.
+
+### Note on licensing (both candidates are permissively open source)
+
+| | Licence | Stars | Forks | Last push |
+|---|---|---|---|---|
+| **Lopaka** | Apache-2.0 (© 2023 Mikhail L. Ilin) | 1,705 | 114 | 2026-06-28 |
+| **GUIslice** | MIT (© 2016–2020 Calvin Hass) | 1,360 | 224 | 2026-07-14 |
+
+Both self-hostable; Lopaka runs via `docker-compose up` or `pnpm dev`.
 
 ---
 
