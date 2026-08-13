@@ -121,10 +121,22 @@ def main() -> int:
             time.sleep(1.0)
             continue
         try:
-            with serial.Serial(args.port, args.baud, timeout=1) as ser:
-                # Never assert these. See the module docstring.
-                ser.dtr = False
-                ser.rts = False
+            # Configure the control lines BEFORE opening, not after.
+            #
+            # pyserial asserts DTR when it opens a port. On ESP32-S3 native USB
+            # CDC that assert-then-deassert transition IS the auto-reset
+            # pattern, so a watcher that opened the port and then set dtr=False
+            # rebooted the board every time it attached -- and those reboots
+            # were being reported as crashes. A monitor must not perturb the
+            # thing it is monitoring.
+            ser = serial.Serial()
+            ser.port = args.port
+            ser.baudrate = args.baud
+            ser.timeout = 1
+            ser.dtr = False
+            ser.rts = False
+            ser.open()
+            with ser:
                 print(f"bot watch: connected {args.port}", flush=True)
                 with session_log.open("a", encoding="utf-8") as log:
                     while not PAUSE.exists():
