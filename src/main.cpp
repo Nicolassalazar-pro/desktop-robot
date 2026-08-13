@@ -10355,60 +10355,32 @@ static void serviceGrabber(int16_t sheetY, bool wantVisible) {
   g_grabberDrawnOnCard = onCard;
 }
 //
-// TWO LABELS, NOT ONE. The card used to say "Establishing Server..." from the
-// moment a finger touched the panel, which was a lie for the whole drag --
-// nothing is being established until the operator commits -- and worse, it
-// never told them what the card WAS. A first-time user pulling down learned
-// nothing about what releasing would do, which defeats the entire point of a
-// sheet: start it, see what it would do, change your mind.
+// Hand the pulled-down card to the panel as the live screen.
 //
-// `armed` is the second half of that fix, and it addresses a real trap. Release
-// is decided by PROJECTED position, so a peek to 30% released with even 500
-// px/s of residual downward motion -- unremarkable, because a thumb rarely
-// stops dead before it lifts -- projects to 51% and commits. From the finger
-// that gesture was "look at it and let go". iOS has identical physics and gets
-// away with it because its sheets change as they approach the threshold; ours
-// did not. Now the verb changes the moment the projected endpoint crosses over,
-// so the operator can see the commit coming and pull back.
+// This is what removes the "Establishing Server..." splash. The card IS the
+// pairing screen now and its credentials are already valid, so interposing a
+// splash meant painting over correct content and then painting the very same QR
+// back a second later: QR -> splash -> QR, three screens for one action.
 //
-// Edge-triggered by the caller: repainted only when the armed state actually
-// flips, not once per frame.
-static void drawSheetCard(bool armed, bool committed) {
-  if (g_sheetCanvas == nullptr) return;
-  // The card is a SURFACE, not a hole.
-  //
-  // It used to fillScreen(0x0000). Pulled fully down that is a black panel with
-  // two small words near the top -- which is visually identical to a dead
-  // screen, and was in fact reported as one. Design-craft 3 asks for a 3-step
-  // surface scale rather than pure black precisely so that "a surface is
-  // present" and "the display is off" cannot be confused.
-  //
-  // So: a dark slate card so the surface is legible as a surface. Its moving
-  // leading edge is already marked by the grabber, which is welded to it.
-  constexpr uint16_t kCardSurface = 0x18E3;   // dark slate, clearly not black
-  g_sheetCanvas->fillScreen(kCardSurface);
-  const char* line1 = committed ? "Establishing" : (armed ? "Let go" : "Pull down");
-  const char* line2 = committed ? "Server..."    : (armed ? "to pair" : "to pair");
-  const uint8_t kSize = 2;
-  const int16_t w1 = static_cast<int16_t>(strlen(line1) * 6 * kSize);
-  const int16_t w2 = static_cast<int16_t>(strlen(line2) * 6 * kSize);
-  g_sheetCanvas->setTextSize(kSize);
-  // Armed is brighter, but the VERB is what carries the state -- never colour
-  // alone (design-craft §3).
-  g_sheetCanvas->setTextColor(armed || committed ? kQrWhite : 0x8410);
-  g_sheetCanvas->setTextWrap(false);
-  // Anchored NEAR THE TOP of the card, not its middle.
-  //
-  // The card is revealed top-down, so its first rows are the only thing on
-  // screen early in a drag. With the label at the panel's vertical centre the
-  // operator pulled a blank black rectangle for the first half of the travel
-  // and only learned what it was at ~58%, which is past the point where they
-  // have decided whether to continue. Caught by tools/lcd_preview.py before it
-  // ever reached the panel.
-  g_sheetCanvas->setCursor(static_cast<int16_t>((kScreenW - w1) / 2), 34);
-  g_sheetCanvas->print(line1);
-  g_sheetCanvas->setCursor(static_cast<int16_t>((kScreenW - w2) / 2), 58);
-  g_sheetCanvas->print(line2);
+// The full push is not optional. Commit fires DURING the drag, the moment the
+// card crosses the commit line -- which can be at ~85%, or earlier via the
+// pulled-to-the-bottom rule -- so at that instant the panel still shows face
+// below the card's edge. The establishing splash used to clean that up
+// incidentally with its own full-screen push; dropping it means doing so here
+// deliberately.
+static void handOffSheetQrToPanel() {
+  if ((g_sheetCanvas == nullptr) || (g_canvas == nullptr)) return;
+  uint16_t* sheetFb = g_sheetCanvas->getFramebuffer();
+  uint16_t* faceFb  = g_canvas->getFramebuffer();
+  if ((sheetFb == nullptr) || (faceFb == nullptr)) return;
+  constexpr size_t kBytes =
+      static_cast<size_t>(kScreenW) * static_cast<size_t>(kScreenH) *
+      sizeof(uint16_t);
+  memcpy(faceFb, sheetFb, kBytes);
+  // Adopt the mode the card already represents, so when the AP finishes coming
+  // up enterLcdQrWifiMode() sees it is already there and does not repaint.
+  g_lcdMode = LCD_MODE_QR_WIFI;
+  pushCanvasRectToLcd(0, 0, kScreenW, kScreenH);
 }
 //
 // The flow is Wi-Fi QR -> URL QR, and nothing used to say so. Scanning the
@@ -11012,9 +10984,14 @@ static void serviceDragTransition() {
       g_grabberHideAtMs = nowMs + kGrabberRevealMs;
     }
     // Stage the card as the actual pairing screen before the first strip is
-    // pushed, so nothing partial or placeholder is ever composited.
+    // pushed, so nothing partial or placeholder is ever composited. Only when
+    // starting from closed: re-pressing a card that is still settling should
+    // pick it up where it is, not re-render it (drawing the QR plus a 134 KB
+    // copy is ~15 ms, and the content would be identical anyway).
     s_armed = false;
-    stageOpenCardWithQr();
+    if (g_sheet.state == SheetTransition::State::Closed) {
+      stageOpenCardWithQr();
+    }
     g_sheet.onPress(screenY, nowMs);
     s_pressed = true;
   } else if (ok && pressed && s_pressed) {
@@ -11067,8 +11044,12 @@ static void serviceDragTransition() {
   // SwipeDown does not start the AP a second time.
   if (g_sheet.takeSettledOpen()) {
     g_sheetGestureSuppressUntilMs = nowMs + kSheetGestureSuppressMs;
+    // Promote the card to the live screen BEFORE the state machine runs, so
+    // enterWifiBoot() sees QR_WIFI already up and skips the splash.
+    handOffSheetQrToPanel();
     g_orPendingSwipeDown = true;
     s_armed = false;
+    s_renderedY = 0;
     Serial.println(F("sheet: pulled to commit -> orPendingSwipeDown"));
   }
 
@@ -11163,9 +11144,10 @@ static void stageOpenCardWithQr() {
       static_cast<size_t>(kScreenW) * static_cast<size_t>(kScreenH) *
       sizeof(uint16_t);
   memcpy(sheetFb, faceFb, kBytes);
-  g_canvas->fillScreen(MASCOT_A_BG);
-  drawMascotToCanvas(static_cast<int16_t>(kOriginX + g_lastShiftX),
-                     static_cast<int16_t>(kOriginY + g_lastShiftY));
+  // Same reason as the dismiss path: the eyes are not part of
+  // drawMascotToCanvas, so restoring the backdrop by hand would leave an
+  // expressionless face behind the descending card.
+  renderFaceTargetToCanvas();
 }
 
 static void stageDismissLayers() {
@@ -11177,9 +11159,12 @@ static void stageDismissLayers() {
       static_cast<size_t>(kScreenW) * static_cast<size_t>(kScreenH) *
       sizeof(uint16_t);
   memcpy(sheetFb, faceFb, kBytes);          // what's on screen becomes the card
-  g_canvas->fillScreen(MASCOT_A_BG);        // ...and the face goes underneath
-  drawMascotToCanvas(static_cast<int16_t>(kOriginX + g_lastShiftX),
-                     static_cast<int16_t>(kOriginY + g_lastShiftY));
+  // Repaint the face UNDERNEATH through the shared helper, not by hand. Doing
+  // fillScreen + drawMascotToCanvas alone leaves the mascot with no eyes -- the
+  // eye engine renders those separately -- so dragging the card up revealed a
+  // blank, expressionless face. renderFaceTargetToCanvas() is the one place
+  // that gets the whole face right.
+  renderFaceTargetToCanvas();
 }
 
 // Put the QR back in g_canvas so the ordinary QR-mode logic keeps working, and
@@ -11249,13 +11234,25 @@ static void serviceDismissDrag() {
                           (ok && !pressed);
 
   if (ok && pressed && !s_pressed) {
-    stageDismissLayers();
-    g_sheet.reset();
-    g_sheet.y = kScreenH;              // the card starts fully down
+    // Stage ONCE per gesture, not once per press.
+    //
+    // stageDismissLayers() copies whatever g_canvas currently holds into the
+    // card -- and then replaces g_canvas with the face. That is correct exactly
+    // once. Re-running it on a second press (which happens whenever the
+    // operator grabs the card again while it is still settling back) copies the
+    // FACE into the card, so the card stops being the QR and starts dragging a
+    // stale face around. Guarding on g_dismissActive also preserves the card's
+    // current position: re-pressing mid-settle must continue from where the
+    // card is, not teleport it back to fully closed.
+    if (!g_dismissActive) {
+      stageDismissLayers();
+      g_sheet.reset();
+      g_sheet.y       = kScreenH;    // the card starts fully down
+      s_renderedY     = kScreenH;
+      g_dismissActive = true;
+    }
     g_sheet.onPress(screenY, nowMs);
-    s_pressed       = true;
-    s_renderedY     = kScreenH;
-    g_dismissActive = true;
+    s_pressed = true;
   } else if (ok && pressed && s_pressed) {
     g_sheet.onMove(screenY, nowMs, kScreenH);
   } else if (s_pressed && fingerGone) {
@@ -11604,7 +11601,15 @@ static void enterWifiBoot() {
   g_orState        = ORS_WIFI_BOOT;
   g_orStateEnterMs = millis();
   resetDriveControl("WIFI_BOOT transition");
-  enterLcdEstablishingMode();   // black + "Establishing Server..."
+  // Only splash if the sheet has NOT already put a valid QR on the panel. The
+  // drag hands its card over on commit (handOffSheetQrToPanel), and overwriting
+  // that with "Establishing Server..." would discard correct content and then
+  // redraw the identical QR a second later. The chip-gesture path -- a fast
+  // flick the sheet did not commit, or a board where the card canvas failed to
+  // allocate -- still arrives here from FACE and still gets the splash.
+  if (g_lcdMode != LCD_MODE_QR_WIFI) {
+    enterLcdEstablishingMode();
+  }
   startWifiServer();             // brings AP up + starts server
   Serial.println(F("override: -> WIFI_BOOT"));
 }
