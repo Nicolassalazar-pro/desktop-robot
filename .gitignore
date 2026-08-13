@@ -43,3 +43,4 @@ build/
 build/preview/
 tools/host_preview/.host-build/
 tools/host_preview/*.exe
+build/watch/
