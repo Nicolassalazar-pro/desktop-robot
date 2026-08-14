@@ -44,6 +44,7 @@
 #include "screens.h"
 #include "sheet_transition.h"
 #include "mascot/mascot_a.h"
+#include "EyeEngine.h"
 
 namespace {
 
@@ -51,6 +52,56 @@ namespace {
 // 240x280 panel. See src/main.cpp lines 357-360.
 constexpr int16_t kOriginX = (Screens::kScreenW - MASCOT_A_W) / 2;   // 10
 constexpr int16_t kOriginY = (Screens::kScreenH - MASCOT_A_H) / 2;   // 32
+
+// -- eye engine -------------------------------------------------------------
+//
+// The mascot bitmap has NO eyes baked in; lib/EyeEngine draws them live. A
+// harness that renders only the backdrop therefore produces a blank-faced
+// mascot -- and reviewing an eyeless face as if it were the real thing is
+// exactly how the drag-to-dismiss reveal shipped with no eyes once already.
+//
+// Geometry mirrors src/main.cpp lines 374-445; the centres are derived from
+// the bitmap's own eye-socket metrics in mascot_a.h, so the harness cannot
+// disagree with the firmware about where the eyes belong without the bitmap
+// itself changing.
+constexpr int16_t kLeftEyeCenterX  = kOriginX + MASCOT_A_EYE_L_X + (MASCOT_A_EYE_L_W / 2);
+constexpr int16_t kLeftEyeCenterY  = kOriginY + MASCOT_A_EYE_L_Y + (MASCOT_A_EYE_L_H / 2);
+constexpr int16_t kRightEyeCenterX = kOriginX + MASCOT_A_EYE_R_X + (MASCOT_A_EYE_R_W / 2);
+constexpr int16_t kRightEyeCenterY = kOriginY + MASCOT_A_EYE_R_Y + (MASCOT_A_EYE_R_H / 2);
+
+EyeEngine g_eyes;
+bool      g_eyesReady = false;
+
+void beginEyes(Arduino_GFX* gfx) {
+  const EyeEngineGeom geom = {
+      kLeftEyeCenterX,  kLeftEyeCenterY,
+      kRightEyeCenterX, kRightEyeCenterY,
+      /*baseW=*/12, /*baseH=*/36, /*borderRadius=*/5,
+      /*motionRangeX=*/14, /*motionRangeY=*/10,
+  };
+  g_eyes.begin(gfx, geom, MASCOT_A_EYE_BG, MASCOT_A_EYE_COLOR);
+  g_eyes.setOutlineColor(MASCOT_A_OUTLINE);
+  g_eyes.setBackgroundSource(MASCOT_A_RGB565, kOriginX, kOriginY,
+                             MASCOT_A_W, MASCOT_A_H);
+  // Autoblink and idle wander are deliberately OFF here. This harness renders
+  // still frames for visual diffing, and a blink or a gaze shift landing on an
+  // arbitrary frame would make two runs of the same code produce different
+  // PNGs. The web harness leaves them on, because there the point is motion.
+  g_eyes.setAutoblinker(false);
+  g_eyes.setIdleWander(false);
+  g_eyesReady = true;
+}
+
+// Mirror of main.cpp's renderFaceTargetToCanvas(): backdrop + mascot + EYES.
+// This is the only function in the harness that yields a complete face.
+void renderFaceTargetToCanvas(Arduino_GFX* gfx) {
+  Screens::drawFaceBackdrop(gfx, kOriginX, kOriginY);
+  if (g_eyesReady) {
+    g_eyes.forceRedraw();
+    (void)g_eyes.update();
+    g_eyes.clearDirty();
+  }
+}
 
 // PPM (P6) writer. 15 lines, no deps. Each RGB565 word explodes to three 8-bit
 // samples via the standard 5-6-5 -> 8-8-8 expansion.
@@ -144,8 +195,10 @@ int main() {
 
   std::printf("host_preview: rendering base screens to %s/\n", kOutDir);
 
-  // 1. Idle face backdrop.
-  Screens::drawFaceBackdrop(&canvas, kOriginX, kOriginY);
+  beginEyes(&canvas);
+
+  // 1. Idle face -- backdrop AND eyes, which is what the panel actually shows.
+  renderFaceTargetToCanvas(&canvas);
   dump("face_idle");
 
   // 2. QR Wi-Fi screen.
@@ -184,7 +237,7 @@ int main() {
   Screens::drawQrScreenWifi(&canvas, kFakeSsid, kFakePwd);
   std::memcpy(sheetFb, canvas.getFramebuffer(), pixels * sizeof(std::uint16_t));
 
-  Screens::drawFaceBackdrop(&canvas, kOriginX, kOriginY);
+  renderFaceTargetToCanvas(&canvas);
   std::memcpy(faceFb,  canvas.getFramebuffer(), pixels * sizeof(std::uint16_t));
 
   // Drive SheetTransition::Controller with synthetic press-move-move-release

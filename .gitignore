@@ -44,3 +44,7 @@ build/preview/
 tools/host_preview/.host-build/
 tools/host_preview/*.exe
 build/watch/
+
+# WebAssembly LCD preview output (regenerate with tools/web_preview/build.ps1)
+build/web/
+tools/web_preview/.wasm-build/

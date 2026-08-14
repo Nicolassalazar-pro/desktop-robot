@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <chrono>
 // Arduino_GFX.cpp uses sinf/cosf/fmodf/fabsf without an explicit <math.h> --
 // the Arduino runtime brings math in through this header, so we do too.
 #include <math.h>
@@ -113,13 +114,63 @@ class String {
   std::size_t len_;
 };
 
-// Clock stubs. The three GFX .cpp files never call these, but Arduino_GFX.h
-// pulls in <Arduino.h> for downstream consumers, and a preview harness may
-// want them.
-inline uint32_t millis()  { return 0U; }
-inline uint32_t micros()  { return 0U; }
+// Clock + RNG.
+//
+// millis() USED to return a constant 0. That was fine while the harnesses only
+// rendered static screens, but the EyeEngine is time-driven -- blink schedules,
+// idle wander, frame pacing and mood tweens all compare against millis() -- and
+// a frozen clock means the eyes never animate and never even draw their first
+// frame. So this now returns a real monotonic millisecond count.
+//
+// SAFE TO CHANGE: this shim is included ONLY by the two preview harnesses
+// (tools/host_preview and tools/web_preview pass -Itest/stubs/arduino_host).
+// The unit tests under test/ do not use it -- they take timestamps as explicit
+// parameters precisely so their behaviour is deterministic, which is what let
+// sheet_transition_test.cpp cover the R46 millis() rollover case at all.
+//
+// The epoch is the first call, so a harness sees a clock starting near zero
+// rather than a huge wall-clock value. That keeps the numbers readable in logs
+// and stays far away from the 49.7-day rollover the firmware has to handle.
+//
+// steady_clock, NOT std::clock(). std::clock() measures PROCESSOR time, and in
+// a browser requestAnimationFrame loop the process is idle between frames, so
+// CPU time advances several times slower than wall time -- the eyes would blink
+// and wander in slow motion, and every duration in the preview would silently
+// lie. steady_clock is monotonic wall time and is implemented on both g++ and
+// Emscripten.
+inline uint32_t millis() {
+  static const std::chrono::steady_clock::time_point kEpoch =
+      std::chrono::steady_clock::now();
+  return static_cast<uint32_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - kEpoch)
+          .count());
+}
+inline uint32_t micros() {
+  static const std::chrono::steady_clock::time_point kEpoch =
+      std::chrono::steady_clock::now();
+  return static_cast<uint32_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - kEpoch)
+          .count());
+}
 inline void delay(uint32_t /*ms*/) {}
 inline void delayMicroseconds(uint32_t /*us*/) {}
+
+// Arduino's random(). EyeEngine uses random(long) for gaze direction and blink
+// jitter. Arduino semantics: random(max) returns [0, max), random(min, max)
+// returns [min, max). Deliberately NOT seeded, so a harness run is repeatable
+// -- an eye animation that differs every reload would make visual diffing
+// against the native PNG harness impossible.
+inline long random(long howbig) {
+  if (howbig <= 0) return 0;
+  return static_cast<long>(std::rand()) % howbig;
+}
+inline long random(long howsmall, long howbig) {
+  if (howbig <= howsmall) return howsmall;
+  return howsmall + random(howbig - howsmall);
+}
+inline void randomSeed(unsigned long seed) { std::srand(static_cast<unsigned>(seed)); }
 
 // digitalWrite / pinMode / etc are NOT provided. The three GFX files never
 // touch pins -- only databus and driver .cpp files do, and we don't compile

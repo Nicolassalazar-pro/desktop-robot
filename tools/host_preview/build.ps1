@@ -33,6 +33,7 @@ try {
         '-Itest\stubs\arduino_host',
         "-I$gfxSrc",
         "-I$qrSrc",
+        '-Ilib\EyeEngine',
         '-Isrc'
     )
     $commonDefs = @(
@@ -80,13 +81,20 @@ try {
     $sheet = Join-Path $buildDir 'sheet_transition.o'
     Invoke-Cxx 'src\sheet_transition.cpp' $sheet
 
+    Write-Host "== compiling EyeEngine (the mascot's eyes) =="
+    # Same anti-drift rule as screens.cpp: the eyes are drawn by real shipped
+    # code, not re-created here. Without this the harness renders an eyeless
+    # mascot, which is the exact recipe behind a bug that already shipped once.
+    $eyes = Join-Path $buildDir 'EyeEngine.o'
+    Invoke-Cxx 'lib\EyeEngine\EyeEngine.cpp' $eyes
+
     Write-Host "== compiling harness main =="
     $harness = Join-Path $buildDir 'main.o'
     Invoke-Cxx 'tools\host_preview\main.cpp' $harness
 
     $exe = Join-Path $buildDir 'lcd_preview.exe'
     Write-Host "== linking $exe =="
-    & g++ @cxxflags $g1 $g2 $g3 $qr $screens $sheet $harness -o $exe
+    & g++ @cxxflags $g1 $g2 $g3 $qr $eyes $screens $sheet $harness -o $exe
     if ($LASTEXITCODE -ne 0) { throw "g++ link failed (exit $LASTEXITCODE)" }
 
     Write-Host "== running $exe (writes to $outDir\) =="

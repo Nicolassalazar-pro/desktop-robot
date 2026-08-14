@@ -1,0 +1,367 @@
+<!doctype html>
+<!--
+  tools/web_preview/index.html -- browser side of the LCD preview.
+
+  WHY THIS EXISTS
+
+  Pairs with tools/web_preview/wasm_main.cpp. The .wasm module renders the
+  firmware's actual screens into an RGBA buffer; this file blits that buffer
+  to a <canvas>, dispatches mouse events into the sheet controller, and
+  offers four screen-selection buttons plus a "drag" mode.
+
+  There is NO tunable UI here -- no sliders, no textboxes to change layout
+  values, no writeback to source. The developer edits src/screens.cpp in
+  their editor exactly as they do for firmware work; the preview simply
+  re-renders after tools/web_preview/build.ps1 rebuilds.
+
+  Offline-only. No CDN dependencies. Everything the module needs is under
+  build/web/ after a build.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>desktop-robot LCD preview (WASM)</title>
+  <style>
+    /* Dark UI so the panel colours are what stands out, not the chrome.
+       Intentionally minimal -- this is a dev tool, not a product. */
+    :root { color-scheme: dark; }
+    html, body {
+      margin: 0;
+      background: #0b0d10;
+      color: #d0d4d8;
+      font: 14px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    body {
+      display: flex;
+      gap: 32px;
+      align-items: flex-start;
+      padding: 32px;
+    }
+    .panel {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      align-items: center;
+    }
+    /* image-rendering: pixelated is what turns the CSS-scaled 240x280 into
+       crisp squares instead of a blurred bilinear stretch. Without it the
+       preview would misrepresent what the ST7789 actually shows. */
+    canvas {
+      image-rendering: pixelated;
+      image-rendering: -moz-crisp-edges;
+      width: 480px;    /* 240 * 2 */
+      height: 560px;   /* 280 * 2 */
+      background: #000;
+      border: 1px solid #202428;
+      touch-action: none;   /* stop the browser from consuming drags as scrolls */
+      cursor: grab;
+    }
+    canvas.dragging { cursor: grabbing; }
+    .side {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      min-width: 260px;
+    }
+    button {
+      background: #171a1e;
+      border: 1px solid #2c3138;
+      color: inherit;
+      font: inherit;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      text-align: left;
+    }
+    button:hover { background: #1e232a; }
+    button.active {
+      background: #253141;
+      border-color: #3d6fb0;
+      color: #fff;
+    }
+    .buttons { display: flex; flex-direction: column; gap: 4px; }
+    .kv {
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: #98a2ad;
+      background: #101317;
+      border: 1px solid #1e2228;
+      padding: 10px 12px;
+      border-radius: 6px;
+      white-space: pre;
+    }
+    h1 {
+      font-size: 15px;
+      margin: 0 0 4px;
+      letter-spacing: 0.02em;
+      color: #eef1f5;
+    }
+    .note {
+      font-size: 12px;
+      color: #7a8390;
+      line-height: 1.5;
+    }
+    a { color: #6ea6ff; }
+  </style>
+</head>
+<body>
+  <!-- Panel canvas.  Native size is 240x280; CSS scales it 2x with pixelated
+       rendering so the developer sees roughly what an actual ST7789 shows at
+       arm's length. -->
+  <div class="panel">
+    <canvas id="lcd" width="240" height="280"></canvas>
+    <div class="note">
+      240 x 280 &middot; ST7789V2 pixel-for-pixel (built from src/screens.cpp)
+    </div>
+  </div>
+
+  <div class="side">
+    <div>
+      <h1>Screen</h1>
+      <div class="buttons" id="screenButtons">
+        <!-- data-id maps 1:1 to wp_render_screen(id) in wasm_main.cpp. -->
+        <button data-id="0">0 &middot; Face backdrop</button>
+        <button data-id="1">1 &middot; QR wifi</button>
+        <button data-id="2">2 &middot; QR url</button>
+        <button data-id="3">3 &middot; Pairing failed</button>
+        <button data-id="4">4 &middot; Drag sheet (mouse)</button>
+        <button data-id="5">5 &middot; Dismiss QR (drag up)</button>
+      </div>
+    </div>
+
+    <div>
+      <h1>Sheet state</h1>
+      <div class="kv" id="stateReadout">idle</div>
+      <div class="note">
+        Numbers come from the real SheetTransition::Controller. Drag the
+        panel with the mouse in <b>Drag sheet</b> mode to drive it.
+        In <b>Dismiss QR</b> mode the panel starts on the QR card &mdash;
+        drag <i>upward</i> to push it off and reveal the face.
+        <b>stage</b> counts how many times the card layer was re-staged
+        during the current gesture; the firmware guards it to exactly 1, so
+        anything higher means the card's content was replaced mid-swipe.
+      </div>
+    </div>
+
+    <div>
+      <h1>QR target</h1>
+      <div class="kv" id="pairingReadout">checking for simulator&hellip;</div>
+      <div class="note">
+        The QR screens encode whatever this says. With
+        <code>robot_sim.py</code> running they carry your machine's real LAN
+        URL, so scanning the panel from a phone opens the actual web app.
+        Without it they fall back to the firmware's own
+        <code>192.168.4.1</code>, which only exists on the robot's softAP.
+      </div>
+    </div>
+
+    <div class="note">
+      Edit <code>src/screens.cpp</code>, run
+      <code>tools\web_preview\build.ps1</code>, refresh this page. Same source
+      the firmware compiles -- no drift possible.
+    </div>
+  </div>
+
+  <script src="preview.js"></script>
+  <script>
+    // Kept tiny and dependency-free on purpose. All the drawing logic lives
+    // in the .wasm module; this file is just glue.
+
+    (async function main() {
+      const canvas = document.getElementById('lcd');
+      const ctx    = canvas.getContext('2d', { alpha: false });
+      const stateEl = document.getElementById('stateReadout');
+      const buttons = Array.from(
+        document.querySelectorAll('#screenButtons button')
+      );
+
+      // Emscripten module factory (MODULARIZE=1 + EXPORT_NAME).  Instantiates
+      // preview.wasm and returns a Module with heaps + ccall/cwrap on it.
+      const Module = await createPreviewModule();
+
+      // cwrap once at startup rather than ccall per frame -- the returned
+      // wrappers are ordinary JS functions with cached signatures.
+      const wp_width            = Module.cwrap('wp_width',            'number', []);
+      const wp_height           = Module.cwrap('wp_height',           'number', []);
+      const wp_framebuffer_rgba = Module.cwrap('wp_framebuffer_rgba', 'number', []);
+      const wp_render_screen    = Module.cwrap('wp_render_screen',    null, ['number']);
+      const wp_touch            = Module.cwrap('wp_touch',            null,
+                                                ['number','number','number','number']);
+      const wp_tick             = Module.cwrap('wp_tick',             null, ['number']);
+      const wp_sheet_y          = Module.cwrap('wp_sheet_y',          'number', []);
+      const wp_sheet_state      = Module.cwrap('wp_sheet_state',      'number', []);
+      const wp_dismiss_active   = Module.cwrap('wp_dismiss_active',   'number', []);
+      const wp_stage_count      = Module.cwrap('wp_stage_count',      'number', []);
+      const wp_last_event       = Module.cwrap('wp_last_event',       'number', []);
+      const wp_set_pairing      = Module.cwrap('wp_set_pairing',      null,
+                                                ['string','string','string']);
+
+      const W = wp_width();
+      const H = wp_height();
+      const FB_BYTES = W * H * 4;
+
+      // Named for the enum in sheet_transition.h. Order matters -- see the
+      // enum class State declaration.
+      const STATE_NAMES = ['Closed', 'Dragging', 'Settling', 'Parked', 'Open'];
+
+      // Build the ImageData once. Backed by a JS-owned Uint8ClampedArray copy
+      // instead of a HEAPU8 view so we don't accidentally hand a stale view
+      // to putImageData if the wasm heap grows (ALLOW_MEMORY_GROWTH=1 can
+      // relocate the buffer under our feet).
+      const imageData = ctx.createImageData(W, H);
+
+      let currentScreen = 4;             // start in drag mode: that's the point
+      let dragActive    = false;
+
+      // -- live pairing data --------------------------------------------------
+      //
+      // A QR is only worth rendering if scanning it goes somewhere. The host
+      // simulator (tools/web_preview/robot_sim.py) publishes the machine's real
+      // LAN URL at /pair.json; when it's reachable we push those values into
+      // the wasm module so the panel's QR opens the actual web app from a
+      // phone. When it isn't, the module keeps the firmware's own defaults and
+      // the QR still renders -- it just points at the robot's softAP address,
+      // which is exactly what the device shows.
+      //
+      // Same-origin is not assumed: the simulator listens on its own port, so
+      // this is a cross-origin fetch and needs the simulator to send CORS
+      // headers. A failure here is non-fatal by design.
+      let pairingSource = 'defaults (firmware constants)';
+
+      async function loadPairing() {
+        const url = new URLSearchParams(location.search).get('sim')
+                 || `http://${location.hostname}:8080/pair.json`;
+        try {
+          const r = await fetch(url, { mode: 'cors', cache: 'no-store' });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const j = await r.json();
+          wp_set_pairing(j.ssid || '', j.password || '', j.url || '');
+          pairingSource = `simulator @ ${j.url}`;
+          wp_render_screen(currentScreen);   // re-encode the QR with real data
+        } catch (err) {
+          pairingSource = `defaults (no simulator: ${err.message})`;
+        }
+        const el = document.getElementById('pairingReadout');
+        if (el) el.textContent = pairingSource;
+      }
+
+      // -- rendering ----------------------------------------------------------
+      //
+      // Called both from RAF and from event handlers when we need an
+      // immediate repaint (e.g. after clicking a new static screen).
+      function blit() {
+        const ptr = wp_framebuffer_rgba();
+        // Grab a fresh HEAPU8 view every call; ALLOW_MEMORY_GROWTH means the
+        // underlying ArrayBuffer can change identity when the heap resizes.
+        // Emscripten refreshes Module.HEAPU8 automatically after a growth.
+        const heap = Module.HEAPU8.subarray(ptr, ptr + FB_BYTES);
+        imageData.data.set(heap);
+        ctx.putImageData(imageData, 0, 0);
+      }
+
+      function updateStateReadout() {
+        const st  = wp_sheet_state();
+        const y   = wp_sheet_y();
+        const pct = Math.round((y / H) * 100);
+        const name = STATE_NAMES[st] || `?${st}`;
+        // Only meaningful in dismiss mode, but harmless to read always.
+        const stages = wp_stage_count();
+        const EVENTS = ['-', 'dismissed (AP would drop)', 'sprang back (QR restored)'];
+        let text =
+          `state = ${name}\n` +
+          `y     = ${y} px  (${pct}% of H=${H})\n` +
+          `mode  = screen ${currentScreen}` +
+          (currentScreen === 4 ? '  [drag]' :
+           currentScreen === 5 ? '  [dismiss]' : '');
+        if (currentScreen === 5) {
+          text +=
+            `\nactive= ${wp_dismiss_active() ? 'yes' : 'no'}` +
+            `\nstage = ${stages}${stages > 1 ? '   <-- RE-STAGED!' : ''}` +
+            `\nlast  = ${EVENTS[wp_last_event()] || '?'}`;
+        }
+        stateEl.textContent = text;
+      }
+
+      // Animation loop. wp_tick is a no-op unless a settle is in progress,
+      // which means we could skip it in static screens -- but the extra
+      // per-frame call costs microseconds and keeps the code simple.
+      function frame(nowMs) {
+        wp_tick(nowMs >>> 0);
+        blit();
+        updateStateReadout();
+        requestAnimationFrame(frame);
+      }
+
+      // -- input -------------------------------------------------------------
+      //
+      // Map CSS pixel coordinates back to panel pixels. getBoundingClientRect
+      // handles the 2x CSS scale, arbitrary window zoom, and any devicePixel
+      // ratio in one shot -- more robust than assuming CSS px = 2 * panel px.
+      function eventToPanelXY(evt) {
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.round(((evt.clientX - rect.left) / rect.width)  * W);
+        const y = Math.round(((evt.clientY - rect.top ) / rect.height) * H);
+        return [x, y];
+      }
+
+      canvas.addEventListener('mousedown', (evt) => {
+        // Screens 4 (pull down) and 5 (push up) are the two drag directions;
+        // the static screens don't accept drag.
+        if (currentScreen !== 4 && currentScreen !== 5) return;
+        evt.preventDefault();
+        dragActive = true;
+        canvas.classList.add('dragging');
+        canvas.setPointerCapture?.(evt.pointerId ?? 0);
+        const [x, y] = eventToPanelXY(evt);
+        wp_touch(x, y, 1, performance.now() >>> 0);
+      });
+
+      // Listen on window, not canvas, so a drag that exits the panel while
+      // held still updates the controller. Matches the firmware's behaviour
+      // where a finger sliding off the touch layer produces a natural
+      // release rather than a stuck state.
+      window.addEventListener('mousemove', (evt) => {
+        if (!dragActive) return;
+        const [x, y] = eventToPanelXY(evt);
+        wp_touch(x, y, 1, performance.now() >>> 0);
+      });
+
+      window.addEventListener('mouseup', (evt) => {
+        if (!dragActive) return;
+        dragActive = false;
+        canvas.classList.remove('dragging');
+        const [x, y] = eventToPanelXY(evt);
+        wp_touch(x, y, 0, performance.now() >>> 0);
+      });
+
+      // -- screen buttons ----------------------------------------------------
+      function selectScreen(id) {
+        currentScreen = id;
+        wp_render_screen(id);
+        buttons.forEach((b) => {
+          b.classList.toggle('active', Number(b.dataset.id) === id);
+        });
+        blit();
+        updateStateReadout();
+      }
+      buttons.forEach((b) => {
+        b.addEventListener('click', () => selectScreen(Number(b.dataset.id)));
+      });
+
+      // Land on the drag screen by default -- that is the interaction that
+      // most needs a browser preview to iterate on.
+      selectScreen(4);
+      // Fire-and-forget: the preview must render immediately whether or not a
+      // simulator is up, so this repaints the QR later rather than gating
+      // startup on a network round trip.
+      loadPairing();
+      requestAnimationFrame(frame);
+    })().catch((err) => {
+      document.body.innerHTML =
+        '<pre style="color:#f66;padding:32px">' +
+        'preview failed to start:\n' + (err.stack || err.message || err) +
+        '</pre>';
+    });
+  </script>
+</body>
+</html>
