@@ -246,7 +246,9 @@ cd ..\dual-servo-calibrator
 py -3.12 .\test\test_calibrator_contract.py -v
 ```
 
-The second half is not this repo — it's the sibling `../dual-servo-calibrator` directory (verified present at `C:\Users\v-nisalazar\Desktop\Scripts\dual-servo-calibrator\test\run_host_tests.ps1`). Nothing in `README.md` mentions this sibling exists, what it does, where it came from, or what to do if it isn't checked out.
+The second half is not this repo - it is the optional sibling
+`../dual-servo-calibrator` directory. Nothing in the original README explained
+that the sibling must be cloned separately or omitted when it is unavailable.
 
 **Why it matters.** A newcomer cloning `desktop-robot` on a fresh machine gets the first two commands to pass, then the third fails silently with `The system cannot find the path specified.` — and there is no README section explaining what they missed.
 

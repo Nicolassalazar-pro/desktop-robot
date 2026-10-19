@@ -8,13 +8,12 @@ note in `platformio.ini` near the affected `lib_deps` entries.
 ## Why this file exists (short version)
 
 The firmware is a single, monolithically-linked ESP32 image. The moment that
-image is handed to someone outside this project — Kickstarter, product, gift,
-sale, employer transfer — every library that ships inside it has a licence
-that has to be honoured. Two of the libraries are LGPL-3.0, and LGPL has
-non-trivial obligations for statically-linked binaries. This is currently a
-**non-issue only because distribution is not happening** (the repo is private
-and no device is being handed off). It becomes an issue on the first shipment
-and by then it is too late to structure the release around it.
+image is handed to someone outside this project - product, gift, sale, or
+employer transfer - every library that ships inside it has a licence that has
+to be honoured. Two of the libraries are LGPL-3.0, and LGPL has non-trivial
+obligations for statically-linked binaries. Publishing the project source is
+useful and intentional, but it is not by itself a complete firmware-binary
+distribution package.
 
 ## Per-dep summary
 
@@ -66,16 +65,17 @@ chosen, this needs to be repaired at ship time (fetch the actual LICENSE
 text from the fork's GitHub repo at the pinned tag) so the resulting image
 is not distributed with an incomplete licence notice.
 
-## What is safe today
+## Current public-source state
 
-Everything is safe today because:
+The repository publishes project-authored software under MIT and CAD/hardware
+source under CERN-OHL-S-2.0. Dependencies remain under their upstream terms and
+are downloaded by PlatformIO rather than vendored here.
 
-- The repo is private (`docs/GIT-NOTES.md`).
-- No firmware image is being distributed.
-- No hardware is being handed to anyone outside the project.
-
-Under those conditions the LGPL obligations do not activate — LGPL is
-triggered by distribution, not by private development or internal use.
+No compiled firmware image is published and no hardware distribution package
+is defined. That distinction matters: source availability helps satisfy future
+compliance, but a distributor of a device or binary still needs to preserve
+license notices and provide the relinkable/source materials required by the
+applicable LGPL version.
 
 ## What needs a decision *before* distribution
 

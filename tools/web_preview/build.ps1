@@ -64,7 +64,6 @@ if ($Clean) {
 # (qrcode.c). Never .bat -- this install does not ship emcc.bat/em++.bat.
 $emsdkRoots = @()
 if ($env:EMSDK) { $emsdkRoots += $env:EMSDK }
-$emsdkRoots += 'C:\Users\v-nisalazar\Desktop\Scripts\emsdk'
 $emsdkRoots += (Join-Path $env:USERPROFILE 'Desktop\Scripts\emsdk')
 
 $emcc = $null

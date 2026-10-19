@@ -43,18 +43,23 @@
 - Why: PROJECT-HISTORY.md R9 and E22 (`[057]`, `[058]`) record that v3-M at 93% capacity produced codes phones detected but did not decode; fixed by moving WIFI to v4-M / URL to v3 at ~67% load (`main.cpp:5333-5335`). Upstream `ricmoo/qrcode` has had no releases since 0.0.1. The `^0.0.1` spec, per npm/semver, pins to exactly 0.0.1 for 0.0.x, which happens to be what we want — but "caret on 0.0.x" is a semantics footgun that varies by resolver, and there is no note in `platformio.ini` explaining that the library is deliberately unmaintained. That means a future contributor who "cleans up the deps" is likely to try a "safer" replacement without knowing about the capacity workaround.
 - Fix: Change to an exact pin `ricmoo/QRCode@0.0.1` and inline the reason with a warning: `; Unmaintained upstream (only release 2017). Do NOT swap without re-running the QR bench in E22 — this library encodes badly above ~70% capacity and current payload budget assumes it (see main.cpp:5326-5336, PROJECT-HISTORY R9).` Consider adding a periodic (yearly) alternative-scan task to the runbook.
 
-### DEP-5 — LGPL-3.0 on the two esphome forks: fine while private, blocks a distributable build without a compliance plan
+### DEP-5 — LGPL-3.0 on the two esphome forks requires a binary-distribution compliance plan
 - Severity: MEDIUM
-- Status: **PARTIALLY FIXED (uncommitted).** A `tools/LICENSING-NOTES.md` file exists in the working
-  tree (2026-08-11) that enumerates each `lib_deps` entry with resolved version and license, which is
-  what the finding's step (1) asked for — but the file is **untracked** (`git status` reports it as
-  `??`) and no commit references it. The intent was carried out; the promotion into git history was
-  not. Step (2) — the actual "how to rebuild with a modified library" plan needed before shipping —
-  is unaddressed. Do not consider this closed until the file is committed and the shipping plan is
-  written down.
+- Status: **PARTIALLY FIXED.** `LICENSE.md`, `THIRD_PARTY_NOTICES.md`, and
+  `tools/LICENSING-NOTES.md` now document the exact dependency boundary and the
+  public source licenses. The remaining work is the distribution package for a
+  compiled firmware image or shipped device: preserve third-party license text
+  and provide the relinkable/source materials required by the applicable LGPL.
 - File: `platformio.ini:98-99`; licenses at `.pio/libdeps/.../AsyncTCP-esphome/LICENSE` (LGPL-3.0), `.pio/libdeps/.../ESPAsyncWebServer-esphome/library.json:14` (declared `"license": "LGPL-3.0"`, no LICENSE file actually shipped in the package)
 - Problem: Both esphome forks are LGPL-3.0. The firmware statically links them into a single ESP32 image, which is a distribution boundary the LGPL cares about the moment the device ships to anyone outside the project.
-- Why: `docs/GIT-NOTES.md` says the repo is private. That is what suppresses the obligation today. If the device is ever handed to another user (Kickstarter, product, gift, sale, employer transfer) the LGPL-3.0 §4/§5 obligations apply and require enabling the recipient to relink with a modified library — nontrivial for a monolithic flashed image without a documented rebuild path or object files. `ESPAsyncWebServer-esphome` also ships no LICENSE text file in the resolved package (verified via `.pio/libdeps/.../ESPAsyncWebServer-esphome/` — only `library.json` and `README.md`), which is itself an LGPL §4 red flag. Note also: `ESP32Servo` and `GFX Library for Arduino` ship *no license file at all* in the PlatformIO tarball; upstream is BSD-like for GFX and LGPL-2.1 for ESP32Servo, but that is not verifiable from the checked-out tree.
+- Why: Publishing project source is not the same act as distributing a
+  statically linked firmware binary. If a device or compiled image is handed to
+  another user, LGPL-3.0 section 4/5 obligations require enabling the recipient
+  to relink with a modified library. `ESPAsyncWebServer-esphome` also ships no
+  LICENSE text in the resolved PlatformIO package, while `ESP32Servo` and
+  `GFX Library for Arduino` omit their upstream license files from their
+  PlatformIO archives. The root third-party notice records the pinned upstream
+  sources, but a binary release still needs a complete notice/rebuild bundle.
 - Fix: Two-step. (1) Add a `THIRD_PARTY_LICENSES.md` to the repo listing each `lib_deps` entry with resolved version + license + upstream URL, so the compliance boundary is documented before any distribution question comes up. (2) If distribution is ever planned, either (a) publish the firmware source under the same terms, (b) provide a documented "how to rebuild with a modified library" recipe alongside the object files, or (c) replace the two forks with permissive alternatives (there is no drop-in). Not urgent, but the decision needs to be *made* before shipping, not after.
 
 ### DEP-6 — `~1.3.7` on GFX is a coupled pin with no cross-reference to the platform pin that makes it safe
@@ -90,4 +95,3 @@
 - Problem: The tools directory imports `numpy`, `librosa`, `imageio_ffmpeg`, `mido`, `pyserial`, and `PIL/Pillow`, but only three of those are declared anywhere (`tools/requirements-midi-bridge.txt`: `mido==1.3.3`, `python-rtmidi==1.5.8`, `pyserial==3.5`). numpy, librosa, imageio_ffmpeg, and Pillow are not listed in any manifest. No `pyproject.toml`, no `uv.lock`, and no PEP 723 script metadata anywhere in `tools/` (searched `# /// script` across `tools/*.py` and `test/*.py`: zero matches — the task prompt's claim that PEP 723 is in use is not currently true).
 - Why: These are host-side calibration and audio-generation tools — not shipped in firmware — so they will not brick a robot, but "run `audio_to_piezo.py` a year from now" is not reproducible today. `librosa` in particular has aggressive minor-version churn and hard numpy pin ranges. The .gitignore line 9 comment says "tools/ has pytest suites and a uv/PEP-723 workflow" — the workflow is not actually in place.
 - Fix: Either (a) add a PEP 723 header block to each executable tool script (`# /// script\n# dependencies = ["numpy", "librosa", "imageio-ffmpeg", "Pillow", "mido", "pyserial"]\n# ///`) with concrete lower bounds, which makes `uv run --script` self-contained per the .gitignore comment; or (b) collapse into a single `tools/requirements.txt` with pinned versions and delete the midi-bridge-only file. Either is a 15-minute change and would match the intent that is already documented in `.gitignore`.
-

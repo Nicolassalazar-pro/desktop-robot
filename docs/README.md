@@ -8,7 +8,9 @@ Start here.
 |---|---|
 | [`PROJECT-HISTORY.md`](PROJECT-HISTORY.md) | 14 months of decisions, **43 already-rejected approaches**, measured constants, open bugs, working agreements. Section 3 and Appendix B are the ones that save time. |
 | [`../HARDWARE.md`](../HARDWARE.md) | Pin map, power architecture, measured hardware constants, LCD SPI timing analysis. |
-| [`../README.md`](../README.md) | Build, flash, test, and the tethered-drive safety rule. |
+| [`../README.md`](../README.md) | Product overview, architecture, quick start, and the tethered-drive safety rule. |
+| [`ENGINEERING-GUIDE.md`](ENGINEERING-GUIDE.md) | Serial CLI, calibration, movement research, and detailed operating procedures. |
+| [`../LICENSE.md`](../LICENSE.md) | MIT software scope, CERN-OHL-S hardware scope, and third-party exclusions. |
 
 ## Operational
 

@@ -660,9 +660,8 @@ on the LCD driver.
 ### R22 — `msys64` `python` for Pillow tooling
 **Tried:** `python` on PATH.
 **Why:** default.
-**Why rejected:** msys64's python has no Pillow. Use
-`C:\Users\v-nisalazar\AppData\Local\Programs\Python\Python310\python.exe`
-or `py -3.12`.
+**Why rejected:** the MSYS2 Python installation had no Pillow. Use a regular
+CPython installation with Pillow available (for example `py -3.12`).
 **Basis:** MEASURED (`ImportError` on host).
 
 ### R23 — DtrEnable/RtsEnable default on `SerialPort`
@@ -1466,10 +1465,9 @@ them consumes more time than any physical bug on the list.
 - **Serial-number-pinned COM allowlist. COM3 is Intel AMT SOL.**
   Auto-detection scans must never touch COM3 (D14).
 
-- **v-nisalazar gets frustrated when responses stall. Always emit
-  visible text and a tool call within the first thinking pass.**
-  Explicit rule from `[057]`. Silent thinking-only turns are a
-  process failure.
+- **Long operations must expose visible progress.** Emit a short status update
+  before work that can block, and keep silent thinking-only waits out of the
+  interaction. Explicit rule from `[057]`.
 
 - **Design DNA is a guardrail, not a generator.** Aesthetic tokens
   and content-density caps are for judgement; do not lint against
